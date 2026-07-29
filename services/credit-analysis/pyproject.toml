@@ -1,0 +1,97 @@
+[project]
+name = "credit-analysis"
+version = "0.1.0"
+description = "Analise automatizada de documentos de credito com OCR, RAG e agents"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "numpy>=2.1",
+    "pandas>=2.2",
+    "structlog>=24.4",
+    # RAG: embeddings locais via ONNX (sem torch) e parsing do front-matter.
+    "fastembed>=0.4",
+    "pyyaml>=6.0",
+    # OCR e processamento de documento.
+    "pytesseract>=0.3.13",
+    "opencv-python-headless>=4.10",
+    "pymupdf>=1.24",
+    # Upload multipart no FastAPI.
+    "python-multipart>=0.0.9",
+    # LLM e visao.
+    "langchain-anthropic>=1.0",
+    # Vector store persistente.
+    "psycopg[binary,pool]>=3.2",
+    "pgvector>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pandas-stubs>=2.2",
+    "types-PyYAML>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/credit_analysis"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+# Evals ficam fora da execucao padrao: baixam 2,24GB de modelo. Rode com
+# `pytest -m eval` (a CI roda num job separado, com cache do modelo).
+addopts = "-q --strict-markers -m 'not eval and not ocr'"
+asyncio_mode = "auto"
+markers = [
+    "integration: testes que exercitam a API completa",
+    "eval: avaliacao de qualidade do retrieval; exige o modelo de embedding real",
+    "ocr: avaliacao de acuracia de OCR; exige o Tesseract instalado",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+ignore = [
+    # RUF001-003: caracteres "ambiguos" (acentos, travessao) em strings e
+    # comentarios. O dominio e escrito em portugues; a regra e ruido aqui.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # N818: exige sufixo "Error" em excecao. A linguagem ubiqua do dominio e
+    # portugues (ErroDominio, ValorInvalido); misturar sufixo em ingles so
+    # para satisfazer a regra deixaria o vocabulario inconsistente.
+    "N818",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["pandas.*"]
+ignore_missing_imports = true
+
+# Bibliotecas sem py.typed. `fastembed` e `pytesseract` sao wrappers finos e
+# `fitz` (PyMuPDF) expoe binding C — nenhuma publica stub. Os pontos de contato
+# ficam confinados aos adapters, e o tipo volta a ser conhecido na fronteira do
+# port.
+[[tool.mypy.overrides]]
+module = ["fitz.*", "pytesseract.*", "fastembed.*"]
+ignore_missing_imports = true

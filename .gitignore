@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Ferramentas
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Ambiente — nunca comitar segredo
+.env
+.env.local
+*.pem
+*.key
+
+# Dados locais
+data/
+*.db
+*.sqlite3
+chroma/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+
+# Editores / SO
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

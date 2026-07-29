@@ -1,0 +1,65 @@
+#!/bin/sh
+# Bloqueia commit que contenha algo com cara de segredo.
+#
+# Existe porque a defesa mais barata contra vazar chave e a que roda antes de o
+# commit existir. Depois que a chave entra no historico, remove-la exige
+# reescrever o historico — e, se ja foi para o GitHub, considere-a comprometida
+# e revogue: qualquer um pode ter clonado, e ha bots varrendo commits publicos
+# em segundos.
+#
+# Ative uma vez por clone:
+#     git config core.hooksPath .githooks
+#
+# Para pular deliberadamente (raro, e pense duas vezes):
+#     git commit --no-verify
+
+set -eu
+
+# Padroes de segredo. Formatos de provedor primeiro, depois atribuicoes
+# genericas de variavel sensivel.
+PADROES='
+sk-ant-[A-Za-z0-9_-]{20,}
+sk-[A-Za-z0-9]{32,}
+ghp_[A-Za-z0-9]{20,}
+AKIA[0-9A-Z]{16}
+-----BEGIN [A-Z ]*PRIVATE KEY-----
+(ANTHROPIC|OPENAI)_API_KEY[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_-]{20,}
+'
+
+# Apenas arquivos que estao entrando no commit, e apenas os adicionados ou
+# modificados (nao os deletados).
+#
+# O proprio hook e excluido: ele carrega os padroes como texto literal e se
+# acusaria a cada commit — um detector que sempre dispara e um detector que
+# todo mundo aprende a ignorar com --no-verify.
+ARQUIVOS=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/' || true)
+[ -z "$ARQUIVOS" ] && exit 0
+
+# Acumula em arquivo temporario para ordenar e deduplicar: dois padroes podem
+# casar a mesma linha, e reportar em duplicidade so confunde.
+ACHADOS=$(mktemp)
+trap 'rm -f "$ACHADOS"' EXIT
+
+for padrao in $(echo "$PADROES" | grep -v '^$'); do
+    # `-I` ignora binario; `git grep --cached` olha o conteudo em stage, que e
+    # o que sera commitado — e nao o que esta no disco.
+    git grep -nIE --cached "$padrao" -- $ARQUIVOS >>"$ACHADOS" 2>/dev/null || true
+done
+
+if [ -s "$ACHADOS" ]; then
+    printf '\n\033[31mCOMMIT BLOQUEADO: possivel segredo detectado\033[0m\n\n'
+    sort -u "$ACHADOS" | sed 's/^/  /'
+    cat <<'FIM'
+
+O que fazer:
+  1. Remova o valor do arquivo e coloque-o em .env (ja ignorado pelo Git).
+  2. Se a chave chegou a existir de verdade, REVOGUE-A em console.anthropic.com
+     mesmo que o commit tenha sido bloqueado — ela ficou em disco e em
+     historico de shell.
+  3. Use .env.example para documentar o NOME da variavel, nunca o valor.
+
+FIM
+    exit 1
+fi
+
+exit 0
