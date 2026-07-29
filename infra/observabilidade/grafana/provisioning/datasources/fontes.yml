@@ -1,0 +1,32 @@
+# Datasources provisionados por arquivo, nao pela interface.
+#
+# Configuracao clicada na UI vive no volume do container e desaparece com
+# `docker compose down -v`. Provisionada, ela esta no Git e sobe igual em
+# qualquer maquina — que e o mesmo argumento de Terraform, aplicado a dashboard.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+      # Liga o botao "ver traces" a partir de um grafico de metrica.
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: prometheus
+      serviceMap:
+        datasourceUid: prometheus

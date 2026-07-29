@@ -7,6 +7,7 @@ repositorio limpo, sem monkeypatch e sem variavel global.
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -17,6 +18,7 @@ from fastapi import FastAPI, Request, Response
 from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
 from credit_analysis.api.routers import analises, documentos, health, politicas
+from credit_analysis.api.routers import metricas as rota_metricas
 from credit_analysis.application.ports import (
     AgenteCredito,
     ConsultaBureau,
@@ -35,6 +37,11 @@ from credit_analysis.infrastructure.llm.ollama_adapter import (
     ollama_disponivel,
 )
 from credit_analysis.infrastructure.logging import configurar_logging
+from credit_analysis.infrastructure.observabilidade import metricas
+from credit_analysis.infrastructure.observabilidade.tracing import (
+    configurar_tracing,
+    instrumentar_fastapi,
+)
 from credit_analysis.infrastructure.ocr.escalonamento import MotorOCRComEscalonamento
 from credit_analysis.infrastructure.ocr.tesseract import OCRTesseract, localizar_binario
 from credit_analysis.infrastructure.ocr.vision import OCRClaudeVision
@@ -60,6 +67,19 @@ def criar_app(
     """Monta a aplicacao. Adapters omitidos caem no default de desenvolvimento."""
     settings = settings or get_settings()
     configurar_logging(nivel=settings.nivel_log, formato_json=settings.log_json)
+    configurar_tracing(
+        endpoint=settings.otlp_endpoint,
+        nome_servico=settings.nome_servico,
+        versao=settings.versao,
+        ambiente=settings.ambiente.value,
+        amostragem=settings.trace_amostragem,
+    )
+    metricas.registrar_info(
+        versao=settings.versao,
+        ambiente=settings.ambiente.value,
+        provedor_llm=settings.provedor_llm.value,
+        modelo_agente=settings.modelo_agente,
+    )
 
     # O pool so existe quando o RAG e montado a partir da configuracao; quando
     # o retriever vem injetado (teste), quem injetou cuida do ciclo de vida.
@@ -134,8 +154,8 @@ def criar_app(
     app.state.agente = agente  # montado no lifespan quando nao injetado
 
     @app.middleware("http")
-    async def correlacao_e_log(request: Request, call_next):  # type: ignore[no-untyped-def]
-        """Propaga um request id e loga cada requisicao com ele.
+    async def correlacao_log_e_metricas(request: Request, call_next):  # type: ignore[no-untyped-def]
+        """Propaga um request id, loga e mede cada requisicao.
 
         Sem correlation id, rastrear uma requisicao que passou por tres
         servicos vira arqueologia de timestamp. Com ele, um filtro resolve.
@@ -149,21 +169,86 @@ def criar_app(
             rota=request.url.path,
         )
 
-        response: Response = await call_next(request)
-        response.headers[CABECALHO_CORRELACAO] = request_id
+        inicio = time.perf_counter()
+        # Rotulo generico e nao a rota: aqui, ANTES do roteamento, o template
+        # ainda nao existe — usar o caminho cru traria de volta o problema de
+        # cardinalidade que `_rotulo_de_rota` resolve. Este gauge responde
+        # "quantas requisicoes estao abertas agora", o sinal de saturacao;
+        # latencia por rota sai do histograma.
+        metricas.http_em_andamento.labels(rota="total").inc()
+        try:
+            response: Response = await call_next(request)
+        finally:
+            metricas.http_em_andamento.labels(rota="total").dec()
 
-        logger.info("http.requisicao", status=response.status_code)
+        duracao = time.perf_counter() - inicio
+        rota = _rotulo_de_rota(request)
+
+        metricas.http_duracao.labels(metodo=request.method, rota=rota).observe(duracao)
+        metricas.http_requisicoes.labels(
+            metodo=request.method, rota=rota, status=str(response.status_code)
+        ).inc()
+
+        response.headers[CABECALHO_CORRELACAO] = request_id
+        logger.info("http.requisicao", status=response.status_code, duracao_ms=int(duracao * 1000))
         return response
 
     registrar_handlers(app)
 
+    app.include_router(rota_metricas.router)
     app.include_router(health.router)
     app.include_router(analises.router, prefix=settings.prefixo_api)
     app.include_router(politicas.router, prefix=settings.prefixo_api)
     app.include_router(documentos.router, prefix=settings.prefixo_api)
     app.include_router(rota_agente.router, prefix=settings.prefixo_api)
 
+    # Depois dos routers: o instrumentador percorre as rotas registradas para
+    # nomear os spans com o template, e nao com o caminho cru.
+    instrumentar_fastapi(app)
+
     return app
+
+
+def _rotulo_de_rota(request: Request) -> str:
+    """Devolve o **template** da rota, nunca o caminho concreto.
+
+    `/v1/analises/8c1f9e.../documentos` como label criaria uma serie temporal por
+    analise, e serie temporal no Prometheus custa memoria para sempre — nao
+    apenas enquanto o valor aparece.
+
+    Requisicao que nao casou com rota alguma vira `desconhecida` em vez do
+    caminho pedido. Sem isso, qualquer varredura de URL (`/wp-admin`, `/.env`,
+    `/api/v2/...`) viraria uma serie nova cada, e um scanner automatizado seria
+    capaz de inflar a memoria do Prometheus de fora para dentro.
+
+    ## Por que nao usar `route.path` direto
+
+    Seria a forma obvia, e esta errada. Medido: com
+    `include_router(analises.router, prefix="/v1")`, o `route.path` da rota
+    resultante e `/analises/{analise_id}` — **sem o `/v1`**. O prefixo do
+    `include_router` nao entra no atributo.
+
+    A consequencia seria silenciosa e ruim: no dia em que existir um `/v2`, as
+    duas versoes da API cairiam na mesma serie temporal, e o painel mostraria
+    latencia de v1 e v2 somadas sem que nada indicasse a mistura.
+
+    Por isso o template e reconstruido do caminho real, trocando cada valor de
+    path param pelo nome do parametro. A troca e por **segmento inteiro**: trocar
+    por substring quebraria um caminho em que o valor do parametro aparece
+    tambem em outro pedaco da URL.
+    """
+    if request.scope.get("route") is None:
+        return "desconhecida"
+
+    parametros: dict[str, object] = request.scope.get("path_params") or {}
+    if not parametros:
+        # Rota sem parametro: o caminho ja e o template, e a cardinalidade e
+        # limitada pelo numero de rotas declaradas.
+        return request.url.path
+
+    substituicoes = {str(valor): f"{{{nome}}}" for nome, valor in parametros.items()}
+    segmentos = [substituicoes.get(s, s) for s in request.url.path.split("/")]
+    return "/".join(segmentos)
 
 
 def _montar_llm(settings: Settings) -> ModeloLinguagem:

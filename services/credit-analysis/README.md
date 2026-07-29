@@ -47,6 +47,7 @@ infrastructure/
   llm/               Adapters Ollama (local) e Anthropic, mesmo port
   ocr/               Pré-processamento, Tesseract, visão, escalonamento
   agente/            Grafo LangGraph + caixa de ferramentas validada
+  observabilidade/   Metricas Prometheus e tracing OpenTelemetry
 api/
   app.py             Application factory + middleware de correlação
   schemas.py         Contrato HTTP, separado das entidades
@@ -114,6 +115,30 @@ chamada com **nenhuma ferramenta vinculada**: o modelo fica incapaz de pedir mai
 uma, em vez de ser instruído a parar em prosa. A medição justifica a paranoia — o
 `llama3.1:8b` ignora "responda sem ferramenta" em 4 de 4 tentativas.
 
+## Observabilidade (Camada 5)
+
+Métricas na **borda** — middleware, rotas e adapters. `domain` e `application`
+não importam `prometheus_client`: instrumentar um caso de uso faria a camada de
+aplicação depender de biblioteca de observabilidade, que é exatamente a inversão
+que os ports existem para impedir. O módulo `api/observabilidade.py` traduz
+resultado de caso de uso em série temporal, e é o único que conhece os dois lados.
+
+Três detalhes que valem explicar:
+
+**Buckets por perfil de carga, não um só.** HTTP vai a 10s; inferência vai a
+320s. Com os buckets padrão (que terminam em 10s), toda chamada de LLM cairia em
+`+Inf` e o p95 do painel seria ficção.
+
+**Falha ao medir nunca derruba o medido.** Cada função de registro captura
+exceção e loga aviso. Uma análise de crédito já calculada não pode falhar porque
+um contador teve problema.
+
+**O histograma de retrieval revelou um cold start.** Medido: 8 de 9 consultas
+entre 100ms e 250ms, e a **primeira** em ~5,8s — o modelo de embedding (2,24GB,
+ONNX) carrega sob demanda. O carregamento tardio é deliberado, para que uma
+réplica que nunca recebe consulta de política não pague isso no boot; o que a
+Camada 5 mudou é que o custo dessa escolha agora está medido em vez de estimado.
+
 ## Decisões que valem explicar
 
 **`Decimal`, nunca `float`, para dinheiro.** `0.1 + 0.2 != 0.3` em ponto
@@ -148,6 +173,7 @@ independente dela.
 | `POST` | `/v1/agente/consultar` | Agente decide as ferramentas e devolve a trilha |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/ready` | Readiness probe |
+| `GET` | `/metrics` | Exposicao Prometheus (fora do OpenAPI) |
 
 ### Fluxo com comprovação de renda
 

@@ -1,0 +1,14 @@
+apiVersion: 1
+
+providers:
+  - name: esteira-credito
+    orgId: 1
+    folder: Esteira de Credito
+    type: file
+    disableDeletion: false
+    # Recarrega alteracao no JSON sem reiniciar o container — util enquanto o
+    # dashboard esta sendo escrito.
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

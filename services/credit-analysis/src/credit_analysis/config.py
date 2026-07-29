@@ -109,6 +109,18 @@ class Settings(BaseSettings):
     # Orcamento de tempo do atendimento inteiro, nao de uma chamada ao modelo.
     agente_timeout_segundos: float = Field(default=180.0, gt=0)
 
+    # --- Observabilidade (Camada 5) ---
+    # Vazio desliga o tracing. Observabilidade nunca deve impedir o servico de
+    # subir: uma falha no coletor de traces viraria indisponibilidade da esteira
+    # de credito, o que troca um problema pequeno por um grande.
+    otlp_endpoint: str = ""
+
+    # 100% de proposito. Uma esteira de credito faz poucas requisicoes caras
+    # (~80s), nao milhoes baratas — amostrar economizaria pouco e jogaria fora o
+    # trace que alguem vai querer investigar. Existe para o dia em que o volume
+    # mudar essa conta.
+    trace_amostragem: float = Field(default=1.0, ge=0.0, le=1.0)
+
     @property
     def usar_pgvector(self) -> bool:
         return bool(self.postgres_dsn.strip())

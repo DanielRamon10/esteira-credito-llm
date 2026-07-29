@@ -12,6 +12,7 @@ from fastapi import APIRouter, File, Form, UploadFile, status
 from fastapi import Path as PathParam
 
 from credit_analysis.api.deps import ProcessarDocumentoDep
+from credit_analysis.api.observabilidade import registrar_processamento
 from credit_analysis.api.schemas import DocumentoProcessadoResponse, ErroResponse
 from credit_analysis.application.use_cases.processar_documento import (
     ComandoProcessarDocumento,
@@ -100,6 +101,7 @@ async def enviar_documento(
             # Arquivo corrompido e erro do cliente (422), nao falha do servico.
             raise ValorInvalido(str(exc)) from exc
 
+    registrar_processamento(resultado)
     return DocumentoProcessadoResponse.de_dominio(resultado)
 
 

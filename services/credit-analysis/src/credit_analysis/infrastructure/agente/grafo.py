@@ -90,6 +90,8 @@ from langgraph.graph import END, START, StateGraph
 from credit_analysis.application.ports import RepositorioAnalises
 from credit_analysis.domain.agente import MotivoParada, TrilhaAgente
 from credit_analysis.infrastructure.agente.ferramentas import CaixaDeFerramentas
+from credit_analysis.infrastructure.observabilidade import metricas
+from credit_analysis.infrastructure.observabilidade.tracing import marcar_erro, span
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 
 logger = structlog.get_logger(__name__)
@@ -200,9 +202,19 @@ class AgenteLangGraph:
         )
 
         try:
-            final: dict[str, Any] = await asyncio.wait_for(
-                grafo.ainvoke(estado_inicial), timeout=self._orcamento
-            )
+            with span(
+                "agente.atender",
+                **{
+                    "agente.modelo": self._identificacao,
+                    "agente.max_passos": self._max_passos,
+                    "agente.ferramentas": ",".join(caixa.nomes),
+                    # A pergunta nao entra: texto livre do usuario.
+                    "agente.tamanho_pergunta": len(pergunta),
+                },
+            ):
+                final: dict[str, Any] = await asyncio.wait_for(
+                    grafo.ainvoke(estado_inicial), timeout=self._orcamento
+                )
         except TimeoutError:
             # A trilha parcial sobrevive porque a caixa acumula os passos fora do
             # estado do grafo — o estado morre com o cancelamento, ela nao.
@@ -216,8 +228,9 @@ class AgenteLangGraph:
                 motivo=MotivoParada.TEMPO_ESGOTADO,
                 inicio=inicio,
             )
-        except Exception:
+        except Exception as exc:
             log.exception("agente.falhou")
+            marcar_erro(exc)
             return self._montar_trilha(
                 resposta="A execucao do agente falhou. Nenhuma resposta foi produzida.",
                 caixa=caixa,
@@ -295,7 +308,12 @@ class AgenteLangGraph:
 
             novas: list[AnyMessage] = []
             for chamada in chamadas:
-                resultado = await caixa.executar(chamada["name"], dict(chamada.get("args") or {}))
+                # Span por ferramenta e o que responde "onde foram os 80s?" — a
+                # pergunta que metrica agregada e log de requisicao nao respondem.
+                with span("agente.ferramenta", **{"ferramenta.nome": str(chamada["name"])}):
+                    resultado = await caixa.executar(
+                        chamada["name"], dict(chamada.get("args") or {})
+                    )
                 novas.append(
                     ToolMessage(
                         content=resultado.texto,
@@ -351,12 +369,31 @@ class AgenteLangGraph:
         motivo: MotivoParada,
         inicio: float,
     ) -> TrilhaAgente:
+        """Funil unico de saida — e por isso as metricas ficam aqui.
+
+        Os quatro desfechos (respondeu, limite, tempo esgotado, erro) passam por
+        este metodo. Instrumentar em cada `return` de `atender` deixaria de fora
+        justamente os caminhos de falha, que sao os que precisam de alerta.
+        """
+        duracao = time.perf_counter() - inicio
+
+        metricas.agente_atendimentos.labels(
+            modelo=self._identificacao, motivo_parada=motivo.value
+        ).inc()
+        metricas.agente_duracao.labels(modelo=self._identificacao).observe(duracao)
+        metricas.agente_passos.observe(len(caixa.passos))
+        for passo in caixa.passos:
+            metricas.agente_ferramentas.labels(
+                ferramenta=passo.ferramenta,
+                resultado="ok" if passo.sucesso else (passo.erro or "erro"),
+            ).inc()
+
         return TrilhaAgente(
             resposta=resposta,
             passos=caixa.passos,
             motivo_parada=motivo,
             modelo=self._identificacao,
-            duracao_ms=int((time.perf_counter() - inicio) * 1000),
+            duracao_ms=int(duracao * 1000),
             suspeitas_injecao=caixa.suspeitas,
         )
 

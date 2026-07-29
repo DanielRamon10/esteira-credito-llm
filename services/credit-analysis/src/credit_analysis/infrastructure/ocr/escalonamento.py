@@ -36,6 +36,7 @@ from credit_analysis.domain.documento import (
     ResultadoOCR,
 )
 from credit_analysis.domain.value_objects import Percentual
+from credit_analysis.infrastructure.observabilidade import metricas
 
 logger = structlog.get_logger(__name__)
 
@@ -129,12 +130,18 @@ class MotorOCRComEscalonamento:
                 return resultado
 
             if not ultimo:
+                proximo = self.motores[indice + 1].identificacao
                 logger.info(
                     "ocr.escalando",
                     de=resultado.motor,
-                    para=self.motores[indice + 1].identificacao,
+                    para=proximo,
                     confianca=float(resultado.confianca.valor),
                 )
+                # A taxa de escalonamento e uma metrica de custo: cada escalada
+                # para o modelo de visao e uma chamada paga. Se ela subir sem
+                # que o volume suba, algo degradou no pipeline de imagem — e
+                # descobrir isso pela fatura e a pior forma de descobrir.
+                metricas.ocr_escalonamentos.labels(de=resultado.motor, para=proximo).inc()
 
         if melhor is None:  # pragma: no cover - todos falharam e o ultimo relancou
             raise RuntimeError("Nenhum motor de OCR produziu resultado")

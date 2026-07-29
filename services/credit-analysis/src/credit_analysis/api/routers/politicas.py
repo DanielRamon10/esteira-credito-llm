@@ -7,6 +7,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Query
 
 from credit_analysis.api.deps import FundamentarDep, RetrieverDep
+from credit_analysis.api.observabilidade import registrar_fundamentacao
 from credit_analysis.api.schemas import (
     ConsultaPoliticaRequest,
     ErroResponse,
@@ -62,4 +63,5 @@ async def consultar(
     fundamentacao = await caso.executar(
         ComandoFundamentar(pergunta=payload.pergunta, produto=payload.produto)
     )
+    registrar_fundamentacao(fundamentacao)
     return FundamentacaoResponse.de_dominio(fundamentacao)

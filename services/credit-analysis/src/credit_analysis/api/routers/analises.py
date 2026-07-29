@@ -8,6 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Path, Query, status
 
 from credit_analysis.api.deps import AnalisarDep, ConsultarDep, ListarDep
+from credit_analysis.api.observabilidade import registrar_parecer
 from credit_analysis.api.schemas import (
     AnaliseRequest,
     AnaliseResponse,
@@ -45,7 +46,9 @@ async def criar_analise(payload: AnaliseRequest, caso: AnalisarDep) -> AnaliseRe
         ),
         meses_historico_bancario=payload.meses_historico_bancario,
     )
-    return AnaliseResponse.de_dominio(await caso.executar(comando))
+    analise = await caso.executar(comando)
+    registrar_parecer(analise)
+    return AnaliseResponse.de_dominio(analise)
 
 
 @router.get(

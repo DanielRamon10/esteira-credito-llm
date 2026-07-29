@@ -43,10 +43,13 @@ nessa.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 from credit_analysis.application.ports import Embedder, RepositorioPoliticas
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
+from credit_analysis.infrastructure.observabilidade import metricas
+from credit_analysis.infrastructure.observabilidade.tracing import span
 from credit_analysis.infrastructure.rag.bm25 import IndiceBM25
 
 # Constante do RRF. Valor 60 e o do paper original (Cormack et al., 2009);
@@ -107,11 +110,38 @@ class RetrieverHibrido:
     async def buscar(
         self, consulta: str, config: ConfiguracaoBusca | None = None
     ) -> list[TrechoRecuperado]:
-        """Recupera os trechos mais relevantes para a consulta."""
+        """Recupera os trechos mais relevantes para a consulta.
+
+        A medicao fica neste envelope e o algoritmo em `_executar_busca` porque a
+        busca tem quatro saidas distintas (consulta vazia, nenhum ranking, um
+        ranking, fusao). Instrumentar cada `return` daria quatro chances de
+        esquecer uma na proxima alteracao — e uma metrica que perde caminhos
+        mente para baixo, o que e pior que nao ter metrica.
+        """
         cfg = config or ConfiguracaoBusca()
         if cfg.k <= 0 or not consulta.strip():
             return []
 
+        inicio = time.perf_counter()
+        with span(
+            "rag.buscar",
+            **{
+                "rag.k": cfg.k,
+                "rag.produto": cfg.produto or "todos",
+                # A consulta em si NAO entra no span: e texto livre do usuario e
+                # pode conter dado pessoal.
+                "rag.tamanho_consulta": len(consulta),
+            },
+        ):
+            resultados = await self._executar_busca(consulta, cfg)
+
+        metricas.retrieval_duracao.observe(time.perf_counter() - inicio)
+        metricas.retrieval_trechos.observe(len(resultados))
+        return resultados
+
+    async def _executar_busca(
+        self, consulta: str, cfg: ConfiguracaoBusca
+    ) -> list[TrechoRecuperado]:
         candidatos = cfg.k * FATOR_CANDIDATOS
         rankings: list[list[TrechoRecuperado]] = []
 

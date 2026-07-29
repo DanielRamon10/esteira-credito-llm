@@ -22,6 +22,15 @@ dependencies = [
     "python-multipart>=0.0.9",
     # LLM e visao.
     "langchain-anthropic>=1.0",
+    # LLM local: sem chave, sem conta, e o dado nao sai da infraestrutura.
+    "langchain-ollama>=1.0",
+    # Agente com ferramentas (Camada 4).
+    "langgraph>=1.0",
+    # Observabilidade (Camada 5): metricas e tracing.
+    "prometheus-client>=0.21",
+    "opentelemetry-sdk>=1.30",
+    "opentelemetry-exporter-otlp-proto-http>=1.30",
+    "opentelemetry-instrumentation-fastapi>=0.51b0",
     # Vector store persistente.
     "psycopg[binary,pool]>=3.2",
     "pgvector>=0.3",

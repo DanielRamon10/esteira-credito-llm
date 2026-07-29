@@ -39,6 +39,8 @@ from dataclasses import dataclass, field
 
 import structlog
 
+from credit_analysis.infrastructure.observabilidade import metricas
+
 logger = structlog.get_logger(__name__)
 
 # Tag do envelope. Nome longo e especifico de proposito: reduz a chance de
@@ -169,19 +171,34 @@ def preparar_conteudo_nao_confiavel(
     *,
     rotulo: str = TAG_ENVELOPE,
     contexto: dict[str, str] | None = None,
+    superficie: str = "documento_do_cliente",
 ) -> ConteudoSanitizado:
-    """Aplica envelope e deteccao, registrando o que foi encontrado."""
+    """Aplica envelope e deteccao, registrando o que foi encontrado.
+
+    `superficie` diz de onde veio o conteudo e vira label da metrica. Documento
+    enviado pelo cliente e retorno de ferramenta do agente sao superficies
+    diferentes com resposta operacional diferente: no primeiro caso o caso vai
+    para revisao e possivelmente para a area de fraude; no segundo, e sinal de
+    que dado ja armazenado carrega payload e voltou ao contexto do modelo.
+    """
     suspeitas = detectar_injecao(texto)
 
     if suspeitas:
-        # Nivel warning e evento nomeado: e isto que a Camada 5 transforma em
-        # metrica e alerta. Tentativa de injecao em documento de credito nao e
-        # curiosidade — e indicio de fraude.
+        categorias = sorted({s.categoria for s in suspeitas})
+
+        # Nivel warning e evento nomeado, mais o contador. Tentativa de injecao em
+        # documento de credito nao e curiosidade — e indicio de fraude, e por isso
+        # aqui saem as tres coisas: log (para investigar o caso), metrica (para
+        # alertar sobre a taxa) e o retorno com as categorias (para a resposta da
+        # API declarar que houve tentativa).
         logger.warning(
             "seguranca.injecao_suspeita",
-            categorias=sorted({s.categoria for s in suspeitas}),
+            categorias=categorias,
             ocorrencias=len(suspeitas),
+            superficie=superficie,
             **(contexto or {}),
         )
+        for categoria in categorias:
+            metricas.injecao_detectada.labels(superficie=superficie, categoria=categoria).inc()
 
     return ConteudoSanitizado(envelopado=envelopar(texto, rotulo), suspeitas=suspeitas)

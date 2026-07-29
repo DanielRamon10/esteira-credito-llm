@@ -1,0 +1,99 @@
+# Regras de alerta.
+#
+# O critério para uma regra entrar aqui: **alguem precisa agir quando ela
+# dispara**. Alerta que nao gera acao treina o time a ignorar alerta, e um time
+# que ignora alerta e pior que um time sem alertas — porque acredita estar
+# coberto.
+#
+# Por isso nao ha alerta de "latencia do LLM alta": 80s e o normal medido deste
+# sistema em CPU, e alertar sobre o esperado e ruido.
+
+groups:
+  - name: guardrails-de-ia
+    interval: 30s
+    rules:
+      # A metrica de alucinacao prometida desde a Camada 2.
+      - alert: CitacoesRejeitadasAlta
+        expr: |
+          sum(rate(credito_citacoes_total{estado="rejeitada"}[15m]))
+            /
+          clamp_min(sum(rate(credito_citacoes_total[15m])), 0.001)
+            > 0.2
+        for: 10m
+        labels:
+          severidade: aviso
+          dominio: ia
+        annotations:
+          resumo: "Mais de 20% das citacoes estao sendo rejeitadas pelo guardrail"
+          acao: >-
+            O modelo comecou a parafrasear em vez de copiar. Verificar se houve
+            troca de modelo, mudanca de prompt ou atualizacao do Ollama.
+            `clamp_min` no denominador evita divisao por zero quando nao ha
+            trafego — sem ele a expressao vira NaN e o alerta nunca dispara.
+
+      # Tentativa de injecao nao e curiosidade: e indicio de fraude.
+      - alert: TentativaDeInjecaoDetectada
+        expr: sum(increase(credito_injecao_detectada_total[10m])) > 0
+        for: 0m
+        labels:
+          severidade: critico
+          dominio: seguranca
+        annotations:
+          resumo: "Prompt injection detectada em conteudo nao confiavel"
+          acao: >-
+            Sem `for`, de proposito: uma unica tentativa precisa ser investigada.
+            Correlacionar pelo `analise_id` no log estruturado e encaminhar para
+            a area de fraude.
+
+      - alert: AgenteInterrompidoComFrequencia
+        expr: |
+          sum(rate(credito_agente_atendimentos_total{motivo_parada!="respondeu"}[15m]))
+            /
+          clamp_min(sum(rate(credito_agente_atendimentos_total[15m])), 0.001)
+            > 0.3
+        for: 15m
+        labels:
+          severidade: aviso
+          dominio: ia
+        annotations:
+          resumo: "Mais de 30% dos atendimentos do agente nao chegam ao fim"
+          acao: >-
+            Teto de passos ou orcamento de tempo sendo atingido demais. Ver a
+            distribuicao de `credito_agente_passos`: concentracao no teto indica
+            loop de ferramenta, nao pergunta difícil.
+
+  - name: disponibilidade
+    interval: 30s
+    rules:
+      - alert: ServicoForaDoAr
+        expr: up{job="credit-analysis"} == 0
+        for: 2m
+        labels:
+          severidade: critico
+        annotations:
+          resumo: "O servico credit-analysis nao responde ao scrape"
+
+      - alert: TaxaDeErro5xx
+        expr: |
+          sum(rate(credito_http_requisicoes_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(credito_http_requisicoes_total[5m])), 0.001)
+            > 0.05
+        for: 5m
+        labels:
+          severidade: critico
+        annotations:
+          resumo: "Mais de 5% das requisicoes falhando com 5xx"
+
+      - alert: RevisaoHumanaAcumulando
+        expr: sum(rate(credito_revisao_humana_total[30m])) * 1800 > 20
+        for: 30m
+        labels:
+          severidade: aviso
+          dominio: operacao
+        annotations:
+          resumo: "Fila de revisao humana crescendo mais de 20 casos por 30min"
+          acao: >-
+            Pode ser degradacao de OCR (ver `credito_ocr_confianca_pct`) ou
+            aumento real de documento ruim. A distribuicao de
+            `credito_revisao_humana_total` por `motivo` separa os dois casos.

@@ -1,11 +1,18 @@
 # Stack local de desenvolvimento.
 #
-# Sobe o Postgres com a extensao pgvector. Prometheus, Grafana e o coletor de
-# tracing entram na Camada 5; o servico em si entra na Camada 6, quando houver
-# Dockerfile. Hoje a API roda no host e aponta para este banco.
+# Sobe o Postgres com pgvector e a stack de observabilidade (Prometheus, Tempo,
+# Grafana). O servico em si entra na Camada 6, quando houver Dockerfile — hoje a
+# API roda no host, e por isso o Prometheus a raspa via `host.docker.internal`.
 #
 #   docker compose up -d
-#   docker compose down -v     # -v tambem apaga o volume de dados
+#   docker compose down -v     # -v tambem apaga os volumes de dados
+#
+#   Grafana      http://localhost:3000   (painel provisionado, sem login)
+#   Prometheus   http://localhost:9090
+#   Tempo        http://localhost:3200   (OTLP em 4318)
+#
+# Para o tracing chegar ao Tempo, a API precisa de:
+#   CREDIT_OTLP_ENDPOINT=http://localhost:4318
 
 name: esteira-credito
 
@@ -53,5 +60,66 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: credito-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Retencao curta: e ambiente local. Em producao isso vira retencao remota
+      # (Thanos, Mimir) em vez de disco maior no proprio Prometheus.
+      - --storage.tsdb.retention.time=15d
+      # Necessario para o Grafana recarregar regra sem reiniciar o container.
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/observabilidade/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/observabilidade/alertas.yml:/etc/prometheus/alertas.yml:ro
+      - prometheus_dados:/prometheus
+    extra_hosts:
+      # No Docker Desktop o `host.docker.internal` ja existe; no Linux nao. Esta
+      # linha faz o scrape da API rodando no host funcionar nos dois.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.9.0
+    container_name: credito-tempo
+    command: ["-config.file=/etc/tempo.yml"]
+    ports:
+      - "3200:3200"   # consulta (Grafana)
+      - "4318:4318"   # OTLP/HTTP — e para ca que CREDIT_OTLP_ENDPOINT aponta
+    volumes:
+      - ./infra/observabilidade/tempo.yml:/etc/tempo.yml:ro
+      - tempo_dados:/var/tempo
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: credito-grafana
+    environment:
+      # Sem login em ambiente local: a friccao de autenticar num Grafana de
+      # desenvolvimento nao compra seguranca nenhuma, e o servico nao esta
+      # exposto para fora da maquina. Em producao isso vira OIDC.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      # Abre direto no painel provisionado em vez da home vazia.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/esteira-credito.json
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./infra/observabilidade/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/observabilidade/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_dados:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - tempo
+    restart: unless-stopped
+
 volumes:
   postgres_dados:
+  prometheus_dados:
+  tempo_dados:
+  grafana_dados:

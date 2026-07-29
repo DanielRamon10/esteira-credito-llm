@@ -37,9 +37,13 @@ mais rapido, mas produz citacao rejeitada, o que derruba `Fundamentacao.confiave
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import structlog
+
+from credit_analysis.infrastructure.observabilidade import metricas
+from credit_analysis.infrastructure.observabilidade.tracing import marcar_erro, span
 
 if TYPE_CHECKING:  # pragma: no cover
     from langchain_ollama import ChatOllama
@@ -135,12 +139,47 @@ class LLMOllama:
         return f"ollama:{self._modelo}"
 
     async def gerar(self, sistema: str, usuario: str, max_tokens: int = 2048) -> str:
-        resposta = await self._obter_cliente(max_tokens).ainvoke(
-            [("system", sistema), ("human", usuario)]
-        )
+        inicio = time.perf_counter()
 
+        try:
+            with span(
+                "llm.gerar",
+                **{
+                    "llm.modelo": self._modelo,
+                    "llm.max_tokens": max_tokens,
+                    # Tamanho do prompt, nao o prompt: ele carrega renda, CPF
+                    # mascarado e trecho de politica interna.
+                    "llm.tamanho_prompt": len(sistema) + len(usuario),
+                },
+            ):
+                resposta = await self._obter_cliente(max_tokens).ainvoke(
+                    [("system", sistema), ("human", usuario)]
+                )
+        except Exception as exc:
+            # A metrica de falha e registrada aqui e a excecao segue subindo: quem
+            # chamou decide o que fazer, mas a contagem nao pode depender disso.
+            metricas.llm_chamadas.labels(
+                modelo=self.identificacao, operacao="gerar", resultado="erro"
+            ).inc()
+            marcar_erro(exc)
+            raise
+
+        duracao = time.perf_counter() - inicio
         texto = resposta.text if isinstance(resposta.text, str) else str(resposta.content)
         uso = dict(resposta.usage_metadata or {})
+
+        metricas.llm_duracao.labels(modelo=self.identificacao, operacao="gerar").observe(duracao)
+        metricas.llm_chamadas.labels(
+            modelo=self.identificacao, operacao="gerar", resultado="ok"
+        ).inc()
+        for direcao, chave in (("entrada", "input_tokens"), ("saida", "output_tokens")):
+            # `usage_metadata` e um dict de tipo aberto: o provedor pode devolver
+            # None, string ou nada. Contador que recebe lixo levanta excecao no
+            # meio de uma resposta que ja foi gerada com sucesso.
+            if isinstance(quantidade := uso.get(chave), int | float):
+                metricas.llm_tokens.labels(modelo=self.identificacao, direcao=direcao).inc(
+                    float(quantidade)
+                )
 
         logger.info(
             "llm.resposta",
@@ -148,6 +187,7 @@ class LLMOllama:
             tokens_entrada=uso.get("input_tokens"),
             tokens_saida=uso.get("output_tokens"),
             caracteres=len(texto),
+            duracao_ms=int(duracao * 1000),
         )
         return texto
 

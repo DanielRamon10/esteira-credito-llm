@@ -46,7 +46,7 @@ banco, e trocar SQLite por Postgres sem tocar em caso de uso.
 | 2 | RAG sobre políticas internas (pgvector, híbrido, citações verificadas) | ✅ Concluída |
 | 3 | OCR, extração documental e defesa contra prompt injection | ✅ Concluída |
 | 4 | Agente LangGraph com ferramentas, teto de passos e trilha de auditoria | ✅ Concluída |
-| 5 | Observabilidade (Prometheus/Grafana/tracing) | ⬜ |
+| 5 | Observabilidade: métricas, tracing, dashboard e alertas | ✅ Concluída |
 | 6 | Terraform, Kubernetes, CI/CD | ⬜ |
 
 ## Rodando
@@ -58,8 +58,9 @@ winget install UB-Mannheim.TesseractOCR
 #    O pacote não traz o português; baixe por.traineddata do repositório
 #    tesseract-ocr/tessdata para C:\Program Files\Tesseract-OCR\tessdata\
 
-# 1. Banco vetorial
+# 1. Banco vetorial + observabilidade (Prometheus, Tempo, Grafana)
 docker compose up -d
+#    Grafana em http://localhost:3000 — painel já provisionado, sem login
 
 # 1b. LLM local (opcional, sem chave e sem conta). Sem ele o serviço sobe
 #     igual e a geração de texto cai num fake determinístico.
@@ -76,7 +77,8 @@ uv pip install -e ".[dev]"
 export CREDIT_POSTGRES_DSN=postgresql://credito:credito_local@localhost:5432/credito
 .venv/Scripts/python -m credit_analysis.ingestao --recriar
 
-# 4. Subir a API
+# 4. Subir a API (com tracing indo para o Tempo)
+export CREDIT_OTLP_ENDPOINT=http://localhost:4318
 .venv/Scripts/python -m credit_analysis
 ```
 
@@ -164,8 +166,69 @@ uma resposta completa para quem consome a API.
 .venv/Scripts/python -m mypy                    # tipagem estrita
 ```
 
-Estado atual: **338 testes** + 20 evals (retrieval e OCR), `mypy --strict` sem
-erros em 58 arquivos.
+Estado atual: **360 testes** + 20 evals (retrieval e OCR), `mypy --strict` sem
+erros em 63 arquivos.
+
+## Observabilidade
+
+Prometheus, Tempo e Grafana sobem com o `docker compose up -d`; o painel e os
+datasources são **provisionados por arquivo**, não clicados na interface —
+configuração clicada vive no volume do container e desaparece no primeiro
+`down -v`.
+
+O dashboard começa por **guardrails de IA**, não por saúde do serviço. Num
+sistema com LLM, "está inventando?" é uma pergunta mais urgente que "está no
+ar?", e as métricas que respondem isso são as que um dashboard genérico não tem:
+
+| Métrica | O que responde |
+|---|---|
+| `credito_citacoes_total{estado}` | Taxa de citação rejeitada pelo guardrail — a métrica de alucinação prometida na Camada 2 |
+| `credito_injecao_detectada_total{superficie,categoria}` | Tentativas de prompt injection, separadas por superfície de entrada |
+| `credito_agente_atendimentos_total{motivo_parada}` | Quantos atendimentos **não** chegam ao fim (limite de passos, tempo) |
+| `credito_agente_passos` | Distribuição de ferramentas por atendimento — zero passos é abstenção, o caso saudável |
+| `credito_revisao_humana_total{motivo}` | Fila de revisão, separando degradação de OCR de tentativa de fraude |
+
+São 6 regras de alerta, e o critério para uma regra existir é que **alguém
+precise agir quando ela disparar**. Por isso não há alerta de "latência do LLM
+alta": 80s é o normal medido deste sistema em CPU, e alertar sobre o esperado
+treina o time a ignorar alerta.
+
+### Três coisas que a instrumentação encontrou
+
+**Os buckets padrão do Prometheus mentiriam.** Eles terminam em 10s. Com a
+fundamentação levando ~80s (e até 148s), *toda* chamada de LLM cairia no bucket
+`+Inf`, e `histogram_quantile` sobre um único bucket infinito devolve número sem
+significado. O p95 apareceria no painel, pareceria correto e estaria errado. Por
+isso há duas escalas de bucket, uma para HTTP e outra para inferência.
+
+**`route.path` perde o prefixo de versão.** A forma óbvia de rotular a rota é
+`request.scope["route"].path` — que devolve `/analises/{analise_id}`, **sem o
+`/v1`**, porque o prefixo do `include_router` não entra nesse atributo. O efeito
+apareceria só no dia em que existisse um `/v2`: as duas versões somadas na mesma
+série, sem nada indicando a mistura. O template é reconstruído do caminho real,
+com regressão em teste.
+
+**A query string vazava para o trace.** A regra "dado pessoal não entra em span"
+estava sendo cumprida pelos spans escritos aqui e violada pelos gerados
+automaticamente: inspecionando um trace real no Tempo, `http.url` continha
+`...?q=<a pergunta do usuário>`. Numa consulta livre isso é texto que a pessoa
+escreveu, e nada impede que contenha nome ou CPF. Nenhuma revisão de código
+pegaria — o código que vazava não está no repositório, está na biblioteca de
+instrumentação. Corrigido com um `server_request_hook` que corta a query string,
+mantendo o caminho e o UUID (que em trace é justamente o que permite cruzar com
+o log).
+
+### Cardinalidade e LGPD, na mesma decisão
+
+Não há UUID, CPF, nome ou valor em label de métrica — só domínio fechado (rota,
+status, modelo, decisão, motivo, categoria). O motivo técnico é que série
+temporal custa memória no Prometheus **para sempre**; o motivo legal é que
+métrica vaza para dashboard, alerta, e-mail e print de Slack, nenhum deles com
+controle de acesso a dado pessoal. Um teste afirma que a exposição do `/metrics`
+não contém o CPF nem o nome enviados na requisição, e outro que uma varredura de
+URL (`/wp-admin`, `/.env`) cai em `rota="desconhecida"` em vez de criar uma série
+por caminho tentado — sem isso, um scanner infla a memória do Prometheus de fora
+para dentro.
 
 ## Segredos
 
@@ -192,7 +255,7 @@ comprometida — há bots varrendo commits públicos em segundos.
 | Retrieval (embeddings locais, ONNX) | ✅ completo |
 | OCR (Tesseract local) | ✅ completo |
 | Extração, reavaliação de score, segurança | ✅ completo |
-| Testes (338 + 20 evals) | ✅ todos passam |
+| Testes (360 + 20 evals) | ✅ todos passam |
 | Geração de texto do parecer | ✅ com Ollama local; sem ele, `LLMFake` |
 | Agente com ferramentas | ✅ com Ollama local; sem ele, 503 explícito |
 | Escalonamento de OCR para visão | ⚠️ fora da cadeia |

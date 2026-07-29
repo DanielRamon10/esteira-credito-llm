@@ -1,0 +1,29 @@
+# Configuracao do Prometheus para a stack local.
+#
+# `scrape_interval` de 15s: o padrao de 1m perderia a forma de um incidente num
+# sistema cujas requisicoes levam 80s — com amostra a cada minuto, um pico de
+# dois minutos aparece como dois pontos.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    ambiente: local
+
+rule_files:
+  - /etc/prometheus/alertas.yml
+
+scrape_configs:
+  - job_name: credit-analysis
+    metrics_path: /metrics
+    static_configs:
+      # A API roda no host (a Camada 6 traz o Dockerfile). `host.docker.internal`
+      # e como o container alcanca o host no Docker Desktop; no Linux exige o
+      # `extra_hosts` que esta no compose.
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          servico: credit-analysis
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
