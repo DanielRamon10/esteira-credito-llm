@@ -1,0 +1,57 @@
+# Stack local de desenvolvimento.
+#
+# Sobe o Postgres com a extensao pgvector. Prometheus, Grafana e o coletor de
+# tracing entram na Camada 5; o servico em si entra na Camada 6, quando houver
+# Dockerfile. Hoje a API roda no host e aponta para este banco.
+#
+#   docker compose up -d
+#   docker compose down -v     # -v tambem apaga o volume de dados
+
+name: esteira-credito
+
+services:
+  postgres:
+    # Imagem oficial do pgvector sobre Postgres 17 — evita compilar a extensao.
+    image: pgvector/pgvector:pg17
+    container_name: credito-postgres
+    environment:
+      POSTGRES_USER: credito
+      POSTGRES_PASSWORD: credito_local
+      POSTGRES_DB: credito
+      # Acelera testes: sem fsync a cada commit. Aceitavel porque perder este
+      # banco custa um `docker compose down -v` seguido de reingestao.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: >
+      postgres
+      -c fsync=off
+      -c synchronous_commit=off
+      -c full_page_writes=off
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dados:/var/lib/postgresql/data
+      # Scripts de initdb rodam automaticamente, em ordem alfabetica, apenas na
+      # primeira subida (diretorio de dados vazio).
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+      # Montado fora do initdb.d porque e aplicado duas vezes pelo script —
+      # uma em `credito`, outra em `credito_test`.
+      - ./infra/postgres/schema.sql:/schema.sql:ro
+    healthcheck:
+      # `pg_isready` responde antes de o initdb terminar; consultar a extensao
+      # garante que o schema esta pronto de verdade antes de o teste conectar.
+      # `-tAc` devolve o valor cru (sem cabecalho nem alinhamento), o que torna
+      # o `grep` confiavel.
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U credito -d credito &&
+          psql -U credito -d credito -tAc
+          "SELECT 1 FROM pg_extension WHERE extname='vector'" | grep -q 1
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_dados:
