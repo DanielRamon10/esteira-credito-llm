@@ -1,0 +1,188 @@
+"""Adapter Ollama do port `ModeloLinguagem`.
+
+Modelo rodando na propria maquina: sem chave, sem conta, sem limite de
+requisicao e sem custo por token. Para uma esteira de credito ha um argumento
+que pesa mais que o preco — **o dado nao sai da infraestrutura**. Prompt de
+fundamentacao carrega renda, CPF mascarado e trecho de politica interna;
+manda-los para uma API de terceiro exige avaliacao de LGPD e contrato, nao
+apenas uma chave. E a mesma razao pela qual os embeddings ja rodam local.
+
+O preco disso e latencia: em CPU, um modelo 8B responde em torno de 70s. Isso
+e aceitavel numa esteira assincrona e inaceitavel num endpoint sincrono — a
+Camada 4 (agent) e a 5 (observabilidade) e que vao expor esse custo de verdade.
+
+## Escolha do modelo, por medicao
+
+Medido nesta maquina (Core Ultra 7 165U, 12 nucleos, sem GPU) contra o
+**guardrail real de citacoes** — nao contra uma metrica generica de qualidade:
+
+    modelo          seg   tok/s  alegadas  confirmadas  rejeitadas
+    llama3.2:3b    49,3     7,4         3            2           1
+    llama3.1:8b    74,2     4,5         2            2           0  <- padrao
+    qwen2.5:7b     96,3     5,7         2            2           0
+
+Duas conclusoes que so aparecem medindo:
+
+1. **Maior nem sempre e melhor nesta tarefa.** Antes de uma correcao na
+   verificacao, o 3B batia os dois maiores. A tarefa aqui e *copiar texto
+   literalmente*, e modelo grande tende a "melhorar" o que copia — parafrasear,
+   normalizar, resumir. Exatamente o que o guardrail rejeita.
+2. **`format="json"` do Ollama e ~25% mais rapido**, alem de garantir o
+   formato. Restringir a gramatica de saida reduz o espaco de busca.
+
+`llama3.1:8b` e o padrao por ser o mais rapido entre os que chegam a zero
+rejeicao. `llama3.2:3b` fica documentado como opcao de desenvolvimento: 33%
+mais rapido, mas produz citacao rejeitada, o que derruba `Fundamentacao.confiavel`.
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import structlog
+
+if TYPE_CHECKING:  # pragma: no cover
+    from langchain_ollama import ChatOllama
+
+logger = structlog.get_logger(__name__)
+
+MODELO_PADRAO = "llama3.1:8b"
+
+# Alternativa rapida para desenvolvimento. Ver a medicao no cabecalho: e mais
+# veloz, mas parafraseia, e parafrase e rejeitada pelo guardrail.
+MODELO_RAPIDO = "llama3.2:3b"
+
+ENDPOINT_PADRAO = "http://127.0.0.1:11434"
+
+# Determinismo: a fundamentacao de um parecer de credito nao deve variar entre
+# execucoes sobre a mesma entrada. Numa esteira auditavel, "por que este parecer
+# saiu diferente do de ontem?" precisa ter resposta.
+TEMPERATURA = 0.0
+
+# Inferencia em CPU e lenta; o timeout precisa acomodar isso sem mascarar um
+# Ollama travado.
+TIMEOUT_PADRAO = 240.0
+
+# Janela de contexto. **Precisa ser explicita.**
+#
+# O Ollama usa 2048 tokens por padrao, e um prompt maior e truncado **em
+# silencio** — sem erro, sem aviso. O prompt de fundamentacao carrega 5 trechos
+# de politica (ate 1800 caracteres cada) mais o caso e as regras do sistema, o
+# que passa folgadamente de 2048. O sintoma seria o modelo ignorar os ultimos
+# trechos recuperados e citar so os primeiros, parecendo um problema de
+# retrieval ou de prompt quando na verdade o texto nunca chegou nele.
+#
+# 8192 cobre o prompt atual com margem. Custa RAM (o KV cache cresce com a
+# janela), o que nesta maquina e barato.
+NUM_CTX = 8192
+
+
+class LLMOllama:
+    """Modelo local via Ollama, atras do mesmo port do adapter Anthropic."""
+
+    def __init__(
+        self,
+        modelo: str = MODELO_PADRAO,
+        endpoint: str = ENDPOINT_PADRAO,
+        timeout_segundos: float = TIMEOUT_PADRAO,
+        forcar_json: bool = True,
+    ) -> None:
+        self._modelo = modelo
+        self._endpoint = endpoint
+        self._timeout = timeout_segundos
+        self._forcar_json = forcar_json
+        self._clientes: dict[int, ChatOllama] = {}
+
+    def _obter_cliente(self, max_tokens: int) -> ChatOllama:
+        """Cliente para um dado teto de saida, memoizado por valor.
+
+        `num_predict` (o equivalente do `max_tokens`) so e aceito no construtor
+        do `ChatOllama` — passa-lo em `ainvoke` ou via `bind()` levanta
+        `TypeError: AsyncClient.chat() got an unexpected keyword argument`.
+        Como o port permite `max_tokens` por chamada, guardamos um cliente por
+        valor distinto. Construir e barato (nao abre conexao) e na pratica ha um
+        ou dois valores em uso.
+        """
+        if (existente := self._clientes.get(max_tokens)) is not None:
+            return existente
+
+        # Import tardio: mantem o servico subindo mesmo sem langchain-ollama
+        # instalado, desde que outro adapter esteja configurado.
+        from langchain_ollama import ChatOllama
+
+        extras: dict[str, Any] = {}
+        if self._forcar_json:
+            # Restringe a gramatica de saida a JSON valido. Elimina a classe de
+            # falha em que o modelo devolve prosa antes ou depois do objeto — o
+            # `_parsear_resposta` tolera, mas nao precisa. Medido: ~25% mais
+            # rapido tambem, por reduzir o espaco de busca.
+            extras["format"] = "json"
+
+        cliente = ChatOllama(
+            model=self._modelo,
+            base_url=self._endpoint,
+            temperature=TEMPERATURA,
+            num_predict=max_tokens,
+            num_ctx=NUM_CTX,
+            client_kwargs={"timeout": self._timeout},
+            **extras,
+        )
+        self._clientes[max_tokens] = cliente
+        return cliente
+
+    @property
+    def identificacao(self) -> str:
+        return f"ollama:{self._modelo}"
+
+    async def gerar(self, sistema: str, usuario: str, max_tokens: int = 2048) -> str:
+        resposta = await self._obter_cliente(max_tokens).ainvoke(
+            [("system", sistema), ("human", usuario)]
+        )
+
+        texto = resposta.text if isinstance(resposta.text, str) else str(resposta.content)
+        uso = dict(resposta.usage_metadata or {})
+
+        logger.info(
+            "llm.resposta",
+            modelo=self.identificacao,
+            tokens_entrada=uso.get("input_tokens"),
+            tokens_saida=uso.get("output_tokens"),
+            caracteres=len(texto),
+        )
+        return texto
+
+
+def ollama_disponivel(endpoint: str = ENDPOINT_PADRAO, timeout: float = 2.0) -> bool:
+    """Verifica se o daemon do Ollama responde.
+
+    Usado no composition root para decidir entre o adapter local e o fake, em
+    vez de deixar a aplicacao subir e falhar na primeira requisicao.
+    """
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{endpoint}/api/version", timeout=timeout) as resposta:
+            return bool(resposta.status == 200)
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def modelos_instalados(endpoint: str = ENDPOINT_PADRAO, timeout: float = 3.0) -> tuple[str, ...]:
+    """Lista os modelos disponiveis no Ollama local.
+
+    Permite avisar 'o modelo X nao esta baixado, rode ollama pull X' em vez de
+    devolver um erro do daemon no meio de uma requisicao de negocio.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{endpoint}/api/tags", timeout=timeout) as resposta:
+            dados = json.loads(resposta.read())
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
+        return ()
+
+    modelos = dados.get("models", []) if isinstance(dados, dict) else []
+    return tuple(str(m.get("name", "")) for m in modelos if m.get("name"))
