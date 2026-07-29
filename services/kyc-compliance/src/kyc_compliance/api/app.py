@@ -21,12 +21,12 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from plataforma.logging import configurar_logging
 
 from kyc_compliance.api.routers import health, triagens
 from kyc_compliance.application.ports import RepositorioListas, RepositorioTriagens
 from kyc_compliance.config import Settings, get_settings
 from kyc_compliance.infrastructure.listas import ListasDeArquivo
-from kyc_compliance.infrastructure.logging import configurar_logging
 from kyc_compliance.infrastructure.repositories.memoria import RepositorioTriagensMemoria
 
 logger = structlog.get_logger(__name__)

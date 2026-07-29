@@ -14,6 +14,15 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from plataforma import llm as llm_compartilhado
+from plataforma import seguranca
+from plataforma.llm import (
+    LLMOllama,
+    criar_chat_ollama,
+    modelos_instalados,
+    ollama_disponivel,
+)
+from plataforma.logging import configurar_logging
 
 from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
@@ -32,13 +41,6 @@ from credit_analysis.infrastructure.agente.grafo import AgenteLangGraph
 from credit_analysis.infrastructure.bureau import BureauStub
 from credit_analysis.infrastructure.kyc import ClienteKYCHttp
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
-from credit_analysis.infrastructure.llm.ollama_adapter import (
-    LLMOllama,
-    criar_chat_ollama,
-    modelos_instalados,
-    ollama_disponivel,
-)
-from credit_analysis.infrastructure.logging import configurar_logging
 from credit_analysis.infrastructure.observabilidade import metricas
 from credit_analysis.infrastructure.observabilidade.tracing import (
     configurar_tracing,
@@ -53,6 +55,8 @@ from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.repositories.memoria import RepositorioAnalisesMemoria
 
 logger = structlog.get_logger(__name__)
+
+_observadores_ligados = False
 
 CABECALHO_CORRELACAO = "X-Request-ID"
 
@@ -83,6 +87,7 @@ def criar_app(
         provedor_llm=settings.provedor_llm.value,
         modelo_agente=settings.modelo_agente,
     )
+    _ligar_observadores_da_plataforma()
 
     # O pool so existe quando o RAG e montado a partir da configuracao; quando
     # o retriever vem injetado (teste), quem injetou cuida do ciclo de vida.
@@ -219,6 +224,45 @@ def criar_app(
     instrumentar_fastapi(app)
 
     return app
+
+
+def _ligar_observadores_da_plataforma() -> None:
+    """Liga os ganchos da `plataforma` as metricas deste servico.
+
+    A biblioteca compartilhada nao conhece Prometheus — se conhecesse, todo
+    consumidor futuro ficaria preso a esta stack de observabilidade. Ela apenas
+    avisa que algo aconteceu, e a traducao para contador vive aqui, no composition
+    root, junto das outras decisoes de wiring.
+    """
+    # Idempotente: `criar_app` e chamada dezenas de vezes na suite, e sem esta
+    # guarda cada chamada empilharia mais um observador — o contador passaria a
+    # incrementar N vezes por evento, e o painel mentiria para cima.
+    global _observadores_ligados
+    if _observadores_ligados:
+        return
+
+    seguranca.registrar_observador(
+        lambda superficie, categoria: metricas.injecao_detectada.labels(
+            superficie=superficie, categoria=categoria
+        ).inc()
+    )
+    llm_compartilhado.registrar_observador(_medir_llm)
+    _observadores_ligados = True
+
+
+def _medir_llm(
+    modelo: str,
+    resultado: str,
+    duracao: float,
+    entrada: int | None,
+    saida: int | None,
+) -> None:
+    metricas.llm_chamadas.labels(modelo=modelo, operacao="gerar", resultado=resultado).inc()
+    if resultado == "ok":
+        metricas.llm_duracao.labels(modelo=modelo, operacao="gerar").observe(duracao)
+    for direcao, quantidade in (("entrada", entrada), ("saida", saida)):
+        if quantidade is not None:
+            metricas.llm_tokens.labels(modelo=modelo, direcao=direcao).inc(quantidade)
 
 
 def _montar_kyc(settings: Settings) -> ConsultaKYC | None:

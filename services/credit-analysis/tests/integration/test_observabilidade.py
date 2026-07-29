@@ -17,6 +17,7 @@ from datetime import date
 
 import pytest
 from fastapi.testclient import TestClient
+from plataforma.seguranca import preparar_conteudo_nao_confiavel
 
 from credit_analysis.api.app import criar_app
 from credit_analysis.api.observabilidade import _motivo_da_revisao
@@ -32,7 +33,6 @@ from credit_analysis.infrastructure.observabilidade.tracing import (
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFake
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.rag.vector_store import VectorStoreMemoria
-from credit_analysis.infrastructure.seguranca import preparar_conteudo_nao_confiavel
 
 pytestmark = pytest.mark.integration
 

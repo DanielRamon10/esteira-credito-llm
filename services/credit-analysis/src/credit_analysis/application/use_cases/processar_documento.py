@@ -23,6 +23,10 @@ from pathlib import Path
 from uuid import UUID
 
 import structlog
+from plataforma.seguranca import (
+    ConteudoSanitizado,
+    preparar_conteudo_nao_confiavel,
+)
 
 from credit_analysis.application.ports import ConsultaBureau, MotorOCR, RepositorioAnalises
 from credit_analysis.domain import scoring
@@ -41,10 +45,6 @@ from credit_analysis.domain.extrato import ResumoExtrato, Transacao, analisar_ex
 from credit_analysis.domain.value_objects import Dinheiro, Percentual
 from credit_analysis.infrastructure.ocr import documentos as leitor
 from credit_analysis.infrastructure.ocr.extracao import extrair_holerite, extrair_transacoes
-from credit_analysis.infrastructure.seguranca import (
-    ConteudoSanitizado,
-    preparar_conteudo_nao_confiavel,
-)
 
 logger = structlog.get_logger(__name__)
 

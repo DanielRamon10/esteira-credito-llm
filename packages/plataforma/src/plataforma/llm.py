@@ -1,4 +1,4 @@
-"""Adapter Ollama do port `ModeloLinguagem`.
+"""Cliente Ollama compartilhado, com gancho de observacao.
 
 Modelo rodando na propria maquina: sem chave, sem conta, sem limite de
 requisicao e sem custo por token. Para uma esteira de credito ha um argumento
@@ -38,17 +38,46 @@ mais rapido, mas produz citacao rejeitada, o que derruba `Fundamentacao.confiave
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import structlog
-
-from credit_analysis.infrastructure.observabilidade import metricas
-from credit_analysis.infrastructure.observabilidade.tracing import marcar_erro, span
 
 if TYPE_CHECKING:  # pragma: no cover
     from langchain_ollama import ChatOllama
 
 logger = structlog.get_logger(__name__)
+
+# Gancho de observacao, pelo mesmo motivo do modulo de seguranca: a biblioteca nao
+# importa `prometheus_client`. O servico registra o que quer contar.
+#
+# Contrato: `(modelo, resultado, duracao_segundos, tokens_entrada, tokens_saida)`.
+_Observador = Callable[[str, str, float, int | None, int | None], None]
+_observadores: list[_Observador] = []
+
+
+def registrar_observador(observador: _Observador) -> None:
+    """Registra um callback chamado ao fim de cada geracao (sucesso ou erro)."""
+    _observadores.append(observador)
+
+
+def limpar_observadores() -> None:
+    _observadores.clear()
+
+
+def _notificar(
+    modelo: str,
+    resultado: str,
+    duracao: float,
+    entrada: int | None = None,
+    saida: int | None = None,
+) -> None:
+    for observador in _observadores:
+        try:
+            observador(modelo, resultado, duracao, entrada, saida)
+        except Exception:
+            logger.warning("llm.observador_falhou", exc_info=True)
+
 
 MODELO_PADRAO = "llama3.1:8b"
 
@@ -142,44 +171,33 @@ class LLMOllama:
         inicio = time.perf_counter()
 
         try:
-            with span(
-                "llm.gerar",
-                **{
-                    "llm.modelo": self._modelo,
-                    "llm.max_tokens": max_tokens,
-                    # Tamanho do prompt, nao o prompt: ele carrega renda, CPF
-                    # mascarado e trecho de politica interna.
-                    "llm.tamanho_prompt": len(sistema) + len(usuario),
-                },
-            ):
-                resposta = await self._obter_cliente(max_tokens).ainvoke(
-                    [("system", sistema), ("human", usuario)]
-                )
-        except Exception as exc:
-            # A metrica de falha e registrada aqui e a excecao segue subindo: quem
-            # chamou decide o que fazer, mas a contagem nao pode depender disso.
-            metricas.llm_chamadas.labels(
-                modelo=self.identificacao, operacao="gerar", resultado="erro"
-            ).inc()
-            marcar_erro(exc)
+            resposta = await self._obter_cliente(max_tokens).ainvoke(
+                [("system", sistema), ("human", usuario)]
+            )
+        except Exception:
+            # Notifica e deixa a excecao subir: quem chamou decide o que fazer, mas a
+            # contagem nao pode depender dessa decisao.
+            _notificar(self.identificacao, "erro", time.perf_counter() - inicio)
             raise
 
         duracao = time.perf_counter() - inicio
         texto = resposta.text if isinstance(resposta.text, str) else str(resposta.content)
         uso = dict(resposta.usage_metadata or {})
 
-        metricas.llm_duracao.labels(modelo=self.identificacao, operacao="gerar").observe(duracao)
-        metricas.llm_chamadas.labels(
-            modelo=self.identificacao, operacao="gerar", resultado="ok"
-        ).inc()
-        for direcao, chave in (("entrada", "input_tokens"), ("saida", "output_tokens")):
-            # `usage_metadata` e um dict de tipo aberto: o provedor pode devolver
-            # None, string ou nada. Contador que recebe lixo levanta excecao no
-            # meio de uma resposta que ja foi gerada com sucesso.
-            if isinstance(quantidade := uso.get(chave), int | float):
-                metricas.llm_tokens.labels(modelo=self.identificacao, direcao=direcao).inc(
-                    float(quantidade)
-                )
+        # `usage_metadata` e um dict de tipo aberto: o provedor pode devolver None,
+        # string ou nada. Normalizar aqui evita que cada observador precise se
+        # defender do mesmo lixo.
+        def inteiro(chave: str) -> int | None:
+            valor = uso.get(chave)
+            return int(valor) if isinstance(valor, int | float) else None
+
+        _notificar(
+            self.identificacao,
+            "ok",
+            duracao,
+            inteiro("input_tokens"),
+            inteiro("output_tokens"),
+        )
 
         logger.info(
             "llm.resposta",

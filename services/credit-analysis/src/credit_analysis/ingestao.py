@@ -19,10 +19,10 @@ import time
 from pathlib import Path
 
 import structlog
+from plataforma.logging import configurar_logging
 
 from credit_analysis.config import Settings, get_settings
 from credit_analysis.infrastructure.event_loop import executar
-from credit_analysis.infrastructure.logging import configurar_logging
 from credit_analysis.infrastructure.rag.carregador import CorpusInvalido, carregar_corpus
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFastEmbed
 from credit_analysis.infrastructure.rag.pgvector_store import VectorStorePgVector, criar_pool

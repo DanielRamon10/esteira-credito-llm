@@ -11,6 +11,10 @@ dependencies = [
     "numpy>=2.1",
     "pandas>=2.2",
     "structlog>=24.4",
+    # Infraestrutura tecnica compartilhada do monorepo (logging, seguranca, BM25,
+    # cliente Ollama). Dependencia de caminho: no monorepo o codigo e resolvido do
+    # disco, sem publicar pacote. Ver packages/plataforma/README.md.
+    "plataforma[llm]",
     # RAG: embeddings locais via ONNX (sem torch) e parsing do front-matter.
     "fastembed>=0.4",
     "pyyaml>=6.0",
@@ -50,6 +54,9 @@ dev = [
     "pandas-stubs>=2.2",
     "types-PyYAML>=6.0",
 ]
+
+[tool.uv.sources]
+plataforma = { path = "../../packages/plataforma", editable = true }
 
 [build-system]
 requires = ["hatchling"]

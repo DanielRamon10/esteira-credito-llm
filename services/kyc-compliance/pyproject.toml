@@ -20,6 +20,9 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
     "structlog>=24.4",
+    # Compartilhada, SEM o extra `llm`: este servico nao usa modelo de linguagem, e
+    # nao deve instalar o cliente do Ollama por tabela.
+    "plataforma",
     "prometheus-client>=0.21",
 ]
 
@@ -32,6 +35,9 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
 ]
+
+[tool.uv.sources]
+plataforma = { path = "../../packages/plataforma", editable = true }
 
 [build-system]
 requires = ["hatchling"]

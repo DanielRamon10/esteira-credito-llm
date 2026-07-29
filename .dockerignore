@@ -1,0 +1,31 @@
+# Contexto de build da raiz — usado pelos Dockerfiles dos servicos, que precisam
+# alcancar `packages/plataforma` (fora do diretorio de cada servico).
+#
+# Sem este arquivo, o contexto levaria os `.venv` de tres projetos, os caches e o
+# `.git` inteiro: centenas de MB enviados ao daemon a cada build.
+
+**/.venv/
+**/.env
+!**/.env.example
+
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+
+.git/
+.github/
+infra/
+docs/
+
+# Testes ficam fora da imagem de producao: o CI roda a suite no repositorio.
+**/tests/
+
+**/*.md
+!**/README.md
+**/Dockerfile
+.dockerignore
+docker-compose.yml

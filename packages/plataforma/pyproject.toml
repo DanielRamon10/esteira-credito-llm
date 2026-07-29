@@ -1,0 +1,68 @@
+[project]
+name = "plataforma"
+version = "0.1.0"
+description = "Infraestrutura tecnica compartilhada entre os servicos do monorepo"
+requires-python = ">=3.12"
+
+# **Uma** dependencia obrigatoria, e o numero e o ponto.
+#
+# Uma biblioteca compartilhada pesada seria pior que a duplicacao que ela remove:
+# todo servico do monorepo passaria a arrastar o que apenas um deles precisa. Por
+# isso `plataforma` NAO conhece Prometheus nem OpenTelemetry — ela expoe ganchos de
+# observacao e cada servico decide o que medir (ver README).
+#
+# A primeira versao deste arquivo listava `numpy`, por reflexo: o BM25 do
+# `credit-analysis` fica ao lado de codigo que usa NumPy, e eu assumi que ele
+# tambem usava. Conferindo os imports: `math`, `re` e `unicodedata`, nada mais. A
+# implementacao e stdlib puro. Teria arrastado 43MB para todo consumidor por
+# suposicao.
+#
+# `langchain-ollama` fica em extra opcional pelo mesmo motivo: um servico que nao
+# use LLM nao deve instalar o cliente.
+dependencies = [
+    "structlog>=24.4",
+]
+
+[project.optional-dependencies]
+llm = ["langchain-ollama>=1.0"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/plataforma"]
+
+# `py.typed` (PEP 561) precisa ir no wheel.
+#
+# Sem esse marcador o mypy do consumidor trata a biblioteca como nao-tipada e
+# **enfraquece o --strict em silencio**: `from plataforma.seguranca import ...` passa
+# a devolver `Any`, e toda checagem a jusante daquele import deixa de valer. Foi
+# exatamente o que aconteceu na primeira instalacao — os dois servicos reportaram
+# "missing library stubs" e teriam continuado com verificacao degradada.
+artifacts = ["src/plataforma/py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S", "BLE", "SLF"]
+ignore = ["S101", "RUF001", "RUF002", "RUF003", "N818"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["langchain_ollama.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"

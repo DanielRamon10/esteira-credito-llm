@@ -9,11 +9,11 @@ provedor pedido explicitamente **falha em vez de degradar em silencio**.
 from __future__ import annotations
 
 import pytest
+from plataforma.llm import LLMOllama
 
 from credit_analysis.api.app import _montar_llm
 from credit_analysis.config import Ambiente, ProvedorLLM, Settings
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
-from credit_analysis.infrastructure.llm.ollama_adapter import LLMOllama
 
 # De proposito **sem** o formato real de uma chave (`sk-ant-...`): o que o
 # codigo testa e presenca, nao formato (`usar_llm_real` so verifica se a string

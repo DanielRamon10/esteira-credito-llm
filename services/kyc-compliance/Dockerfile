@@ -1,5 +1,25 @@
 # Imagem do kyc-compliance.
 #
+# ## O contexto de build e a RAIZ do repositorio, nao o diretorio do servico
+#
+# Isso mudou quando `packages/plataforma` passou a existir. A dependencia de caminho
+# (`plataforma = { path = "../../packages/plataforma" }`) aponta para fora do
+# diretorio do servico, e o Docker nao consegue copiar nada que esteja acima do
+# contexto — o build falhava com "path outside the build context".
+#
+# Duas alternativas foram descartadas: publicar a biblioteca num registry privado
+# (infraestrutura nova para um monorepo de tres servicos) e copiar os arquivos para
+# dentro de cada servico no build (que reintroduz a duplicacao que a extracao
+# removeu, so mais tarde).
+#
+# O preco de usar a raiz e um contexto de build maior; o `.dockerignore` da raiz
+# limita o que entra.
+#
+#     docker build -f services/kyc-compliance/Dockerfile -t kyc-compliance:dev .
+#
+# No compose isso e o `context: .` com `dockerfile:` apontando para ca.
+
+#
 # ## O contraste com o outro servico e o argumento a favor de separar
 #
 # A imagem do `credit-analysis` tem 1,18GB: OpenCV, pandas, PyMuPDF, ONNX Runtime e
@@ -27,19 +47,33 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-WORKDIR /app
+WORKDIR /repo/services/kyc-compliance
 
 # Metadado antes do codigo: mudar uma linha do dominio nao reinstala dependencia.
-COPY pyproject.toml README.md ./
-COPY src/kyc_compliance/__init__.py src/kyc_compliance/__init__.py
+# A biblioteca compartilhada, ANTES do `uv pip install`: sem ela no disco a
+# dependencia de caminho nao resolve.
+#
+# O estagio de build **replica a estrutura do repositorio**: o servico em
+# `/repo/services/<nome>` e a biblioteca em `/repo/packages/plataforma`. Assim o
+# `path = "../../packages/plataforma"` do pyproject resolve sem override.
+#
+# A primeira tentativa foi copiar para `/packages/plataforma` mantendo o
+# `WORKDIR /app`, e o `uv` recusou: `/app/../../packages` sobe acima da raiz, e ele
+# nao normaliza caminho que escapa do diretorio base. A mensagem foi clara —
+# "cannot normalize a relative path beyond the base directory" — e a licao e que
+# dependencia de caminho num monorepo exige que a imagem espelhe o layout.
+COPY packages/plataforma/ /repo/packages/plataforma/
+COPY services/kyc-compliance/pyproject.toml services/kyc-compliance/README.md ./
+COPY services/kyc-compliance/src/kyc_compliance/__init__.py src/kyc_compliance/__init__.py
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /app/.venv && uv pip install .
+    uv venv /opt/venv \
+ && uv pip install --python /opt/venv/bin/python .
 
-COPY src/ src/
+COPY services/kyc-compliance/src/ src/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-deps --reinstall-package kyc-compliance .
+    uv pip install --python /opt/venv/bin/python --no-deps --reinstall-package kyc-compliance .
 
 
 # -------------------------------------------------------------------- runtime
@@ -64,8 +98,23 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 WORKDIR /app
 
-COPY --from=construcao --chown=kyc:kyc /app/.venv /app/.venv
-COPY --from=construcao --chown=kyc:kyc /app/src /app/src
+# A biblioteca compartilhada tambem vai para o runtime, e o motivo e sutil.
+#
+# O `pyproject` declara a dependencia como **editavel** (`editable = true`), que e o
+# que se quer em desenvolvimento: editar `plataforma` reflete nos tres servicos sem
+# reinstalar. Numa imagem, porem, o venv guarda apenas um ponteiro para o caminho de
+# origem — e copiar so o `/opt/venv` deixa esse ponteiro apontando para nada.
+#
+# O sintoma foi exatamente esse: `ModuleNotFoundError: No module named 'plataforma'`
+# num container cujo `uv pip install` tinha passado sem erro.
+#
+# Copiar o pacote (cinco arquivos, ~30KB) e mais simples que trocar a instalacao por
+# nao-editavel no build, o que exigiria contornar o `[tool.uv.sources]` do proprio
+# pyproject e faria imagem e desenvolvimento divergirem.
+COPY --from=construcao --chown=kyc:kyc /repo/packages/plataforma /repo/packages/plataforma
+
+COPY --from=construcao --chown=kyc:kyc /opt/venv /app/.venv
+COPY --from=construcao --chown=kyc:kyc /repo/services/kyc-compliance/src /app/src
 
 # As listas entram na imagem, e essa e uma diferenca deliberada em relacao ao
 # corpus de politicas do outro servico (que fica fora, porque a ingestao e passo
@@ -79,7 +128,7 @@ COPY --from=construcao --chown=kyc:kyc /app/src /app/src
 #
 # Em producao a lista oficial vem de fonte externa e substitui estas por volume ou
 # initContainer; o conteudo versionado aqui e sintetico (ver dados/listas/README.md).
-COPY --chown=kyc:kyc dados/ dados/
+COPY --chown=kyc:kyc services/kyc-compliance/dados/ dados/
 
 USER kyc
 

@@ -8,8 +8,7 @@ detectar sem conter seria falsa seguranca.
 from __future__ import annotations
 
 import pytest
-
-from credit_analysis.infrastructure.seguranca import (
+from plataforma.seguranca import (
     TAG_ENVELOPE,
     detectar_injecao,
     envelopar,

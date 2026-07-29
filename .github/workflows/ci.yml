@@ -93,6 +93,9 @@ jobs:
 
       - name: Instalar dependencias
         working-directory: ${{ env.SERVICO }}
+        # A dependencia de caminho para `packages/plataforma` resolve sozinha porque
+        # o checkout traz o monorepo inteiro — o `uv` le o `[tool.uv.sources]` do
+        # pyproject e instala a biblioteca do disco.
         run: |
           uv venv --python ${{ env.PYTHON_VERSION }}
           uv pip install -e ".[dev]"
@@ -135,6 +138,54 @@ jobs:
             echo "::error::Testes de integracao pulados — o service container nao foi alcancado"
             exit 1
           fi
+
+  plataforma:
+    name: Lint, tipagem e testes (plataforma)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # A biblioteca compartilhada tem job proprio, e nao apenas cobertura indireta
+    # pelos servicos que a usam. O motivo: um defeito nela atinge os tres servicos
+    # ao mesmo tempo, e descobrir isso pela falha de um consumidor perde o sinal de
+    # onde o problema esta.
+    #
+    # O que ela tem de teste proprio e o que a extracao introduziu de NOVO: os
+    # ganchos de observacao. O resto dos modulos veio testado pelos servicos.
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "packages/plataforma/pyproject.toml"
+
+      - name: Instalar dependencias
+        working-directory: packages/plataforma
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install -e ".[llm,dev]"
+
+      - name: Formatacao, lint e tipagem
+        working-directory: packages/plataforma
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+
+      - name: Testes
+        working-directory: packages/plataforma
+        run: uv run pytest -q
+
+      - name: Conferir que a biblioteca nao conhece observabilidade
+        # A regra de dependencia mais importante desta biblioteca, verificada em vez
+        # de apenas documentada: se `prometheus_client` ou `opentelemetry` aparecerem
+        # num import aqui, todo consumidor futuro fica preso a esta stack.
+        run: |
+          if grep -rn "import prometheus_client\|from prometheus_client\|import opentelemetry\|from opentelemetry" packages/plataforma/src; then
+            echo "::error::plataforma passou a importar biblioteca de observabilidade — use os ganchos"
+            exit 1
+          fi
+          echo "  nenhum import de observabilidade (correto)"
 
   qualidade-kyc:
     name: Lint, tipagem e testes (kyc-compliance)
@@ -306,7 +357,10 @@ jobs:
       - name: Construir (sem publicar)
         uses: docker/build-push-action@v6
         with:
-          context: ${{ env.SERVICO }}
+          # Contexto na raiz: os servicos dependem de `packages/plataforma`, que esta
+          # fora do diretorio de cada um. Ver a nota no topo do Dockerfile.
+          context: .
+          file: ${{ env.SERVICO }}/Dockerfile
           push: false
           load: true
           tags: credit-analysis:ci

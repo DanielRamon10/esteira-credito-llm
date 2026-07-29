@@ -35,13 +35,43 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import structlog
 
-from credit_analysis.infrastructure.observabilidade import metricas
-
 logger = structlog.get_logger(__name__)
+
+# Ganchos de observacao, em vez de incrementar metrica direto.
+#
+# A versao anterior deste modulo importava `metricas` do proprio servico. Ao virar
+# biblioteca compartilhada isso deixou de servir: forcaria todo consumidor a usar
+# `prometheus_client`, inclusive um que preferisse OpenTelemetry Metrics ou nada.
+#
+# O contrato do observador e `(superficie, categoria) -> None`. Excecao levantada
+# por um observador e **engolida**: falha ao medir nao pode derrubar a deteccao que
+# esta sendo medida.
+_Observador = Callable[[str, str], None]
+_observadores: list[_Observador] = []
+
+
+def registrar_observador(observador: _Observador) -> None:
+    """Registra um callback chamado a cada categoria de injecao detectada."""
+    _observadores.append(observador)
+
+
+def limpar_observadores() -> None:
+    """Remove todos os observadores — usado pela suite para nao vazar estado."""
+    _observadores.clear()
+
+
+def _notificar(superficie: str, categoria: str) -> None:
+    for observador in _observadores:
+        try:
+            observador(superficie, categoria)
+        except Exception:
+            logger.warning("seguranca.observador_falhou", exc_info=True)
+
 
 # Tag do envelope. Nome longo e especifico de proposito: reduz a chance de
 # colisao acidental com conteudo legitimo do documento.
@@ -199,6 +229,6 @@ def preparar_conteudo_nao_confiavel(
             **(contexto or {}),
         )
         for categoria in categorias:
-            metricas.injecao_detectada.labels(superficie=superficie, categoria=categoria).inc()
+            _notificar(superficie, categoria)
 
     return ConteudoSanitizado(envelopado=envelopar(texto, rotulo), suspeitas=suspeitas)

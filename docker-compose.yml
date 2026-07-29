@@ -69,8 +69,10 @@ services:
 
   kyc:
     build:
-      context: ./services/kyc-compliance
-      dockerfile: Dockerfile
+      # Contexto na raiz: o servico depende de `packages/plataforma`, que esta fora
+      # do diretorio dele. Ver a nota no topo do Dockerfile.
+      context: .
+      dockerfile: services/kyc-compliance/Dockerfile
     image: kyc-compliance:dev
     container_name: credito-kyc
     profiles: ["api"]
@@ -95,8 +97,8 @@ services:
 
   api:
     build:
-      context: ./services/credit-analysis
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: services/credit-analysis/Dockerfile
     image: credit-analysis:dev
     container_name: credito-api
     profiles: ["api"]

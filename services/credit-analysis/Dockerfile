@@ -1,5 +1,25 @@
 # Imagem do credit-analysis.
 #
+# ## O contexto de build e a RAIZ do repositorio, nao o diretorio do servico
+#
+# Isso mudou quando `packages/plataforma` passou a existir. A dependencia de caminho
+# (`plataforma = { path = "../../packages/plataforma" }`) aponta para fora do
+# diretorio do servico, e o Docker nao consegue copiar nada que esteja acima do
+# contexto — o build falhava com "path outside the build context".
+#
+# Duas alternativas foram descartadas: publicar a biblioteca num registry privado
+# (infraestrutura nova para um monorepo de tres servicos) e copiar os arquivos para
+# dentro de cada servico no build (que reintroduz a duplicacao que a extracao
+# removeu, so mais tarde).
+#
+# O preco de usar a raiz e um contexto de build maior; o `.dockerignore` da raiz
+# limita o que entra.
+#
+#     docker build -f services/credit-analysis/Dockerfile -t credit-analysis:dev .
+#
+# No compose isso e o `context: .` com `dockerfile:` apontando para ca.
+
+#
 # ## Multi-stage, e o que fica de fora
 #
 # O estagio `construcao` tem uv, compilador e cabecalhos; o estagio final tem
@@ -57,18 +77,32 @@ ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never
 
-WORKDIR /app
+WORKDIR /repo/services/credit-analysis
 
 # Copia so o metadado antes do codigo. E o que faz a camada de dependencias ser
 # reaproveitada: mudar uma linha de `scoring.py` nao reinstala nada.
-COPY pyproject.toml README.md ./
-COPY src/credit_analysis/__init__.py src/credit_analysis/__init__.py
+# A biblioteca compartilhada, ANTES do `uv pip install`: sem ela no disco a
+# dependencia de caminho nao resolve.
+#
+# O estagio de build **replica a estrutura do repositorio**: o servico em
+# `/repo/services/<nome>` e a biblioteca em `/repo/packages/plataforma`. Assim o
+# `path = "../../packages/plataforma"` do pyproject resolve sem override.
+#
+# A primeira tentativa foi copiar para `/packages/plataforma` mantendo o
+# `WORKDIR /app`, e o `uv` recusou: `/app/../../packages` sobe acima da raiz, e ele
+# nao normaliza caminho que escapa do diretorio base. A mensagem foi clara —
+# "cannot normalize a relative path beyond the base directory" — e a licao e que
+# dependencia de caminho num monorepo exige que a imagem espelhe o layout.
+COPY packages/plataforma/ /repo/packages/plataforma/
+COPY services/credit-analysis/pyproject.toml services/credit-analysis/README.md ./
+COPY services/credit-analysis/src/credit_analysis/__init__.py src/credit_analysis/__init__.py
 
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv venv /app/.venv && uv pip install .
+    uv venv /opt/venv \
+ && uv pip install --python /opt/venv/bin/python .
 
-COPY src/ src/
-COPY politicas/ politicas/
+COPY services/credit-analysis/src/ src/
+COPY services/credit-analysis/politicas/ politicas/
 
 # Reinstala apenas o proprio pacote depois do codigo. A instalacao acima ja
 # trouxe as dependencias (a partir do metadado, com um `__init__.py` vazio como
@@ -77,7 +111,7 @@ COPY politicas/ politicas/
 #
 # `uv pip install` nao aceita `--no-editable`: instalacao sem `-e` ja e o padrao.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-deps --reinstall-package credit-analysis .
+    uv pip install --python /opt/venv/bin/python --no-deps --reinstall-package credit-analysis .
 
 
 # -------------------------------------------------------------------- runtime
@@ -111,9 +145,24 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 WORKDIR /app
 
-COPY --from=construcao --chown=credito:credito /app/.venv /app/.venv
-COPY --from=construcao --chown=credito:credito /app/src /app/src
-COPY --from=construcao --chown=credito:credito /app/politicas /app/politicas
+# A biblioteca compartilhada tambem vai para o runtime, e o motivo e sutil.
+#
+# O `pyproject` declara a dependencia como **editavel** (`editable = true`), que e o
+# que se quer em desenvolvimento: editar `plataforma` reflete nos tres servicos sem
+# reinstalar. Numa imagem, porem, o venv guarda apenas um ponteiro para o caminho de
+# origem — e copiar so o `/opt/venv` deixa esse ponteiro apontando para nada.
+#
+# O sintoma foi exatamente esse: `ModuleNotFoundError: No module named 'plataforma'`
+# num container cujo `uv pip install` tinha passado sem erro.
+#
+# Copiar o pacote (cinco arquivos, ~30KB) e mais simples que trocar a instalacao por
+# nao-editavel no build, o que exigiria contornar o `[tool.uv.sources]` do proprio
+# pyproject e faria imagem e desenvolvimento divergirem.
+COPY --from=construcao --chown=credito:credito /repo/packages/plataforma /repo/packages/plataforma
+
+COPY --from=construcao --chown=credito:credito /opt/venv /app/.venv
+COPY --from=construcao --chown=credito:credito /repo/services/credit-analysis/src /app/src
+COPY --from=construcao --chown=credito:credito /repo/services/credit-analysis/politicas /app/politicas
 
 RUN mkdir -p /cache && chown -R credito:credito /cache
 

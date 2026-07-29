@@ -61,6 +61,7 @@ from typing import Any
 from uuid import UUID
 
 import structlog
+from plataforma.seguranca import preparar_conteudo_nao_confiavel
 from pydantic import BaseModel, Field, ValidationError
 
 from credit_analysis.application.ports import RepositorioAnalises
@@ -69,7 +70,6 @@ from credit_analysis.domain.agente import PassoAgente
 from credit_analysis.domain.entities import PropostaCredito, Solicitante
 from credit_analysis.domain.value_objects import CPF, Dinheiro, Percentual
 from credit_analysis.infrastructure.rag.retriever import ConfiguracaoBusca, RetrieverHibrido
-from credit_analysis.infrastructure.seguranca import preparar_conteudo_nao_confiavel
 
 logger = structlog.get_logger(__name__)
 

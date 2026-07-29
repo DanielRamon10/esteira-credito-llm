@@ -11,9 +11,9 @@ from __future__ import annotations
 from datetime import date
 
 import pytest
+from plataforma.bm25 import IndiceBM25, tokenizar
 
 from credit_analysis.domain.politica import ReferenciaPolitica, TrechoPolitica
-from credit_analysis.infrastructure.rag.bm25 import IndiceBM25, tokenizar
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFake
 from credit_analysis.infrastructure.rag.retriever import ConfiguracaoBusca, RetrieverHibrido
 from credit_analysis.infrastructure.rag.vector_store import VectorStoreMemoria

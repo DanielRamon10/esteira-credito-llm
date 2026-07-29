@@ -1,8 +1,12 @@
-"""Logging estruturado com structlog.
+"""Logging estruturado com structlog (compartilhado).
 
 Log em JSON com chaves estaveis, nao string interpolada. A diferenca importa
-quando a Camada 5 mandar isso para Loki/CloudWatch: `analise_id` como campo e
-consultavel, dentro de uma frase nao e.
+quando isso for para Loki ou CloudWatch: `analise_id` como campo e consultavel,
+dentro de uma frase nao e.
+
+Compartilhado porque nao ha razao para dois servicos do mesmo monorepo
+formatarem log de formas diferentes — quem investiga um incidente que atravessa
+os dois precisa do mesmo shape de evento nos dois lados.
 
 Em desenvolvimento o renderer vira console colorido, porque JSON puro no
 terminal e ilegivel.

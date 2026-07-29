@@ -18,6 +18,8 @@ caixa-preta que ninguém consegue auditar.
 
 ```
 esteira-credito-llm/
+├── packages/
+│   └── plataforma/          # Infra técnica compartilhada (1 dependência)
 ├── services/
 │   ├── credit-analysis/     # Esteira de crédito: RAG, OCR, agente (1,18GB)
 │   └── kyc-compliance/      # Triagem contra listas restritivas (253MB)
@@ -323,16 +325,42 @@ O `X-Request-ID` é **propagado e reaproveitado** entre os dois serviços — se
 investigar uma análise que consultou o KYC exigiria cruzar timestamp entre dois
 conjuntos de log.
 
-### Sobre duplicação, que é a decisão central de um monorepo
+### `packages/plataforma`: extraída com evidência, não por antecipação
 
-Há duplicação consciente entre os serviços: validação de CPF, logging, mascaramento.
-**Não extraí biblioteca compartilhada**, e o motivo é que extrair antes do segundo
-consumidor é adivinhar a abstração.
+Durante duas camadas resisti a criar biblioteca compartilhada — **extrair antes do
+segundo consumidor é adivinhar a abstração**. O terceiro serviço forçou a decisão, e
+a medição mostrou o tamanho da repetição: `seguranca` em 15 pontos de uso, `tracing`
+em 13, `llm` em 6, `bm25` e `logging` em 5 cada.
 
-E há uma distinção que vai ficar: compartilhar **infraestrutura técnica** (logging,
-métricas, detecção de injeção) vale; compartilhar **domínio** entre bounded contexts
-é o acoplamento que DDD alerta contra — o `kyc-compliance` vai precisar de CNPJ e
-documento estrangeiro, o `credit-analysis` não.
+**A regra de dependência é o que mais importa nela: `plataforma` não conhece
+Prometheus nem OpenTelemetry.** Incrementar contador direto forçaria todo consumidor
+futuro à mesma stack. Em vez disso ela expõe ganchos — `registrar_observador` — e
+cada serviço traduz para a métrica que usa, no composition root. Um teste do CI
+falha o build se um import de observabilidade aparecer ali.
+
+O efeito: **uma** dependência obrigatória (`structlog`), contra 21 do
+`credit-analysis`. Uma biblioteca compartilhada pesada seria pior que a duplicação
+que ela remove.
+
+**Domínio continua fora.** Nada de `CPF`, `Dinheiro` ou entidade de negócio: cada
+serviço é um bounded context, e o `kyc-compliance` vai precisar de CNPJ e documento
+estrangeiro que o outro não. A validação de CPF segue duplicada nos dois — preço
+consciente, anotado nos dois lados.
+
+Três detalhes que a extração ensinou, cada um com sintoma real:
+
+- **`numpy` entrou na lista de dependências por reflexo** e não era usado: o BM25 é
+  `math` + `re` + `unicodedata`, stdlib puro. Teria arrastado 43MB para todo
+  consumidor por suposição.
+- **Sem `py.typed` (PEP 561), o `--strict` dos consumidores é enfraquecido em
+  silêncio** — os dois serviços passaram a reportar "missing library stubs" e
+  seguiriam com verificação degradada.
+- **A dependência de caminho quebra o build da imagem.** O Docker não copia nada
+  acima do contexto, e o `uv` recusa caminho que escapa da raiz. A solução foi mover
+  o contexto para a raiz do repositório e **replicar o layout do monorepo** dentro do
+  estágio de build. Depois disso ainda faltava copiar a biblioteca para o runtime:
+  instalação editável guarda um ponteiro, e copiar só o venv deixava
+  `ModuleNotFoundError` num container cujo build passou sem erro.
 
 ## Observabilidade
 

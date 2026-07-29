@@ -46,11 +46,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from plataforma.bm25 import IndiceBM25
+
 from credit_analysis.application.ports import Embedder, RepositorioPoliticas
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
 from credit_analysis.infrastructure.observabilidade import metricas
 from credit_analysis.infrastructure.observabilidade.tracing import span
-from credit_analysis.infrastructure.rag.bm25 import IndiceBM25
 
 # Constante do RRF. Valor 60 e o do paper original (Cormack et al., 2009);
 # amortece o peso das primeiras posicoes para que um unico ranking muito
