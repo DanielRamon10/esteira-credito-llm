@@ -1,0 +1,116 @@
+# HPA, PodDisruptionBudget e NetworkPolicy.
+#
+# Autoscaling por CPU e uma aproximacao, e vale dizer por que: a maior parte do
+# tempo de uma requisicao de agente e **espera** por inferencia, e espera nao
+# aparece como uso de CPU. A metrica correta seria `credito_http_em_andamento`,
+# que mede saturacao real — mas exige o Prometheus Adapter instalado no cluster.
+#
+# CPU fica como base portavel, com a limitacao registrada na anotacao em vez de
+# escondida. Um HPA que parece funcionar e escala tarde e pior que um HPA que
+# declara sua propria imprecisao.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: credit-analysis
+  annotations:
+    limitacao-conhecida: >-
+      Escala por CPU, mas o tempo dominante e espera por inferencia (80s
+      medidos), que nao aparece como CPU. Proximo passo: metrica customizada
+      credito_http_em_andamento via Prometheus Adapter.
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: credit-analysis
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # Subir rapido: fila de credito acumulando significa cliente esperando.
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # Descer devagar: cada pod novo paga o download de 2,24GB do modelo, entao
+      # remover cedo demais sai caro quando o trafego oscila.
+      stabilizationWindowSeconds: 300
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: credit-analysis
+spec:
+  # Valor absoluto e nao porcentagem: com 2 replicas, `50%` daria o mesmo
+  # resultado, mas com 1 replica arredondaria para zero e um drain de no levaria
+  # o servico ao ar. Absoluto e previsivel em qualquer escala.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis
+---
+# Nega tudo e libera o necessario.
+#
+# Sem NetworkPolicy, um pod comprometido alcanca qualquer servico do cluster. Num
+# servico que le documento de cliente e fala com banco, egress irrestrito e o
+# caminho de exfiltracao mais direto que existe — e o mais facil de esquecer,
+# porque nada para de funcionar quando ele esta aberto.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credit-analysis
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+      ports:
+        - port: 8000
+    # Scrape do Prometheus, que vive em outro namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 8000
+  egress:
+    # DNS primeiro. Esquecer esta regra e o erro classico de NetworkPolicy: tudo
+    # passa a falhar com erro de resolucao de nome, e a policy raramente e a
+    # primeira suspeita.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dados
+      ports:
+        - port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ia
+      ports:
+        - port: 11434
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 4318

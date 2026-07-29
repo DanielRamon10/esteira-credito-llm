@@ -1,0 +1,21 @@
+# Estado do Terraform NUNCA vai para o Git.
+#
+# O arquivo de estado contem valor de segredo em texto claro — inclusive o que o
+# provider leu do Secrets Manager para comparar com o desejado. Commitar estado
+# e vazar credencial, mesmo em repositorio privado.
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+
+# O `.terraform.lock.hcl` NAO entra nesta lista: ele **deve** ser versionado.
+#
+# E o lock de provider — fixa versao e hash de cada provider baixado. Sem ele no
+# Git, dois `init` em momentos diferentes podem trazer versoes distintas do
+# provider AWS, e a mesma configuracao passa a gerar plano diferente. E o
+# equivalente ao lockfile de dependencia da aplicacao, e ignora-lo e o erro mais
+# comum em repositorio de Terraform.
+
+# Arquivo de variaveis com valor real. O `.tfvars.example` documenta a forma.
+*.tfvars
+!*.tfvars.example

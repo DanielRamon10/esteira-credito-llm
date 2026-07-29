@@ -1,0 +1,299 @@
+# Pipeline de integracao continua.
+#
+# ## O que este pipeline garante, e o que nao garante
+#
+# Garante: lint, tipagem estrita, 360 testes (inclusive os de integracao contra
+# pgvector de verdade), schema dos manifests Kubernetes, validade do Terraform e
+# que a imagem constroi. Tudo isso sem chave de API e sem conta em nuvem.
+#
+# Nao garante qualidade de retrieval nem de OCR. Os evals dependem de baixar
+# 2,24GB de modelo e do binario do Tesseract, e sao **medicao**, nao teste
+# binario: o resultado e "90% de acerto no top-1", que precisa de julgamento
+# humano para virar aprovado ou reprovado. Rodam sob demanda, no workflow
+# `qualidade-ia.yml`.
+#
+# ## Por que os jobs sao paralelos e nao sequenciais
+#
+# `qualidade`, `infraestrutura` e `imagem` nao dependem um do outro. Em serie, um
+# erro de formatacao em HCL faria esperar a suite inteira para so depois
+# descobrir. Em paralelo, o feedback de cada dimensao chega no tempo dela.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancela execucao anterior do mesmo ref: em sequencia de pushes, o resultado do
+# commit intermediario nao interessa e ocupa runner.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Permissao minima no topo. Cada job que precisar de mais declara localmente —
+# sem isso, o token teria escrita em todo o repositorio em todos os jobs.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  SERVICO: services/credit-analysis
+
+jobs:
+  qualidade:
+    name: Lint, tipagem e testes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Postgres com pgvector como service container: e o que permite rodar os
+    # testes de integracao de verdade em vez de pular 15 deles. A imagem oficial
+    # do pgvector evita compilar a extensao no runner.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: credito
+          POSTGRES_PASSWORD: credito_local
+          POSTGRES_DB: credito
+        ports:
+          - 5432:5432
+        # O healthcheck do compose confere a extensao; aqui basta o `pg_isready`,
+        # porque a extensao e criada pelo schema.sql abaixo e nao pelo initdb (o
+        # service container nao monta volume).
+        options: >-
+          --health-cmd "pg_isready -U credito -d credito"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Instalar uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.SERVICO }}/pyproject.toml"
+
+      - name: Preparar o banco de teste
+        # Os testes de integracao derivam `<banco>_test` do DSN e dao TRUNCATE na
+        # tabela. Criar o banco separado aqui reproduz o que o
+        # `infra/postgres/init/01-bancos.sh` faz localmente — e a protecao que
+        # impede a suite de apagar o corpus do banco de desenvolvimento.
+        env:
+          PGPASSWORD: credito_local
+        run: |
+          psql -h localhost -U credito -d credito -c "CREATE DATABASE credito_test OWNER credito;"
+          for banco in credito credito_test; do
+            psql -h localhost -U credito -d "$banco" -f infra/postgres/schema.sql
+          done
+
+      - name: Instalar dependencias
+        working-directory: ${{ env.SERVICO }}
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install -e ".[dev]"
+
+      - name: Formatacao (ruff format)
+        working-directory: ${{ env.SERVICO }}
+        run: uv run ruff format --check .
+
+      - name: Lint (ruff check)
+        working-directory: ${{ env.SERVICO }}
+        run: uv run ruff check .
+
+      - name: Tipagem estrita (mypy)
+        working-directory: ${{ env.SERVICO }}
+        run: uv run mypy
+
+      - name: Testes
+        working-directory: ${{ env.SERVICO }}
+        env:
+          # Com o DSN definido, os 15 testes de integracao de pgvector rodam de
+          # verdade em vez de pular. Um teste pulado num pipeline verde e pior que
+          # um teste falhando: da a impressao de cobertura que nao existe.
+          CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@localhost:5432/credito
+          # Fake explicito: sem isto o modo `auto` tentaria alcancar um Ollama que
+          # nao existe no runner, e o resultado dependeria de timeout de rede.
+          CREDIT_PROVEDOR_LLM: fake
+        run: uv run pytest -q --cov=credit_analysis --cov-report=term-missing
+
+      - name: Conferir que nenhum teste foi pulado em silencio
+        working-directory: ${{ env.SERVICO }}
+        env:
+          CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@localhost:5432/credito
+          CREDIT_PROVEDOR_LLM: fake
+        # `-rs` lista o motivo de cada skip. O grep falha o job se houver skip por
+        # falta de Postgres — que e exatamente o cenario em que o pipeline pareceria
+        # verde tendo exercitado 15 testes menos.
+        run: |
+          uv run pytest -q -rs 2>&1 | tee resultado.txt
+          if grep -q "CREDIT_POSTGRES_DSN nao definido" resultado.txt; then
+            echo "::error::Testes de integracao pulados — o service container nao foi alcancado"
+            exit 1
+          fi
+
+  seguranca:
+    name: Varredura de segredo
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Historico completo: a varredura precisa olhar todos os commits, nao
+          # apenas o topo. Uma chave removida no ultimo commit continua no
+          # historico e continua comprometida.
+          fetch-depth: 0
+
+      - name: Varrer o historico com o hook do repositorio
+        # Reusa o hook em vez de uma acao de terceiro: a regra que roda no CI passa
+        # a ser exatamente a que roda na maquina de quem commita, em vez de duas
+        # listas de padrao que divergem com o tempo.
+        #
+        # `--tudo` e obrigatorio aqui. No modo padrao o hook olha o que esta em
+        # stage, e num clone limpo do CI nao ha nada em stage: o passo passaria
+        # sempre, sem examinar arquivo nenhum. Verde por vacuidade e pior que
+        # ausencia de verificacao.
+        run: bash .githooks/pre-commit --tudo
+
+      - name: Conferir que a varredura de fato detecta
+        # Teste negativo do proprio detector. Sem ele, um erro que quebre o grep
+        # deixaria o passo acima verde para sempre — foi assim que dois bugs reais
+        # sobreviveram neste hook (word splitting e padrao comecando com `-`).
+        run: |
+          set -eu
+
+          # ## Por que as chaves falsas sao MONTADAS em pedacos
+          #
+          # Escrever `sk-ant-api03-AAAA...` literalmente aqui faria o proprio hook
+          # bloquear o commit deste arquivo — e com razao, porque ele nao tem como
+          # saber que a chave e falsa. Aconteceu de fato na primeira versao.
+          #
+          # A saida NAO e excluir `.github/` da varredura: workflow e um dos
+          # lugares mais comuns onde credencial e colada por engano. A saida e a
+          # mesma adotada nos testes de unidade: montar o valor em tempo de
+          # execucao, para que o **arquivo** nao contenha nada com formato de
+          # segredo, mas o **arquivo gerado** contenha. Enfraquecer o detector para
+          # acomodar seu proprio teste seria trocar defesa real por conveniencia.
+          #
+          # Sem `printf` com escape: dentro de bloco YAML o `\n` e fonte facil de
+          # erro silencioso. `echo` por linha e verboso e inequivoco.
+          verificar() {
+            rotulo="$1"
+            arquivo="$2"
+            git add "$arquivo"
+            if bash .githooks/pre-commit > /dev/null 2>&1; then
+              echo "::error::o hook NAO detectou $rotulo"
+              exit 1
+            fi
+            git rm -q --cached "$arquivo"
+            rm -f "$arquivo"
+            echo "  detectado: $rotulo"
+          }
+
+          PREFIXO_ANT="sk-""ant"
+          CORPO=$(printf 'A%.0s' $(seq 1 40))
+          echo "chave = \"${PREFIXO_ANT}-api03-${CORPO}\"" > vazamento_ci.py
+          verificar "chave de API da Anthropic" vazamento_ci.py
+
+          # A deteccao de PEM esteve quebrada por um padrao que comecava com `-`,
+          # interpretado como opcao pelo `git grep`. Este caso existe para que ela
+          # nao volte a quebrar em silencio.
+          PALAVRA="KEY"
+          {
+            echo "-----BEGIN RSA PRIVATE ${PALAVRA}-----"
+            echo "MIIEow=="
+          } > pem_ci.txt
+          verificar "chave privada PEM" pem_ci.txt
+
+          echo "aws = \"AKIA""IOSFODNN7EXAMPLE\"" > aws_ci.txt
+          verificar "chave de acesso da AWS" aws_ci.txt
+
+  infraestrutura:
+    name: Kubernetes e Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Validar schema dos manifests (kubeconform, modo estrito)
+        run: |
+          curl -sSL -o kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar xzf kubeconform.tar.gz kubeconform
+          for alvo in infra/k8s/base infra/k8s/overlays/producao; do
+            echo "::group::$alvo"
+            kubectl kustomize "$alvo" | ./kubeconform -summary -strict -kubernetes-version 1.31.0 -
+            echo "::endgroup::"
+          done
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.5"
+
+      - name: Terraform fmt, init e validate
+        working-directory: infra/terraform
+        # `-backend=false`: validar nao precisa de estado remoto, e exigir o
+        # bucket faria o CI depender de conta AWS para checar sintaxe.
+        run: |
+          terraform fmt -check -recursive -diff
+          terraform init -backend=false -input=false
+          terraform validate
+
+  imagem:
+    name: Build da imagem
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Construir (sem publicar)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.SERVICO }}
+          push: false
+          load: true
+          tags: credit-analysis:ci
+          # Cache no GitHub Actions: a camada de dependencias tem ~600MB de
+          # pacote nativo e nao muda entre commits de codigo.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verificar que a imagem serve trafego
+        # Build que passa e container que nao sobe e um resultado inutil. Este
+        # passo exercita o que o Dockerfile promete: usuario sem privilegio,
+        # Tesseract com portugues e a API respondendo.
+        run: |
+          docker run --rm credit-analysis:ci id | grep -q "uid=10001" \
+            || { echo "::error::container nao esta rodando como usuario sem privilegio"; exit 1; }
+
+          docker run --rm --entrypoint tesseract credit-analysis:ci --list-langs | grep -q "^por$" \
+            || { echo "::error::Tesseract sem o pacote de portugues"; exit 1; }
+
+          docker run -d --name api -p 8000:8000 -e CREDIT_PROVEDOR_LLM=fake credit-analysis:ci
+          for _ in $(seq 1 60); do
+            curl -fsS http://localhost:8000/health > /dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/health | grep -q '"status":"ok"' \
+            || { echo "::error::/health nao respondeu ok"; docker logs api; exit 1; }
+
+          # Uma analise de verdade: se o dominio quebrou, o health check nao
+          # perceberia.
+          curl -fsS -X POST http://localhost:8000/v1/analises \
+            -H 'Content-Type: application/json' \
+            -d '{"solicitante":{"nome":"Ana Souza","cpf":"529.982.247-25","data_nascimento":"1990-05-14T00:00:00Z","renda_mensal_declarada":"8500.00"},"proposta":{"valor_solicitado":"45000.00","prazo_meses":36,"taxa_juros_mensal":"1.99"}}' \
+            | grep -q '"score"' \
+            || { echo "::error::a esteira nao produziu parecer"; docker logs api; exit 1; }
+
+          docker rm -f api

@@ -1,0 +1,126 @@
+# Deployment do credit-analysis.
+#
+# O que vale explicar aqui sao as probes, os recursos e o filesystem somente
+# leitura. O resto e boilerplate.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credit-analysis
+  labels:
+    app.kubernetes.io/name: credit-analysis
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  # maxUnavailable 0 porque o boot desta aplicacao nao e instantaneo: o pod novo
+  # abre pool de conexao e, na primeira consulta de politica, baixa 2,24GB de
+  # modelo. Derrubar um pod velho antes de o novo estar pronto jogaria trafego
+  # num pod frio — e o custo disso esta medido: 5,8s na primeira consulta.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: credit-analysis
+        app.kubernetes.io/component: api
+      annotations:
+        # Anotacao de scrape em vez de ServiceMonitor: funciona com Prometheus
+        # puro e tambem com o Operator configurado para honrar anotacao. Um
+        # ServiceMonitor exigiria o CRD instalado, o que este manifest nao pode
+        # assumir sem quebrar em cluster limpo.
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: credit-analysis:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: credit-analysis-config
+            - secretRef:
+                name: credit-analysis-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # readOnlyRootFilesystem exige declarar onde a aplicacao PODE escrever.
+          # Sao exatamente dois lugares: o cache do modelo e o /tmp que o upload
+          # de documento usa. Se aparecer um terceiro, e sinal de que algo esta
+          # gravando onde nao devia.
+          volumeMounts:
+            - name: modelo-cache
+              mountPath: /cache
+            - name: tmp
+              mountPath: /tmp
+          # Liveness no /health, readiness no /ready — e a distincao nao e
+          # cosmetica. Com um endpoint unico que tocasse o banco, uma lentidao no
+          # Postgres derrubaria o liveness, o pod reiniciaria, subiria frio e
+          # falharia de novo: restart loop causado pela propria sonda.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          # startupProbe da folga ao boot sem afrouxar o liveness em regime:
+          # ate 2 minutos para subir (60 x 2s), e depois o liveness volta a ser
+          # rigoroso. Sem ela, seria preciso escolher entre um liveness
+          # permissivo para sempre ou um pod morto durante o boot.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          resources:
+            requests:
+              # Request de memoria alto de proposito: o modelo de embedding ocupa
+              # ~2,3GB residentes depois de carregado. Pedir menos faria o
+              # scheduler empacotar pods que depois morreriam por OOM — e OOM em
+              # pod de credito significa requisicao perdida no meio da analise.
+              memory: 1Gi
+              cpu: 250m
+            limits:
+              memory: 3Gi
+              # SEM limite de CPU, e isso e deliberado. Limite de CPU provoca
+              # throttling do CFS exatamente no burst de inferencia, que e onde a
+              # latencia ja e o problema (80s medidos). O request garante a fatia
+              # sob contencao; o limite so puniria o pod quando ha CPU sobrando.
+      volumes:
+        - name: modelo-cache
+          # emptyDir e nao PVC: o cache e reconstruivel por download, e um PVC
+          # ReadWriteOnce impediria dois pods no mesmo no durante o rollout. O
+          # preco e rebaixar o modelo a cada restart de pod — uma vez por vida de
+          # pod, nao por requisicao.
+          emptyDir:
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+      terminationGracePeriodSeconds: 30

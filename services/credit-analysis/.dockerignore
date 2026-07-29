@@ -1,0 +1,29 @@
+# Tudo que nao deve ir para o contexto de build.
+#
+# Contexto grande nao e so lentidao: o `.venv` local tem binarios compilados para
+# o host e o `.env` tem segredo. Copiar qualquer um dos dois para dentro da imagem
+# seria erro grave — o segundo vazaria credencial em toda camada publicada.
+
+.venv/
+.env
+*.env
+!.env.example
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Testes ficam fora da imagem de producao. O CI roda a suite no repositorio, nao
+# no container publicado; incluir tests/ so aumentaria a imagem e a superficie.
+tests/
+
+.git/
+.github/
+*.md
+!README.md
+Dockerfile
+.dockerignore

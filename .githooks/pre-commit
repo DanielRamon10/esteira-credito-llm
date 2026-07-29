@@ -10,53 +10,96 @@
 # Ative uma vez por clone:
 #     git config core.hooksPath .githooks
 #
+# Dois modos:
+#     .githooks/pre-commit            arquivos em stage (uso como hook)
+#     .githooks/pre-commit --tudo     todo o historico (uso no CI)
+#
+# O segundo existe porque no CI nao ha nada em stage: um clone limpo tem indice
+# identico ao HEAD. Sem esse modo, o passo de seguranca do pipeline passaria
+# sempre, sem examinar arquivo algum — verde por vacuidade, que e pior que
+# ausencia de verificacao, porque parece cobertura.
+#
 # Para pular deliberadamente (raro, e pense duas vezes):
 #     git commit --no-verify
 
 set -eu
 
-# Padroes de segredo. Formatos de provedor primeiro, depois atribuicoes
-# genericas de variavel sensivel.
-PADROES='
+MODO="${1:-stage}"
+
+# Padroes de segredo, um por linha. Formatos de provedor primeiro, depois
+# atribuicoes genericas de variavel sensivel.
+#
+# Dois detalhes aqui existem por causa de bugs reais, encontrados por teste
+# negativo — ou seja, verificando que o hook **bloqueia** o que deveria bloquear,
+# e nao apenas que ele passa quando esta tudo limpo:
+#
+# 1. A leitura usa `while read` e nao `for ... in $(...)`. `for` aplica word
+#    splitting, e o padrao de chave PEM contem espaco: seria quebrado em quatro
+#    pedacos, um deles (`[A-Z`) um regex invalido cujo erro o `|| true` engolia.
+#
+# 2. O `git grep` recebe o padrao via `-e`. Sem isso, um padrao que comeca com
+#    `-` — como `-----BEGIN ... PRIVATE KEY-----` — e interpretado como **opcao**
+#    de linha de comando, e o grep falha em silencio. Era o caso: o hook
+#    anunciava detectar chave privada e nao detectava nenhuma.
+#
+# Os dois defeitos tinham o mesmo sintoma: verde por vacuidade. Um detector que
+# nao detecta e pior que nenhum, porque desliga a atencao de quem confia nele.
+PADROES=$(cat <<'PADROES_FIM'
 sk-ant-[A-Za-z0-9_-]{20,}
 sk-[A-Za-z0-9]{32,}
 ghp_[A-Za-z0-9]{20,}
+github_pat_[A-Za-z0-9_]{20,}
 AKIA[0-9A-Z]{16}
 -----BEGIN [A-Z ]*PRIVATE KEY-----
-(ANTHROPIC|OPENAI)_API_KEY[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_-]{20,}
-'
-
-# Apenas arquivos que estao entrando no commit, e apenas os adicionados ou
-# modificados (nao os deletados).
-#
-# O proprio hook e excluido: ele carrega os padroes como texto literal e se
-# acusaria a cada commit — um detector que sempre dispara e um detector que
-# todo mundo aprende a ignorar com --no-verify.
-ARQUIVOS=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/' || true)
-[ -z "$ARQUIVOS" ] && exit 0
+(ANTHROPIC|OPENAI|AWS_SECRET)[A-Z_]*KEY[[:space:]]*=[[:space:]]*["']?[A-Za-z0-9/+_-]{20,}
+PADROES_FIM
+)
 
 # Acumula em arquivo temporario para ordenar e deduplicar: dois padroes podem
 # casar a mesma linha, e reportar em duplicidade so confunde.
 ACHADOS=$(mktemp)
 trap 'rm -f "$ACHADOS"' EXIT
 
-for padrao in $(echo "$PADROES" | grep -v '^$'); do
-    # `-I` ignora binario; `git grep --cached` olha o conteudo em stage, que e
-    # o que sera commitado — e nao o que esta no disco.
-    git grep -nIE --cached "$padrao" -- $ARQUIVOS >>"$ACHADOS" 2>/dev/null || true
-done
+# O proprio hook e excluido da varredura: ele carrega os padroes como texto
+# literal e se acusaria a cada commit — um detector que sempre dispara e um
+# detector que todo mundo aprende a ignorar com --no-verify.
+if [ "$MODO" = "--tudo" ]; then
+    ESCOPO="todo o historico"
+    COMMITS=$(git rev-list --all)
+    [ -z "$COMMITS" ] && exit 0
+
+    printf '%s\n' "$PADROES" | while IFS= read -r padrao; do
+        [ -z "$padrao" ] && continue
+        # shellcheck disable=SC2086
+        git grep -nIE -e "$padrao" $COMMITS -- ':!.githooks' >>"$ACHADOS" 2>/dev/null || true
+    done
+else
+    ESCOPO="arquivos em stage"
+    # Apenas os adicionados ou modificados; deletado nao entra no commit.
+    ARQUIVOS=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/' || true)
+    [ -z "$ARQUIVOS" ] && exit 0
+
+    printf '%s\n' "$PADROES" | while IFS= read -r padrao; do
+        [ -z "$padrao" ] && continue
+        # `--cached` olha o conteudo em stage, que e o que sera commitado — e nao
+        # o que esta no disco. `-I` ignora binario.
+        # shellcheck disable=SC2086
+        git grep -nIE --cached -e "$padrao" -- $ARQUIVOS >>"$ACHADOS" 2>/dev/null || true
+    done
+fi
 
 if [ -s "$ACHADOS" ]; then
-    printf '\n\033[31mCOMMIT BLOQUEADO: possivel segredo detectado\033[0m\n\n'
+    printf '\n\033[31mSEGREDO DETECTADO (%s)\033[0m\n\n' "$ESCOPO"
     sort -u "$ACHADOS" | sed 's/^/  /'
     cat <<'FIM'
 
 O que fazer:
   1. Remova o valor do arquivo e coloque-o em .env (ja ignorado pelo Git).
-  2. Se a chave chegou a existir de verdade, REVOGUE-A em console.anthropic.com
-     mesmo que o commit tenha sido bloqueado — ela ficou em disco e em
-     historico de shell.
+  2. Se a chave chegou a existir de verdade, REVOGUE-A no provedor mesmo que o
+     commit tenha sido bloqueado — ela ficou em disco e em historico de shell.
   3. Use .env.example para documentar o NOME da variavel, nunca o valor.
+  4. Se o achado esta no historico e nao no stage, remover o arquivo agora nao
+     resolve: reescreva o historico (git filter-repo) e revogue a chave.
 
 FIM
     exit 1

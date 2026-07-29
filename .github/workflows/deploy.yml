@@ -1,0 +1,143 @@
+# Deploy para AWS (ECR + ECS Fargate).
+#
+# ## Estado honesto deste arquivo
+#
+# **Nunca foi executado.** Ele exige uma conta AWS com a role de OIDC criada e as
+# variaveis de repositorio preenchidas; nada disso existe neste projeto de
+# portfolio. O que esta aqui e a estrutura que o `infra/terraform/` provisiona,
+# escrita para ser lida — nao um pipeline verificado.
+#
+# Dizer isso e mais util que deixar o arquivo implicar que ha um ambiente rodando.
+#
+# ## Sem chave de longa duracao, e isso e o ponto principal
+#
+# A autenticacao usa **OIDC**: o GitHub emite um token de curta duracao que a AWS
+# troca por credencial temporaria, com base numa role que confia neste repositorio
+# e nesta branch. Nao ha `AWS_SECRET_ACCESS_KEY` guardada como segredo do
+# repositorio.
+#
+# A diferenca importa: chave de longa duracao em segredo de CI vaza por log, por
+# action de terceiro comprometida e por fork malicioso, e continua valida depois de
+# vazar. Token de OIDC dura minutos e so vale para a role especifica.
+#
+# ## Deploy so a partir de `main`, e so com CI verde
+#
+# `workflow_run` em vez de `push`: o deploy roda depois de o CI concluir com
+# sucesso. Amarrar deploy ao push permitiria publicar imagem que nao passou nos
+# testes — e num servico de credito isso e uma decisao de negocio errada tomada
+# por conveniencia de pipeline.
+
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  # `id-token: write` e o que habilita OIDC. Sem esta permissao explicita, o
+  # GitHub nao emite o token — e o padrao e nao emitir, corretamente.
+  id-token: write
+  contents: read
+
+env:
+  SERVICO: services/credit-analysis
+  AWS_REGIAO: sa-east-1
+
+jobs:
+  publicar:
+    name: Build, push e deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # Roda so se o CI passou. Sem esta condicao, um CI vermelho dispararia o
+    # deploy do mesmo commit.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    # Environment do GitHub permite exigir aprovacao manual antes de o job rodar.
+    # Para producao de credito, deploy automatico sem revisao humana e uma escolha
+    # que precisa ser deliberada — aqui ela e explicitamente "nao".
+    environment:
+      name: producao
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assumir a role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_DEPLOY }}
+          aws-region: ${{ env.AWS_REGIAO }}
+          # Nome de sessao com o SHA: no CloudTrail, cada acao fica ligada ao
+          # commit que a originou.
+          role-session-name: deploy-${{ github.sha }}
+
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.SERVICO }}
+          push: true
+          # Tag pelo SHA do commit, nunca `latest`. Com tag mutavel, duas tasks do
+          # mesmo servico podem rodar codigo diferente conforme quando baixaram a
+          # imagem — e o rollback deixa de ter para onde voltar.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/credit-analysis:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Registrar nova revisao da task e atualizar o servico
+        env:
+          REGISTRO: ${{ steps.ecr.outputs.registry }}
+          CLUSTER: credit-analysis-prod
+          SERVICO_ECS: credit-analysis-prod
+        run: |
+          set -eu
+
+          # Le a definicao atual, troca so a imagem e registra nova revisao. O
+          # Terraform ignora mudanca em `task_definition` (ver o `lifecycle` no
+          # main.tf) exatamente para que este passo nao entre em conflito com ele.
+          aws ecs describe-task-definition \
+            --task-definition "$SERVICO_ECS" \
+            --query taskDefinition > atual.json
+
+          jq --arg imagem "$REGISTRO/credit-analysis:${{ github.sha }}" \
+            '.containerDefinitions[0].image = $imagem
+             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                   .compatibilities, .registeredAt, .registeredBy)' \
+            atual.json > nova.json
+
+          ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://nova.json \
+            --query "taskDefinition.taskDefinitionArn" --output text)
+
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICO_ECS" \
+            --task-definition "$ARN" > /dev/null
+
+          echo "Aguardando o servico estabilizar..."
+          # O circuit breaker do servico faz rollback sozinho se as tasks novas
+          # nao ficarem saudaveis; este wait garante que o job so termina verde
+          # quando o deploy de fato assentou.
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICO_ECS"
+
+      - name: Reindexar o corpus de politicas
+        # Ingestao e passo de deploy e nao de boot: o container nao indexa ao
+        # subir, senao cada replica reindexaria o mesmo corpus em paralelo. Roda
+        # como task pontual depois de o servico estabilizar.
+        env:
+          CLUSTER: credit-analysis-prod
+        run: |
+          echo "Passo pendente: rodar `python -m credit_analysis.ingestao --recriar`"
+          echo "como RunTask pontual, com a mesma task definition e override de comando."
+          echo "Nao implementado porque exige a rede (subnets/SG) resolvida do ambiente."

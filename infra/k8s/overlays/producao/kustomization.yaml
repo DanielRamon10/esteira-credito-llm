@@ -1,0 +1,60 @@
+# Overlay de producao.
+#
+# O que muda em relacao a base e pouco de proposito: quanto mais um overlay
+# reescreve, menos a base representa o que roda de verdade — e ai o `kubectl
+# apply -k base` deixa de ser um teste util.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: credito
+
+resources:
+  - ../../base
+
+images:
+  # A tag e substituida pelo CI com o SHA do commit. Tag imutavel e nao `latest`:
+  # com `latest`, dois pods do mesmo Deployment podem rodar codigo diferente
+  # (o que foi baixado antes e depois de um push), e o sintoma e um bug que
+  # aparece em metade das requisicoes.
+  - name: credit-analysis
+    newName: 000000000000.dkr.ecr.sa-east-1.amazonaws.com/credit-analysis
+    newTag: PREENCHIDO_PELO_CI
+
+replicas:
+  - name: credit-analysis
+    count: 3
+
+patches:
+  # Producao pede mais memoria: com tres replicas atendendo simultaneamente, o
+  # pico de uso do modelo de embedding mais o buffer de OCR passam do limite de
+  # 3Gi da base.
+  - target:
+      kind: Deployment
+      name: credit-analysis
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 4Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 2Gi
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+
+  # Espalha as replicas por zona. Sem isto, o scheduler pode colocar as tres no
+  # mesmo no — e uma manutencao de no leva o servico inteiro, tornando o PDB
+  # inutil.
+  - target:
+      kind: Deployment
+      name: credit-analysis
+    patch: |-
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: credit-analysis

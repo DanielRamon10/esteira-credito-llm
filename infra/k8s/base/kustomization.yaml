@@ -1,0 +1,28 @@
+# Base do Kustomize.
+#
+# Kustomize e nao Helm nesta escala: um servico com dois ambientes nao precisa de
+# templating com condicional e loop. Kustomize aplica patch sobre YAML valido, o
+# que significa que a base pode ser lida e validada como manifest de verdade —
+# um chart Helm com `{{ if }}` no meio nao pode.
+#
+# Helm passaria a valer com muitos servicos parecidos ou distribuicao para
+# terceiros; nenhum dos dois e o caso aqui.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - configuracao.yaml
+  - resiliencia.yaml
+
+# `labels` com `includeSelectors: false`, e nao o `commonLabels` (deprecado).
+#
+# A diferenca nao e so de nome: `commonLabels` injeta os rotulos tambem no
+# `selector` do Deployment, e selector de Deployment e **imutavel**. Um dia depois
+# de aplicado, mudar qualquer rotulo comum passa a exigir recriar o objeto — o que
+# em producao significa downtime para uma alteracao cosmetica.
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: esteira-credito
+      app.kubernetes.io/managed-by: kustomize

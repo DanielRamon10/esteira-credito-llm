@@ -1,0 +1,125 @@
+# Medicao de qualidade de retrieval e de OCR.
+#
+# ## Por que isto nao esta no CI
+#
+# Estes nao sao testes, sao **medicoes**. O resultado de um eval de retrieval e
+# "90% de acerto no top-1, 100% no top-3", e transformar isso em aprovado ou
+# reprovado exige escolher um limiar — que, escolhido no lugar errado, faz uma das
+# duas coisas ruins: quebra o pipeline por variacao normal, ou passa por cima de
+# uma regressao real.
+#
+# Alem disso custam caro: baixam 2,24GB de modelo de embedding e exigem o binario
+# do Tesseract com o pacote de portugues.
+#
+# Rodam sob demanda e antes de mudar modelo, prompt ou chunking — que sao
+# exatamente as alteracoes que os numeros do README precisam refletir. O limiar
+# existe, mas frouxo: pega colapso (um modelo errado configurado, um indice vazio),
+# nao oscilacao de um ponto percentual.
+
+name: Qualidade de IA
+
+on:
+  workflow_dispatch:
+  # Semanal, para pegar regressao vinda de atualizacao de dependencia — fastembed
+  # e onnxruntime mudam de comportamento sem mudar a nossa linha de codigo.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  SERVICO: services/credit-analysis
+
+jobs:
+  retrieval:
+    name: Qualidade do retrieval
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: credito
+          POSTGRES_PASSWORD: credito_local
+          POSTGRES_DB: credito
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U credito -d credito"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.SERVICO }}/pyproject.toml"
+
+      - name: Cache do modelo de embedding
+        # 2,24GB. Sem cache, cada execucao gasta minutos de download e banda —
+        # e a chave inclui o nome do modelo, para que trocar de modelo invalide.
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/fastembed
+          key: fastembed-multilingual-e5-large-v1
+
+      - name: Preparar o banco
+        env:
+          PGPASSWORD: credito_local
+        run: |
+          psql -h localhost -U credito -d credito -c "CREATE DATABASE credito_test OWNER credito;"
+          for banco in credito credito_test; do
+            psql -h localhost -U credito -d "$banco" -f infra/postgres/schema.sql
+          done
+
+      - name: Instalar dependencias
+        working-directory: ${{ env.SERVICO }}
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+
+      - name: Eval de retrieval
+        working-directory: ${{ env.SERVICO }}
+        env:
+          CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@localhost:5432/credito
+          CREDIT_PROVEDOR_LLM: fake
+        run: uv run pytest -m eval -v tests/eval/test_retrieval_qualidade.py
+
+  ocr:
+    name: Acuracia de OCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "${{ env.SERVICO }}/pyproject.toml"
+
+      - name: Instalar Tesseract com portugues
+        # `tesseract-ocr-por` e um pacote separado. Sem ele o Tesseract roda em
+        # ingles sobre documento em portugues, e o resultado degrada de forma
+        # sutil: os numeros saem, os rotulos ("Salario liquido") nao.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-por
+          tesseract --list-langs
+
+      - name: Instalar dependencias
+        working-directory: ${{ env.SERVICO }}
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+
+      - name: Eval de OCR
+        working-directory: ${{ env.SERVICO }}
+        env:
+          CREDIT_PROVEDOR_LLM: fake
+        run: uv run pytest -m ocr -v

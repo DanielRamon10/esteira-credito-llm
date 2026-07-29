@@ -1,0 +1,68 @@
+# Service, ConfigMap e Secret.
+#
+# ConfigMap e Secret ficam separados porque ConfigMap aparece inteiro em
+# `kubectl describe` e em log de auditoria. Misturar os dois faria com que uma
+# consulta rotineira exibisse credencial.
+apiVersion: v1
+kind: Service
+metadata:
+  name: credit-analysis
+  labels:
+    app.kubernetes.io/name: credit-analysis
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: credit-analysis
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: credit-analysis-config
+data:
+  CREDIT_AMBIENTE: "prod"
+  CREDIT_LOG_JSON: "true"
+  CREDIT_NIVEL_LOG: "INFO"
+  # Documentacao interativa fechada em producao: ela expoe o schema completo da
+  # API, que e material de reconhecimento para quem procura superficie.
+  CREDIT_DOCS_HABILITADOS: "false"
+
+  CREDIT_MODELO_EMBEDDING: "intfloat/multilingual-e5-large"
+  CREDIT_TRECHOS_POR_CONSULTA: "5"
+
+  # `ollama` e nao `auto`, e esta e a linha mais importante deste arquivo. Com
+  # `auto`, um Ollama indisponivel faria o servico cair no fake deterministico e
+  # responder parecer com texto inventado. Explicito, ele falha ao subir — o pod
+  # nao passa no readiness, o rollout para, e ninguem recebe parecer falso.
+  CREDIT_PROVEDOR_LLM: "ollama"
+  CREDIT_OLLAMA_ENDPOINT: "http://ollama.ia.svc.cluster.local:11434"
+  CREDIT_MODELO_OLLAMA: "llama3.1:8b"
+  # Modelo do agente diferente do da fundamentacao, por medicao (ver o cabecalho
+  # de infrastructure/agente/grafo.py).
+  CREDIT_MODELO_AGENTE: "qwen2.5:7b"
+  CREDIT_AGENTE_MAX_PASSOS: "6"
+  CREDIT_AGENTE_TIMEOUT_SEGUNDOS: "180"
+
+  CREDIT_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
+  CREDIT_TRACE_AMOSTRAGEM: "1.0"
+---
+# Placeholder de ESTRUTURA, com valores vazios.
+#
+# Este arquivo declara quais chaves o Deployment espera; nunca carrega valor
+# real. Secret do Kubernetes e base64, nao criptografia — qualquer um com `get
+# secret` le o conteudo. Em producao o valor vem do AWS Secrets Manager via
+# External Secrets Operator (ver infra/terraform/), e este objeto e substituido.
+#
+# O hook de pre-commit do repositorio bloqueia commit com formato de chave, o que
+# torna difícil preencher isto por acidente.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: credit-analysis-secrets
+type: Opaque
+stringData:
+  CREDIT_POSTGRES_DSN: ""
+  CREDIT_ANTHROPIC_API_KEY: ""

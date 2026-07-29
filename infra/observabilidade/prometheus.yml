@@ -17,12 +17,27 @@ scrape_configs:
   - job_name: credit-analysis
     metrics_path: /metrics
     static_configs:
-      # A API roda no host (a Camada 6 traz o Dockerfile). `host.docker.internal`
-      # e como o container alcanca o host no Docker Desktop; no Linux exige o
-      # `extra_hosts` que esta no compose.
+      # Dois alvos porque ha dois modos de rodar, e os dois sao legitimos:
+      #
+      #   `api:8000`                    API no compose (--profile api)
+      #   `host.docker.internal:8000`   API no host, para desenvolver com reload
+      #
+      # Os dois sao mutuamente exclusivos **por causa das portas**: o container
+      # publica 8080 no host, nao 8000. Publicando em 8000, os dois alvos
+      # alcancariam o mesmo processo e cada serie apareceria duplicada — todo
+      # `sum()` do dashboard contaria em dobro. Foi medido e corrigido; ver o
+      # comentario em `ports:` no docker-compose.yml.
+      #
+      # O alvo inativo aparece como `down`, e isso e informacao e nao defeito:
+      # deixa explicito qual dos dois esta servindo.
+      - targets: ["api:8000"]
+        labels:
+          servico: credit-analysis
+          execucao: container
       - targets: ["host.docker.internal:8000"]
         labels:
           servico: credit-analysis
+          execucao: host
 
   - job_name: prometheus
     static_configs:

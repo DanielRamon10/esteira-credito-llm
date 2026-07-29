@@ -1,12 +1,18 @@
 # Stack local de desenvolvimento.
 #
-# Sobe o Postgres com pgvector e a stack de observabilidade (Prometheus, Tempo,
-# Grafana). O servico em si entra na Camada 6, quando houver Dockerfile — hoje a
-# API roda no host, e por isso o Prometheus a raspa via `host.docker.internal`.
+# Sobe a stack completa: Postgres com pgvector, observabilidade (Prometheus,
+# Tempo, Grafana) e a propria API.
+#
+# O perfil `api` deixa o servico opcional: `docker compose up -d` sobe so a
+# infraestrutura (util para rodar a API do host, com reload); `--profile api`
+# sobe tambem o container. Sem isso, quem esta desenvolvendo pagaria um rebuild
+# de imagem a cada alteracao de codigo.
 #
 #   docker compose up -d
 #   docker compose down -v     # -v tambem apaga os volumes de dados
 #
+#   API          http://localhost:8000   rodando no host
+#                http://localhost:8080   rodando no compose (--profile api)
 #   Grafana      http://localhost:3000   (painel provisionado, sem login)
 #   Prometheus   http://localhost:9090
 #   Tempo        http://localhost:3200   (OTLP em 4318)
@@ -58,6 +64,45 @@ services:
       timeout: 5s
       retries: 20
       start_period: 10s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./services/credit-analysis
+      dockerfile: Dockerfile
+    image: credit-analysis:dev
+    container_name: credito-api
+    profiles: ["api"]
+    environment:
+      # `postgres` e nao `localhost`: dentro da rede do compose o host e o nome
+      # do servico.
+      CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@postgres:5432/credito
+      CREDIT_OTLP_ENDPOINT: http://tempo:4318
+      CREDIT_AMBIENTE: local
+      CREDIT_LOG_JSON: "true"
+      # Ollama roda no host, nao no compose: o daemon ja esta instalado na
+      # maquina e duplicar 4GB de modelo dentro de um container nao ajuda nada.
+      CREDIT_OLLAMA_ENDPOINT: http://host.docker.internal:11434
+    ports:
+      # **8080 no host, e nao 8000.** Publicar em 8000 fazia o Prometheus raspar
+      # o mesmo processo duas vezes: o alvo `api:8000` pela rede do compose e o
+      # alvo `host.docker.internal:8000` pela porta publicada. As duas series
+      # tinham valores identicos e todo `sum()` do dashboard contava em dobro —
+      # um painel que mente por um fator de 2 e pior que um painel vazio.
+      #
+      # Com portas distintas os dois alvos ficam mutuamente exclusivos: em modo
+      # container sobe `api:8000` e o alvo do host fica `down`; rodando a API no
+      # host e o inverso. O Prometheus sempre ve exatamente uma fonte.
+      - "8080:8000"
+    volumes:
+      # Cache do modelo de embedding (2,24GB). Sem este volume, cada `up`
+      # rebaixaria o modelo inteiro.
+      - modelo_cache:/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   prometheus:
@@ -120,6 +165,8 @@ services:
 
 volumes:
   postgres_dados:
+  # Cache do modelo de embedding, fora da imagem de proposito (ver o Dockerfile).
+  modelo_cache:
   prometheus_dados:
   tempo_dados:
   grafana_dados:

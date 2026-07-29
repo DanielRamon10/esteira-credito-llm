@@ -17,11 +17,15 @@ caixa-preta que ninguém consegue auditar.
 ## Arquitetura
 
 ```
-Praticando_RAG/
+esteira-credito-llm/
 ├── services/
-│   └── credit-analysis/     # Análise de documentos de crédito
-├── infra/                   # Terraform, manifests Kubernetes
-├── docs/                    # Decisões de arquitetura (ADRs)
+│   └── credit-analysis/     # Serviço de análise (Dockerfile incluído)
+├── infra/
+│   ├── postgres/            # Schema e init do pgvector
+│   ├── observabilidade/     # Prometheus, Tempo, Grafana provisionados
+│   ├── k8s/                 # Manifests (base + overlay de produção)
+│   └── terraform/           # ECR, S3, Secrets Manager, IAM, ECS Fargate
+├── .github/workflows/       # CI, evals de IA e deploy
 └── docker-compose.yml       # Stack local completa
 ```
 
@@ -47,7 +51,7 @@ banco, e trocar SQLite por Postgres sem tocar em caso de uso.
 | 3 | OCR, extração documental e defesa contra prompt injection | ✅ Concluída |
 | 4 | Agente LangGraph com ferramentas, teto de passos e trilha de auditoria | ✅ Concluída |
 | 5 | Observabilidade: métricas, tracing, dashboard e alertas | ✅ Concluída |
-| 6 | Terraform, Kubernetes, CI/CD | ⬜ |
+| 6 | Dockerfile, Kubernetes, Terraform e CI/CD | ✅ Concluída |
 
 ## Rodando
 
@@ -155,6 +159,97 @@ Duas defesas estruturais valem destacar:
 A resposta traz a trilha completa (ferramentas, argumentos validados, duração,
 `motivo_parada`). Sem isso, uma resposta cortada por limite é indistinguível de
 uma resposta completa para quem consome a API.
+
+## Container e infraestrutura
+
+```bash
+# A stack inteira, API incluída
+docker compose --profile api up -d
+#   API em http://localhost:8080 (no compose) ou :8000 (rodando no host)
+```
+
+**A imagem tem 1,18GB, e o peso não está no Dockerfile.** Os cinco maiores
+pacotes somam 614MB: OpenCV 153MB, pandas 73MB, PyMuPDF 64MB, ONNX Runtime 58MB,
+NumPy 70MB. É o preço de fazer OCR, RAG e análise de extrato no mesmo processo —
+cortar exigiria separar serviços, e a fronteira certa entre eles vem do domínio,
+não do tamanho da imagem. O que já está feito para não piorar: `headless` no
+OpenCV, `--no-install-recommends` no apt, multi-stage, e o modelo de embedding de
+2,24GB **fora** da imagem (baixado no primeiro uso, para um volume).
+
+Verificado, não presumido: o container roda como uid 10001, tem Tesseract com
+`por`, responde `/health`, produz parecer e o healthcheck do Docker chega a
+`healthy`.
+
+### Kubernetes e Terraform são dois caminhos, não dois ambientes
+
+`infra/k8s/` (Kustomize, base + overlay) e `infra/terraform/` (ECS Fargate) fazem
+a mesma coisa em runtimes diferentes. A duplicação é proposital e a escolha não é
+técnica em abstrato: **já existe cluster e time de plataforma?** Sem cluster,
+Fargate elimina gestão de nó; com cluster, subir um runtime separado para um
+serviço é desperdício.
+
+O que vale olhar nos manifests: `readOnlyRootFilesystem` com os dois únicos
+caminhos graváveis declarados, `startupProbe` para dar folga ao boot sem afrouxar
+o liveness, **sem limite de CPU** (limite provoca throttling do CFS exatamente no
+burst de inferência), NetworkPolicy com egress fechado por namespace, e um HPA
+que declara sua própria imprecisão numa anotação — escalar por CPU é uma
+aproximação ruim quando o tempo dominante é *espera* por inferência.
+
+No Terraform, o ponto central é a separação entre a role de **execução** (usada
+pelo agente do ECS: puxar imagem, ler segredo) e a role da **task** (usada pelo
+código: S3). Juntar as duas daria ao código da aplicação permissão de ler
+qualquer segredo do serviço — que é exatamente o que um comprometimento procura.
+O bucket de documentos tem versionamento, criptografia, bloqueio de acesso
+público e expiração em 365 dias (LGPD art. 15), e a aplicação **não** tem
+`s3:DeleteObject`: quem expira é a regra de ciclo de vida, auditável e
+independente de código.
+
+Nível de verificação, sem exagero: `terraform validate` e `fmt` passam, e
+`kubeconform --strict` valida 7 recursos na base e no overlay. **Nada foi
+aplicado** — não há conta AWS, e o Kubernetes do Docker Desktop precisa ser
+habilitado pela interface (o `docker desktop enable` desta versão só cobre
+`model-runner`).
+
+## CI/CD
+
+Três workflows, e a divisão é por *tipo de garantia*:
+
+| Workflow | Quando | O que garante |
+|---|---|---|
+| `ci.yml` | push e PR | lint, `mypy --strict`, 360 testes com pgvector real, schema dos manifests, `terraform validate`, imagem constrói **e serve tráfego** |
+| `qualidade-ia.yml` | manual e semanal | evals de retrieval e OCR |
+| `deploy.yml` | após CI verde | build, push no ECR e `update-service` no ECS, via OIDC |
+
+**Por que os evals não estão no CI.** Eles não são testes, são medições: o
+resultado é "90% de acerto no top-1", e transformar isso em passou/falhou exige
+um limiar que, no lugar errado, ou quebra o pipeline por variação normal ou passa
+por cima de uma regressão real. Ficam separados, rodando antes de mudar modelo,
+prompt ou chunking.
+
+**Dois passos do CI existem para evitar verde falso.** Um falha o job se algum
+teste de integração for *pulado* — um teste pulado em pipeline verde dá impressão
+de cobertura que não existe. O outro é um **teste negativo do próprio detector de
+segredos**: ele planta uma chave falsa e falha se o hook *não* bloquear.
+
+Esse segundo passo não é paranoia decorativa — ele nasceu de dois bugs reais
+encontrados agora, no hook que já estava no repositório desde o primeiro commit:
+
+1. `for padrao in $(...)` fazia **word splitting**, quebrando o padrão de chave
+   PEM (que contém espaço) em quatro pedaços, um deles um regex inválido cujo erro
+   o `|| true` engolia.
+2. `git grep -E "-----BEGIN..."` interpretava o `-----` como **opção** de linha de
+   comando. Faltava `-e`.
+
+Resultado: o hook anunciava detectar chave privada e **não detectava nenhuma**.
+Passava sempre — verde por vacuidade, que é pior que ausência de verificação,
+porque desliga a atenção de quem confia nele. Só apareceu ao testar se ele
+bloqueia, em vez de testar se ele passa.
+
+O `deploy.yml` usa OIDC e não `AWS_SECRET_ACCESS_KEY`: chave de longa duração em
+segredo de CI vaza por log, por action de terceiro comprometida e por fork
+malicioso, e continua válida depois de vazar. E ele **nunca foi executado** — não
+há conta AWS nem role configurada. Está no repositório para ser lido, e o próprio
+arquivo diz isso na primeira linha.
 
 ## Qualidade
 
