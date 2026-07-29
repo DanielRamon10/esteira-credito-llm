@@ -31,6 +31,9 @@ dependencies = [
     "opentelemetry-sdk>=1.30",
     "opentelemetry-exporter-otlp-proto-http>=1.30",
     "opentelemetry-instrumentation-fastapi>=0.51b0",
+    # Cliente HTTP do servico de KYC. Sai de `dev` para dependencia principal:
+    # antes era usado apenas pelo TestClient, agora roda em producao.
+    "httpx>=0.27",
     # Vector store persistente.
     "psycopg[binary,pool]>=3.2",
     "pgvector>=0.3",

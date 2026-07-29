@@ -14,13 +14,14 @@ nao em uma cadeia de ifs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import numpy as np
 
 from credit_analysis.domain.entities import Parecer, PropostaCredito, Solicitante
 from credit_analysis.domain.enums import Decisao, NivelRisco
+from credit_analysis.domain.kyc import DecisaoKYC, ResultadoKYC
 from credit_analysis.domain.value_objects import Dinheiro, Percentual
 
 # --- Limiares de politica ----------------------------------------------------
@@ -257,3 +258,108 @@ def avaliar(entrada: EntradaScore) -> Parecer:
         justificativas=[f.justificativa for f in fatores],
         limite_recomendado=calcular_limite_recomendado(entrada, score),
     )
+
+
+def aplicar_gate_kyc(parecer: Parecer, kyc: ResultadoKYC) -> Parecer:
+    """Compoe o parecer de credito com a triagem de conformidade.
+
+    ## Por que um gate separado, e nao um fator do score
+
+    Seria tentador somar KYC como sexto fator com um peso. Estaria errado: score e
+    uma medida **graduada** de risco de credito, e conformidade e **binaria** por
+    natureza. Uma pessoa em lista de sancoes nao tem "risco alto" — ela nao pode
+    operar, e nenhuma combinacao de renda alta e historico impecavel compensa isso.
+    Virar peso significaria que um score excelente poderia diluir uma sancao.
+
+    E o mesmo raciocinio que faz restricao cadastral ser veto e nao peso.
+
+    ## O gate so aperta, nunca afrouxa
+
+    Nenhum caminho aqui melhora uma decisao — e garantir isso exige mais cuidado do
+    que parece. A primeira versao fazia `replace(parecer, decisao=ANALISE_MANUAL)`
+    direto, e um teste de propriedade derrubou na hora: um parecer **NEGADO** pelo
+    motor de score era promovido a analise manual porque a pessoa era PEP. Ou seja,
+    a exigencia regulatoria de diligencia reforcada estava **abrindo** um caso que o
+    score havia negado.
+
+    Por isso a composicao usa `_decisao_mais_restritiva`: o gate declara o **piso**
+    de restricao que a conformidade exige, e a decisao final e a mais severa entre
+    esse piso e a do score. Assim a propriedade "o gate so aperta" deixa de depender
+    de disciplina de quem edita e passa a ser estrutural.
+
+    A ordem das clausulas e a de severidade, e cada uma acrescenta a justificativa
+    em vez de substitui-la — o parecer final carrega o porque do score **e** o porque
+    do gate.
+    """
+    if kyc.decisao is DecisaoKYC.APROVADO:
+        return parecer
+
+    justificativas = [*parecer.justificativas, *kyc.justificativas]
+
+    if kyc.veta:
+        # Veto duro, no mesmo nivel da restricao cadastral: score irrelevante.
+        return replace(
+            parecer,
+            decisao=_decisao_mais_restritiva(parecer.decisao, Decisao.NEGADO),
+            nivel_risco=_risco_mais_alto(parecer.nivel_risco, NivelRisco.CRITICO),
+            justificativas=[
+                *justificativas,
+                "Reprovado na triagem de conformidade: veto independente do score",
+            ],
+        )
+
+    if kyc.indisponivel:
+        # Nao aprovar sem verificar (violacao regulatoria) e nao negar por causa de
+        # uma indisponibilidade nossa (injusto). Vai para humano, com o motivo dito —
+        # a menos que o score ja tenha negado, e nesse caso a negativa fica.
+        motivo = (
+            "Analise manual obrigatoria: nao foi possivel concluir a triagem de "
+            "conformidade. Aprovar sem ela seria descumprir a diligencia exigida; "
+            "negar puniria o cliente por indisponibilidade interna."
+        )
+    elif kyc.decisao is DecisaoKYC.APROVADO_COM_DILIGENCIA:
+        motivo = (
+            "Pessoa Exposta Politicamente: aprovacao exige alcada superior "
+            "(Circular BCB 3.978 art. 27). Nao e impedimento."
+        )
+    else:
+        motivo = "Triagem de conformidade encaminhada a revisao humana"
+
+    return replace(
+        parecer,
+        decisao=_decisao_mais_restritiva(parecer.decisao, Decisao.ANALISE_MANUAL),
+        justificativas=[*justificativas, motivo],
+    )
+
+
+# Ordem de severidade das decisoes, do mais permissivo ao mais restritivo.
+#
+# Explicita numa tupla, e nao inferida da ordem de declaracao do enum: a ordem do
+# enum e uma escolha de leitura e pode ser reorganizada sem que ninguem perceba que
+# quebrou a comparacao. Aqui a intencao esta escrita.
+_SEVERIDADE_DECISAO = (
+    Decisao.APROVADO,
+    Decisao.APROVADO_COM_RESSALVAS,
+    Decisao.ANALISE_MANUAL,
+    Decisao.NEGADO,
+)
+
+_SEVERIDADE_RISCO = (
+    NivelRisco.BAIXO,
+    NivelRisco.MEDIO,
+    NivelRisco.ALTO,
+    NivelRisco.CRITICO,
+)
+
+
+def _decisao_mais_restritiva(a: Decisao, b: Decisao) -> Decisao:
+    """A mais severa entre duas decisoes.
+
+    E o que torna "o gate so aperta" uma propriedade do codigo em vez de uma
+    promessa do comentario.
+    """
+    return max(a, b, key=_SEVERIDADE_DECISAO.index)
+
+
+def _risco_mais_alto(a: NivelRisco, b: NivelRisco) -> NivelRisco:
+    return max(a, b, key=_SEVERIDADE_RISCO.index)

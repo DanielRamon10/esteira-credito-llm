@@ -22,6 +22,7 @@ from credit_analysis.api.routers import metricas as rota_metricas
 from credit_analysis.application.ports import (
     AgenteCredito,
     ConsultaBureau,
+    ConsultaKYC,
     ModeloLinguagem,
     MotorOCR,
     RepositorioAnalises,
@@ -29,6 +30,7 @@ from credit_analysis.application.ports import (
 from credit_analysis.config import ProvedorLLM, Settings, get_settings
 from credit_analysis.infrastructure.agente.grafo import AgenteLangGraph
 from credit_analysis.infrastructure.bureau import BureauStub
+from credit_analysis.infrastructure.kyc import ClienteKYCHttp
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
 from credit_analysis.infrastructure.llm.ollama_adapter import (
     LLMOllama,
@@ -63,6 +65,7 @@ def criar_app(
     llm: ModeloLinguagem | None = None,
     motor_ocr: MotorOCR | None = None,
     agente: AgenteCredito | None = None,
+    kyc: ConsultaKYC | None = None,
 ) -> FastAPI:
     """Monta a aplicacao. Adapters omitidos caem no default de desenvolvimento."""
     settings = settings or get_settings()
@@ -96,6 +99,7 @@ def criar_app(
             ambiente=settings.ambiente.value,
             rag=("pgvector" if pool else "injetado" if retriever else "desabilitado"),
             llm=app_.state.llm.identificacao,
+            kyc=(app_.state.kyc.identificacao if app_.state.kyc else "desabilitado"),
             ocr=(app_.state.motor_ocr.identificacao if app_.state.motor_ocr else "indisponivel"),
         )
 
@@ -128,6 +132,13 @@ def criar_app(
 
         yield
 
+        # Fecha o pool de conexoes HTTP do cliente de KYC junto com o resto: sem
+        # isso o httpx reclama de cliente nao fechado no encerramento, e conexoes
+        # keep-alive ficam penduradas no outro servico.
+        cliente_kyc = getattr(app_.state, "kyc", None)
+        if cliente_kyc is not None and hasattr(cliente_kyc, "fechar"):
+            await cliente_kyc.fechar()
+
         if pool is not None:
             await pool.close()
         logger.info("servico.encerrando", servico=settings.nome_servico)
@@ -152,6 +163,7 @@ def criar_app(
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)
     app.state.llm = llm or _montar_llm(settings)
     app.state.agente = agente  # montado no lifespan quando nao injetado
+    app.state.kyc = kyc or _montar_kyc(settings)
 
     @app.middleware("http")
     async def correlacao_log_e_metricas(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -207,6 +219,43 @@ def criar_app(
     instrumentar_fastapi(app)
 
     return app
+
+
+def _montar_kyc(settings: Settings) -> ConsultaKYC | None:
+    """Monta o cliente de conformidade, ou recusa a subir.
+
+    A assimetria entre ambientes e deliberada e e a decisao central desta funcao:
+
+    - **Fora de producao**, sem URL configurada o gate simplesmente nao existe. E o
+      que permite desenvolver e rodar a suite sem subir um segundo servico.
+    - **Em producao**, a ausencia de URL levanta erro na subida. Uma esteira que
+      aprova credito sem triagem de lista restritiva descumpre a Circular BCB 3.978,
+      e fazer isso por configuracao faltando — em silencio — e pior que ficar fora
+      do ar: ninguem percebe ate a auditoria.
+
+    E a mesma disciplina do `CREDIT_PROVEDOR_LLM=ollama`: pedir explicitamente algo
+    indisponivel falha alto, em vez de degradar para um substituto que se parece com
+    o original.
+    """
+    if not settings.kyc_url.strip():
+        if settings.producao:
+            raise RuntimeError(
+                "CREDIT_KYC_URL e obrigatoria em producao: sem o servico de "
+                "conformidade a esteira aprovaria credito sem triagem de lista "
+                "restritiva, descumprindo a Circular BCB 3.978."
+            )
+        logger.warning(
+            "kyc.desabilitado",
+            motivo="CREDIT_KYC_URL vazia",
+            efeito="o gate de conformidade nao sera aplicado",
+        )
+        return None
+
+    return ClienteKYCHttp(
+        url_base=settings.kyc_url,
+        timeout_segundos=settings.kyc_timeout_segundos,
+        tentativas=settings.kyc_tentativas,
+    )
 
 
 def _rotulo_de_rota(request: Request) -> str:

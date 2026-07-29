@@ -1,0 +1,16 @@
+.venv/
+.env
+*.env
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+tests/
+.git/
+*.md
+!README.md
+Dockerfile
+.dockerignore

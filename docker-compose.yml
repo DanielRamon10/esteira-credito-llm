@@ -13,6 +13,7 @@
 #
 #   API          http://localhost:8000   rodando no host
 #                http://localhost:8080   rodando no compose (--profile api)
+#   KYC          http://localhost:8101   servico de conformidade (--profile api)
 #   Grafana      http://localhost:3000   (painel provisionado, sem login)
 #   Prometheus   http://localhost:9090
 #   Tempo        http://localhost:3200   (OTLP em 4318)
@@ -66,6 +67,32 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  kyc:
+    build:
+      context: ./services/kyc-compliance
+      dockerfile: Dockerfile
+    image: kyc-compliance:dev
+    container_name: credito-kyc
+    profiles: ["api"]
+    environment:
+      KYC_AMBIENTE: local
+      KYC_LOG_JSON: "true"
+      KYC_OTLP_ENDPOINT: http://tempo:4318
+    ports:
+      # 8101 no host pelo mesmo motivo que a API usa 8080: evitar que o
+      # Prometheus alcance o mesmo processo por dois alvos e conte em dobro.
+      - "8101:8100"
+    healthcheck:
+      # `/ready` e nao `/health` aqui: o compose usa isto para liberar o
+      # `depends_on` da API, e o que importa nesse momento e "da para consultar?",
+      # que inclui ter lista carregada.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8100/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   api:
     build:
       context: ./services/credit-analysis
@@ -83,6 +110,9 @@ services:
       # Ollama roda no host, nao no compose: o daemon ja esta instalado na
       # maquina e duplicar 4GB de modelo dentro de um container nao ajuda nada.
       CREDIT_OLLAMA_ENDPOINT: http://host.docker.internal:11434
+      # Gate de conformidade. Dentro da rede do compose o host e o nome do
+      # servico; a porta e a interna (8100), nao a publicada.
+      CREDIT_KYC_URL: http://kyc:8100
     ports:
       # **8080 no host, e nao 8000.** Publicar em 8000 fazia o Prometheus raspar
       # o mesmo processo duas vezes: o alvo `api:8000` pela rede do compose e o
@@ -100,6 +130,12 @@ services:
       - modelo_cache:/cache
     depends_on:
       postgres:
+        condition: service_healthy
+      # `service_healthy` e nao `service_started`: a API tolera um KYC fora do ar
+      # (as analises vao para revisao humana), mas subir sabendo que a dependencia
+      # ainda nao esta pronta transformaria o primeiro minuto de operacao em
+      # revisao manual desnecessaria.
+      kyc:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"

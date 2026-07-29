@@ -18,6 +18,7 @@ from fastapi import Depends, Request
 from credit_analysis.application.ports import (
     AgenteCredito,
     ConsultaBureau,
+    ConsultaKYC,
     ModeloLinguagem,
     MotorOCR,
     RepositorioAnalises,
@@ -48,11 +49,23 @@ def obter_bureau(request: Request) -> ConsultaBureau:
     return bureau
 
 
+def obter_kyc(request: Request) -> ConsultaKYC | None:
+    """Cliente de conformidade, ou None quando o gate esta desabilitado.
+
+    Devolve None em vez de levantar 503: sem KYC a esteira ainda funciona (o gate
+    nao e aplicado), e a decisao de exigi-lo pertence ao boot — `_montar_kyc` ja
+    recusa subir em producao sem ele.
+    """
+    kyc: ConsultaKYC | None = getattr(request.app.state, "kyc", None)
+    return kyc
+
+
 def obter_caso_analisar(
     repositorio: Annotated[RepositorioAnalises, Depends(obter_repositorio)],
     bureau: Annotated[ConsultaBureau, Depends(obter_bureau)],
+    kyc: Annotated[ConsultaKYC | None, Depends(obter_kyc)],
 ) -> AnalisarCredito:
-    return AnalisarCredito(repositorio=repositorio, bureau=bureau)
+    return AnalisarCredito(repositorio=repositorio, bureau=bureau, kyc=kyc)
 
 
 def obter_caso_consultar(

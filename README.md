@@ -19,7 +19,8 @@ caixa-preta que ninguém consegue auditar.
 ```
 esteira-credito-llm/
 ├── services/
-│   └── credit-analysis/     # Serviço de análise (Dockerfile incluído)
+│   ├── credit-analysis/     # Esteira de crédito: RAG, OCR, agente (1,18GB)
+│   └── kyc-compliance/      # Triagem contra listas restritivas (253MB)
 ├── infra/
 │   ├── postgres/            # Schema e init do pgvector
 │   ├── observabilidade/     # Prometheus, Tempo, Grafana provisionados
@@ -261,8 +262,77 @@ arquivo diz isso na primeira linha.
 .venv/Scripts/python -m mypy                    # tipagem estrita
 ```
 
-Estado atual: **360 testes** + 20 evals (retrieval e OCR), `mypy --strict` sem
-erros em 63 arquivos.
+Estado atual: **389 testes** (credit-analysis) + **58** (kyc-compliance) + 20 evals (retrieval e OCR), `mypy --strict` sem
+erros em 65 e 32 arquivos.
+
+## Microsserviços separados por domínio
+
+Dois serviços, e a separação não é cosmética — o contraste diz o que ela compra:
+
+| | `credit-analysis` | `kyc-compliance` |
+|---|---|---|
+| Domínio | score, RAG, OCR, agente | casamento de nome contra listas |
+| Dependências | 21 | **7** |
+| Imagem | 1,18GB | **253MB** |
+| LLM | sim (Ollama local) | **nenhum** |
+| Decisão | motor determinístico + LLM que explica | motor determinístico, sem prosa |
+
+O `kyc-compliance` é **dependência** do outro: quando ele cai, toda análise vai
+para revisão humana. Um serviço nessa posição precisa subir rápido, escalar barato
+e ter pouca superfície de CVE — e é o que se ganha por não carregar 600MB de
+dependência nativa que ele nunca usa.
+
+Ele também não tem LLM, e isso é argumento e não economia: nome próprio não tem
+significado a aproximar (num embedding, "Silva" e "Souza" ficam vizinhos por serem
+ambos sobrenomes comuns), e conformidade precisa dar a mesma resposta hoje e em
+seis meses. Lá o LLM redige e o motor decide; aqui não há o que redigir.
+
+### O gate de conformidade, e o estado que quase todo mundo esquece
+
+Consultar outro serviço introduz um estado que não existia: **não sei**. Uma esteira
+que só trata "aprovado" e "reprovado" tem três saídas erradas quando o KYC cai —
+aprovar sem verificar (violação regulatória), negar (pune o cliente por falha
+nossa), ou ignorar (aprova sem registro, e ninguém descobre até a auditoria).
+
+A saída é uma quarta: **revisão humana com o motivo dito**. Mesmo padrão do
+escalonamento de OCR e da citação rejeitada — quando o sistema não tem confiança,
+ele diz isso em vez de escolher um extremo.
+
+O gate **só aperta, nunca afrouxa**, e essa propriedade é estrutural e não uma
+promessa de comentário: a decisão final é a mais severa entre a do score e o piso
+que a conformidade exige. Um teste de propriedade encontrou a violação na primeira
+versão — um parecer **NEGADO** pelo score era promovido a análise manual porque a
+pessoa era PEP, ou seja, a exigência de diligência estava *abrindo* um caso negado.
+
+### O disjuntor, medido derrubando o serviço
+
+Sem disjuntor, um KYC fora do ar não deixa a esteira "mais lenta": ela **cai
+junto**, por acúmulo de timeout até esgotar o pool de conexões. Medido de verdade,
+parando o container:
+
+| requisição | tempo | o que aconteceu |
+|---|---|---|
+| 1 a 5 | **6,4s** | 2 tentativas × 3s de timeout; decisão vai para revisão manual |
+| 6 em diante | **167ms** | disjuntor abriu, falha rápida sem tocar na rede — **38× mais rápido** |
+| após religar + 30s | **190ms** | sondagem do meio-aberto passou, circuito fechou, decisão voltou a `negado` |
+
+O ciclo inteiro aparece no log: `disjuntor_abriu`, `recusado_pelo_disjuntor`,
+`disjuntor_fechou`.
+
+O `X-Request-ID` é **propagado e reaproveitado** entre os dois serviços — sem isso,
+investigar uma análise que consultou o KYC exigiria cruzar timestamp entre dois
+conjuntos de log.
+
+### Sobre duplicação, que é a decisão central de um monorepo
+
+Há duplicação consciente entre os serviços: validação de CPF, logging, mascaramento.
+**Não extraí biblioteca compartilhada**, e o motivo é que extrair antes do segundo
+consumidor é adivinhar a abstração.
+
+E há uma distinção que vai ficar: compartilhar **infraestrutura técnica** (logging,
+métricas, detecção de injeção) vale; compartilhar **domínio** entre bounded contexts
+é o acoplamento que DDD alerta contra — o `kyc-compliance` vai precisar de CNPJ e
+documento estrangeiro, o `credit-analysis` não.
 
 ## Observabilidade
 
@@ -350,7 +420,7 @@ comprometida — há bots varrendo commits públicos em segundos.
 | Retrieval (embeddings locais, ONNX) | ✅ completo |
 | OCR (Tesseract local) | ✅ completo |
 | Extração, reavaliação de score, segurança | ✅ completo |
-| Testes (360 + 20 evals) | ✅ todos passam |
+| Testes (389 + 58 + evals) | ✅ todos passam |
 | Geração de texto do parecer | ✅ com Ollama local; sem ele, `LLMFake` |
 | Agente com ferramentas | ✅ com Ollama local; sem ele, 503 explícito |
 | Escalonamento de OCR para visão | ⚠️ fora da cadeia |

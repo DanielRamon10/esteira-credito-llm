@@ -231,6 +231,42 @@ ocr_escalonamentos = Counter(
 )
 
 
+# ---------------------------------------------------------------------- KYC
+
+# Contador com o desfecho como label, incluindo `circuito_aberto` e `indisponivel`.
+#
+# A taxa de `indisponivel` sobre o total e a metrica que importa: ela mede quantas
+# analises estao indo para revisao humana por causa de uma falha de integracao, e
+# nao por causa do caso do cliente. Um numero que sobe aqui e fila de analista
+# crescendo por motivo tecnico.
+kyc_consultas = Counter(
+    f"{PREFIXO}_kyc_consultas_total",
+    "Consultas ao servico de KYC, por desfecho.",
+    labelnames=("resultado",),
+    registry=REGISTRO,
+)
+
+# Buckets curtos: a triagem do outro servico e comparacao em memoria, e o timeout do
+# cliente e 3s. Reusar os buckets de inferencia (que vao a 320s) desperdicaria toda a
+# resolucao onde as chamadas realmente vivem.
+kyc_duracao = Histogram(
+    f"{PREFIXO}_kyc_duracao_segundos",
+    "Latencia da consulta ao servico de KYC.",
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 3.0),
+    registry=REGISTRO,
+)
+
+# Estado do disjuntor como gauge de valor 1 no estado corrente. Permite alertar em
+# "circuito aberto por mais de 2 minutos", que e um sintoma diferente de "taxa de
+# erro alta" — o circuito aberto ja parou de tentar.
+kyc_disjuntor = Gauge(
+    f"{PREFIXO}_kyc_disjuntor",
+    "Estado do disjuntor do cliente de KYC (1 no estado corrente).",
+    labelnames=("estado",),
+    registry=REGISTRO,
+)
+
+
 # ---------------------------------------------------------------- Seguranca
 
 # Contador que deve gerar alerta, nao painel bonito: tentativa de injecao em

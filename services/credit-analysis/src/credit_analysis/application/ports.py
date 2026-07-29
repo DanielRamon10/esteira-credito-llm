@@ -19,6 +19,7 @@ from uuid import UUID
 from credit_analysis.domain.agente import TrilhaAgente
 from credit_analysis.domain.documento import ImagemDocumento, ResultadoOCR
 from credit_analysis.domain.entities import AnaliseCredito
+from credit_analysis.domain.kyc import ResultadoKYC
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
 
 
@@ -54,6 +55,29 @@ class ConsultaBureau(Protocol):
 
     async def tem_restricao(self, cpf: str) -> bool:
         """True se houver restricao cadastral ativa."""
+        ...
+
+
+@runtime_checkable
+class ConsultaKYC(Protocol):
+    """Triagem de conformidade, servida por outro microsservico.
+
+    A assinatura nao tem `raises`: este port **nao levanta excecao de rede**. Um KYC
+    indisponivel devolve `ResultadoKYC` com decisao `INDISPONIVEL`, e quem decide o
+    que fazer com a ausencia de informacao e o dominio (ver `domain/kyc.py`).
+
+    A alternativa — propagar a excecao — faria o caso de uso marcar a analise como
+    FALHA. Mas a analise nao falhou: ela ficou **incompleta**, o que tem tratamento
+    proprio (revisao humana) e nao pode ser confundido com erro interno.
+    """
+
+    async def triar(self, nome: str, cpf: str) -> ResultadoKYC:
+        """Consulta as listas restritivas para esta pessoa."""
+        ...
+
+    @property
+    def identificacao(self) -> str:
+        """Endpoint ou adapter em uso, para a trilha."""
         ...
 
 

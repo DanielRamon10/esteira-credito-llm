@@ -112,6 +112,18 @@ class Settings(BaseSettings):
     # Orcamento de tempo do atendimento inteiro, nao de uma chamada ao modelo.
     agente_timeout_segundos: float = Field(default=180.0, gt=0)
 
+    # --- KYC (servico de conformidade) ---
+    # Vazio desliga o gate de conformidade. Em `prod` isso e ERRO de subida, nao
+    # degradacao: aprovar credito sem triagem de lista restritiva e descumprir a
+    # Circular BCB 3.978, e um servico que faz isso em silencio e pior que um
+    # servico fora do ar. Ver `_montar_kyc` em `api/app.py`.
+    kyc_url: str = ""
+
+    # Timeout por tentativa. A triagem do outro servico e comparacao em memoria;
+    # passar de 3s indica rede ou saturacao, nao calculo.
+    kyc_timeout_segundos: float = Field(default=3.0, gt=0)
+    kyc_tentativas: int = Field(default=2, ge=1, le=5)
+
     # --- Observabilidade (Camada 5) ---
     # Vazio desliga o tracing. Observabilidade nunca deve impedir o servico de
     # subir: uma falha no coletor de traces viraria indisponibilidade da esteira
