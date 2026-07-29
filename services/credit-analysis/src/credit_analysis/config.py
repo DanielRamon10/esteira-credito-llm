@@ -1,0 +1,119 @@
+"""Configuracao da aplicacao.
+
+Tudo que muda entre ambientes vem de variavel de ambiente (12-factor). Nada
+de `if ambiente == "prod"` espalhado pelo codigo — o container recebe as
+variaveis certas e o mesmo binario roda em qualquer lugar.
+
+`Settings` e cacheada: ler o ambiente uma vez e reusar evita divergencia se
+alguem mexer em os.environ no meio da execucao.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ProvedorLLM(StrEnum):
+    """Qual adapter de LLM usar."""
+
+    AUTO = "auto"
+    ANTHROPIC = "anthropic"
+    OLLAMA = "ollama"
+    FAKE = "fake"
+
+
+class Ambiente(StrEnum):
+    LOCAL = "local"
+    DEV = "dev"
+    HOMOLOG = "homolog"
+    PROD = "prod"
+
+
+class Settings(BaseSettings):
+    """Configuracao lida de variaveis de ambiente e do arquivo .env."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="CREDIT_",
+        extra="ignore",
+    )
+
+    # --- Aplicacao ---
+    nome_servico: str = "credit-analysis"
+    ambiente: Ambiente = Ambiente.LOCAL
+    versao: str = "0.1.0"
+    debug: bool = False
+
+    # --- API ---
+    host: str = "0.0.0.0"
+    porta: int = 8000
+    prefixo_api: str = "/v1"
+
+    # --- Logging ---
+    nivel_log: str = "INFO"
+    log_json: bool = True
+
+    # --- Regras de negocio parametrizaveis ---
+    # Ficam aqui, e nao hardcoded, porque o time de risco ajusta sem deploy.
+    taxa_juros_padrao_mensal: float = Field(default=1.99, ge=0, le=20)
+    prazo_maximo_meses: int = Field(default=120, ge=1, le=480)
+
+    # --- Bureau ---
+    bureau_habilitado: bool = True
+    bureau_timeout_segundos: float = Field(default=3.0, gt=0)
+
+    # --- RAG ---
+    # Diretorio do corpus de politicas, relativo a raiz do servico.
+    diretorio_politicas: Path = Path("politicas")
+    modelo_embedding: str = "intfloat/multilingual-e5-large"
+    # Vazio = usa o vector store em memoria. Preencher aponta para pgvector.
+    postgres_dsn: str = ""
+    trechos_por_consulta: int = Field(default=5, ge=1, le=20)
+
+    # --- LLM ---
+    # `auto` escolhe na ordem: Anthropic (se houver chave) -> Ollama (se o
+    # daemon responder) -> fake. Nenhuma das tres exige configuracao: o
+    # servico sobe em qualquer ambiente e degrada de forma explicita.
+    provedor_llm: ProvedorLLM = ProvedorLLM.AUTO
+
+    # Anthropic (opcional, pago).
+    anthropic_api_key: str = ""
+    modelo_llm: str = "claude-opus-5"
+
+    # Ollama (local, gratuito). Modelo escolhido por medicao — ver o cabecalho
+    # de `infrastructure/llm/ollama_adapter.py`.
+    ollama_endpoint: str = "http://127.0.0.1:11434"
+    modelo_ollama: str = "llama3.1:8b"
+
+    llm_timeout_segundos: float = Field(default=60.0, gt=0)
+    ollama_timeout_segundos: float = Field(default=240.0, gt=0)
+
+    @property
+    def usar_pgvector(self) -> bool:
+        return bool(self.postgres_dsn.strip())
+
+    @property
+    def usar_llm_real(self) -> bool:
+        """Se ha credencial Anthropic — habilita tambem o OCR por visao."""
+        return bool(self.anthropic_api_key.strip())
+
+    @property
+    def producao(self) -> bool:
+        return self.ambiente is Ambiente.PROD
+
+    @property
+    def docs_habilitados(self) -> bool:
+        """Swagger fica fora do ar em producao: expoe superficie de ataque."""
+        return not self.producao
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Instancia unica de configuracao (injetada via Depends na API)."""
+    return Settings()
