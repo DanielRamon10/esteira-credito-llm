@@ -15,18 +15,22 @@ import structlog
 from fastapi import FastAPI, Request, Response
 
 from credit_analysis.api.errors import registrar_handlers
+from credit_analysis.api.routers import agente as rota_agente
 from credit_analysis.api.routers import analises, documentos, health, politicas
 from credit_analysis.application.ports import (
+    AgenteCredito,
     ConsultaBureau,
     ModeloLinguagem,
     MotorOCR,
     RepositorioAnalises,
 )
 from credit_analysis.config import ProvedorLLM, Settings, get_settings
+from credit_analysis.infrastructure.agente.grafo import AgenteLangGraph
 from credit_analysis.infrastructure.bureau import BureauStub
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
 from credit_analysis.infrastructure.llm.ollama_adapter import (
     LLMOllama,
+    criar_chat_ollama,
     modelos_instalados,
     ollama_disponivel,
 )
@@ -51,6 +55,7 @@ def criar_app(
     retriever: RetrieverHibrido | None = None,
     llm: ModeloLinguagem | None = None,
     motor_ocr: MotorOCR | None = None,
+    agente: AgenteCredito | None = None,
 ) -> FastAPI:
     """Monta a aplicacao. Adapters omitidos caem no default de desenvolvimento."""
     settings = settings or get_settings()
@@ -85,6 +90,22 @@ def criar_app(
                 VectorStorePgVector(pool), EmbedderFastEmbed(settings.modelo_embedding)
             )
 
+        # O agente e montado aqui, e nao junto dos outros adapters, porque ele
+        # depende do retriever — que com pgvector so existe depois do bloco
+        # acima. Montar antes deixaria o agente permanentemente sem a ferramenta
+        # de politica, e o sintoma seria "o agente nunca consulta politica",
+        # facil de confundir com o modelo escolhendo mal a ferramenta.
+        if app_.state.agente is None:
+            app_.state.agente = _montar_agente(
+                settings,
+                retriever=app_.state.retriever,
+                repositorio=app_.state.repositorio,
+            )
+        logger.info(
+            "servico.agente",
+            agente=(app_.state.agente.identificacao if app_.state.agente else "indisponivel"),
+        )
+
         yield
 
         if pool is not None:
@@ -110,6 +131,7 @@ def criar_app(
     app.state.retriever = retriever  # pode virar pgvector no lifespan
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)
     app.state.llm = llm or _montar_llm(settings)
+    app.state.agente = agente  # montado no lifespan quando nao injetado
 
     @app.middleware("http")
     async def correlacao_e_log(request: Request, call_next):  # type: ignore[no-untyped-def]
@@ -139,6 +161,7 @@ def criar_app(
     app.include_router(analises.router, prefix=settings.prefixo_api)
     app.include_router(politicas.router, prefix=settings.prefixo_api)
     app.include_router(documentos.router, prefix=settings.prefixo_api)
+    app.include_router(rota_agente.router, prefix=settings.prefixo_api)
 
     return app
 
@@ -194,6 +217,84 @@ def _montar_llm(settings: Settings) -> ModeloLinguagem:
 
     logger.warning("llm.usando_fake", motivo="nenhum provedor real disponivel")
     return LLMFake()
+
+
+def _montar_agente(
+    settings: Settings,
+    retriever: RetrieverHibrido | None,
+    repositorio: RepositorioAnalises,
+) -> AgenteCredito | None:
+    """Monta o agente, ou devolve None quando nao ha modelo com ferramentas.
+
+    Diferente do `_montar_llm`, aqui **nao existe fake de producao**. Um agente
+    que finge decidir e pior que um agente ausente: a resposta tem a mesma
+    aparencia da real, com trilha e tudo, e nada no corpo do JSON avisa que as
+    ferramentas nunca rodaram. Sem modelo, o endpoint responde 503 dizendo o que
+    instalar.
+
+    Note que o agente sobe **mesmo sem indice de politicas**. Ele perde a
+    ferramenta de consulta e mantem a simulacao, que e deterministica e nao
+    depende de nada externo — degradacao parcial e melhor que 503 total, desde
+    que o modelo saiba quais ferramentas tem (e ele sabe: a caixa so anuncia as
+    que funcionam).
+    """
+    if settings.provedor_llm is ProvedorLLM.FAKE:
+        logger.info("agente.desabilitado", motivo="provedor_llm=fake")
+        return None
+
+    modelo: object | None = None
+    identificacao = ""
+
+    if (
+        settings.provedor_llm in {ProvedorLLM.ANTHROPIC, ProvedorLLM.AUTO}
+        and settings.usar_llm_real
+    ):
+        from langchain_anthropic import ChatAnthropic
+
+        modelo = ChatAnthropic(
+            model=settings.modelo_llm,
+            timeout=settings.llm_timeout_segundos,
+            max_tokens_to_sample=2048,
+            stop=None,
+        )
+        identificacao = f"anthropic:{settings.modelo_llm}"
+
+    elif settings.provedor_llm in {ProvedorLLM.OLLAMA, ProvedorLLM.AUTO} and ollama_disponivel(
+        settings.ollama_endpoint
+    ):
+        instalados = modelos_instalados(settings.ollama_endpoint)
+        if instalados and settings.modelo_agente not in instalados:
+            # Aviso e nao erro: o Ollama baixa sob demanda na primeira chamada.
+            # O que nao pode acontecer e a primeira requisicao de negocio pagar
+            # um download de 4GB sem ninguem entender a demora.
+            logger.warning(
+                "agente.modelo_ausente",
+                solicitado=settings.modelo_agente,
+                instalados=list(instalados),
+                acao=f"rode: ollama pull {settings.modelo_agente}",
+            )
+        modelo = criar_chat_ollama(
+            modelo=settings.modelo_agente,
+            endpoint=settings.ollama_endpoint,
+            timeout_segundos=settings.ollama_timeout_segundos,
+        )
+        identificacao = f"ollama:{settings.modelo_agente}"
+
+    if modelo is None:
+        logger.warning("agente.indisponivel", motivo="nenhum modelo com suporte a ferramentas")
+        return None
+
+    from langchain_core.language_models import BaseChatModel
+
+    assert isinstance(modelo, BaseChatModel)
+    return AgenteLangGraph(
+        modelo=modelo,
+        retriever=retriever,
+        repositorio=repositorio,
+        identificacao=identificacao,
+        max_passos=settings.agente_max_passos,
+        orcamento_segundos=settings.agente_timeout_segundos,
+    )
 
 
 def _montar_ocr(settings: Settings) -> MotorOCR | None:

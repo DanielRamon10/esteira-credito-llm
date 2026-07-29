@@ -94,6 +94,21 @@ class Settings(BaseSettings):
     llm_timeout_segundos: float = Field(default=60.0, gt=0)
     ollama_timeout_segundos: float = Field(default=240.0, gt=0)
 
+    # --- Agente (Camada 4) ---
+    # Modelo **diferente** do usado na fundamentacao, e nao por descuido. Medido
+    # com 9 cenarios: `qwen2.5:7b` abstem-se corretamente 4/4 quando a pergunta
+    # nao exige ferramenta; `llama3.1:8b` abstem-se 0/4, chamando ferramenta
+    # ate para "Bom dia". Na fundamentacao a ordem se inverte. Ver o cabecalho de
+    # `infrastructure/agente/grafo.py`.
+    modelo_agente: str = "qwen2.5:7b"
+
+    # Teto de execucoes de ferramenta por atendimento — a protecao contra o
+    # modelo que nao sabe parar de chamar ferramenta.
+    agente_max_passos: int = Field(default=6, ge=1, le=20)
+
+    # Orcamento de tempo do atendimento inteiro, nao de uma chamada ao modelo.
+    agente_timeout_segundos: float = Field(default=180.0, gt=0)
+
     @property
     def usar_pgvector(self) -> bool:
         return bool(self.postgres_dsn.strip())

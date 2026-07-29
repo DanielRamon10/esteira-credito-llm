@@ -16,6 +16,7 @@ from typing import Annotated
 from fastapi import Depends, Request
 
 from credit_analysis.application.ports import (
+    AgenteCredito,
     ConsultaBureau,
     ModeloLinguagem,
     MotorOCR,
@@ -100,6 +101,23 @@ def obter_motor_ocr(request: Request) -> MotorOCR:
     return motor
 
 
+def obter_agente(request: Request) -> AgenteCredito:
+    """Agente configurado na aplicacao.
+
+    503 e nao fake: um agente falso responderia com trilha vazia e texto
+    plausivel, e quem consome nao teria como saber que nenhuma ferramenta rodou.
+    Indisponibilidade honesta e melhor que disponibilidade fingida.
+    """
+    agente: AgenteCredito | None = getattr(request.app.state, "agente", None)
+    if agente is None:
+        raise RecursoIndisponivel(
+            "Agente indisponivel: nenhum modelo com suporte a ferramentas. "
+            "Instale o Ollama (`winget install Ollama.Ollama`) e rode "
+            "`ollama pull qwen2.5:7b`, ou configure CREDIT_ANTHROPIC_API_KEY."
+        )
+    return agente
+
+
 def obter_caso_processar_documento(
     repositorio: Annotated[RepositorioAnalises, Depends(obter_repositorio)],
     motor: Annotated[MotorOCR, Depends(obter_motor_ocr)],
@@ -124,3 +142,4 @@ ProcessarDocumentoDep = Annotated[ProcessarDocumento, Depends(obter_caso_process
 AnalisarDep = Annotated[AnalisarCredito, Depends(obter_caso_analisar)]
 ConsultarDep = Annotated[ConsultarAnalise, Depends(obter_caso_consultar)]
 ListarDep = Annotated[ListarAnalises, Depends(obter_caso_listar)]
+AgenteDep = Annotated[AgenteCredito, Depends(obter_agente)]

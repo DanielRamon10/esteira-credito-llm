@@ -18,6 +18,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from credit_analysis.application.use_cases.processar_documento import ResultadoProcessamento
+from credit_analysis.domain.agente import PassoAgente, TrilhaAgente
 from credit_analysis.domain.documento import CampoExtraido, QualidadeExtracao
 from credit_analysis.domain.entities import AnaliseCredito, Parecer, PropostaCredito, Solicitante
 from credit_analysis.domain.enums import Decisao, NivelRisco, StatusAnalise, TipoDocumento
@@ -381,6 +382,95 @@ class DocumentoProcessadoResponse(BaseModel):
             exige_revisao_humana=resultado.exige_revisao_humana,
             injecao_suspeita=bool(conteudo and conteudo.suspeito),
             categorias_suspeitas=list(conteudo.categorias) if conteudo else [],
+        )
+
+
+class PerguntaAgenteRequest(BaseModel):
+    """Corpo do POST /v1/agente/consultar."""
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True,
+        json_schema_extra={
+            "example": {
+                "pergunta": "O comprometimento deste caso passa do teto? O que a politica exige?",
+                "analise_id": "8c1f9e6a-0b3d-4a2e-9f11-6c5d4e3b2a10",
+            }
+        },
+    )
+
+    pergunta: str = Field(min_length=3, max_length=2000)
+    analise_id: UUID | None = Field(
+        default=None,
+        description=(
+            "Caso a discutir. Fixa qual analise o agente pode ler — ele nao "
+            "escolhe, nem pode trocar de caso durante o atendimento."
+        ),
+    )
+
+
+class PassoAgenteResponse(BaseModel):
+    """Uma ferramenta executada pelo agente."""
+
+    ordem: int
+    ferramenta: str
+    argumentos: dict[str, object]
+    resumo: str
+    sucesso: bool
+    duracao_ms: int
+    erro: str | None = None
+
+    @classmethod
+    def de_dominio(cls, passo: PassoAgente) -> PassoAgenteResponse:
+        return cls(
+            ordem=passo.ordem,
+            ferramenta=passo.ferramenta,
+            argumentos=dict(passo.argumentos),
+            resumo=passo.resumo,
+            sucesso=passo.sucesso,
+            duracao_ms=passo.duracao_ms,
+            erro=passo.erro,
+        )
+
+
+class TrilhaAgenteResponse(BaseModel):
+    """Resposta do agente com o caminho percorrido.
+
+    A trilha vai no corpo, e nao so no log, porque quem consome precisa poder
+    decidir o que fazer com a resposta. `completa=false` significa que o agente
+    parou por limite ou por tempo — a resposta ainda serve, mas nao deve ser
+    tratada como conclusiva.
+    """
+
+    resposta: str
+    completa: bool = Field(
+        description="False quando o agente parou por limite de passos, tempo ou erro"
+    )
+    motivo_parada: str
+    modelo: str
+    duracao_ms: int
+    passos: list[PassoAgenteResponse] = Field(default_factory=list)
+    ferramentas_usadas: list[str] = Field(
+        default_factory=list,
+        description="Na ordem, com repeticao — repeticao e o sintoma de loop",
+    )
+    injecao_suspeita: bool = Field(
+        default=False,
+        description="Padrao de injecao detectado no retorno de alguma ferramenta",
+    )
+    categorias_suspeitas: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def de_dominio(cls, trilha: TrilhaAgente) -> TrilhaAgenteResponse:
+        return cls(
+            resposta=trilha.resposta,
+            completa=trilha.completa,
+            motivo_parada=trilha.motivo_parada.value,
+            modelo=trilha.modelo,
+            duracao_ms=trilha.duracao_ms,
+            passos=[PassoAgenteResponse.de_dominio(p) for p in trilha.passos],
+            ferramentas_usadas=list(trilha.ferramentas_usadas),
+            injecao_suspeita=bool(trilha.suspeitas_injecao),
+            categorias_suspeitas=list(trilha.suspeitas_injecao),
         )
 
 

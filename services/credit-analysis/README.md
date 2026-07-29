@@ -46,6 +46,7 @@ infrastructure/
   rag/               BM25 + denso + RRF, embeddings ONNX, pgvector
   llm/               Adapters Ollama (local) e Anthropic, mesmo port
   ocr/               Pré-processamento, Tesseract, visão, escalonamento
+  agente/            Grafo LangGraph + caixa de ferramentas validada
 api/
   app.py             Application factory + middleware de correlação
   schemas.py         Contrato HTTP, separado das entidades
@@ -75,6 +76,43 @@ esteira de crédito não pode errar.
 Tabela densa de números monoespacados recebe score por palavra mais baixo que
 prosa. Por isso a cadeia pergunta "os campos obrigatórios saíram?" e usa a
 confiança como sinal secundário.
+
+## Agente com ferramentas (Camada 4)
+
+```
+START -> decidir -> tem tool_calls? -- não --> END
+                         | sim
+                    passos < teto? -- não --> concluir (sem ferramentas) -> END
+                         | sim
+                   usar_ferramentas -> decidir
+```
+
+Três ferramentas, todas de leitura ou cálculo: `consultar_politica`,
+`consultar_caso`, `simular_proposta`. **Nenhuma escreve** — o agente lê, simula e
+explica; quem decide crédito é o `scoring.py`, e `simular_proposta` chama esse
+mesmo motor para que o número do agente nunca divirja do da esteira.
+
+Medido ponta a ponta com `qwen2.5:7b` e o corpus real (37 trechos):
+
+| Pergunta | Ferramenta | Tempo |
+|---|---|---|
+| "Bom dia! Tudo bem?" | *nenhuma* (abstenção correta) | 5s |
+| "Qual o teto de comprometimento?" | `consultar_politica` | 80s |
+| "Resuma o caso em análise" | `consultar_caso` | 83s |
+| "20 mil em 60 meses cabe em 9 mil?" | `simular_proposta` | 80s |
+
+A abstenção sai 16× mais rápida — é por isso que a escolha do modelo do agente
+foi por *abstenção*, não por velocidade por chamada (ver README raiz).
+
+**Por que grafo e não um `while`.** O `while` seria menor. O grafo dá estado
+explícito, topologia inspecionável (`draw_mermaid()` desenha o fluxo real) e é
+onde entram checkpoint e retomada sem reescrita — que é o caminho para resolver
+os 80s.
+
+**O teto de passos não é um `if` educado.** Ao atingi-lo, o grafo faz uma última
+chamada com **nenhuma ferramenta vinculada**: o modelo fica incapaz de pedir mais
+uma, em vez de ser instruído a parar em prosa. A medição justifica a paranoia — o
+`llama3.1:8b` ignora "responda sem ferramenta" em 4 de 4 tentativas.
 
 ## Decisões que valem explicar
 
@@ -107,6 +145,7 @@ independente dela.
 | `POST` | `/v1/analises/{id}/documentos` | Envia documento, extrai e **reavalia o score** |
 | `GET` | `/v1/politicas/buscar` | Retrieval puro no corpus, sem LLM |
 | `POST` | `/v1/politicas/consultar` | Resposta fundamentada com citações verificadas |
+| `POST` | `/v1/agente/consultar` | Agente decide as ferramentas e devolve a trilha |
 | `GET` | `/health` | Liveness probe |
 | `GET` | `/ready` | Readiness probe |
 

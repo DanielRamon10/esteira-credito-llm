@@ -152,6 +152,38 @@ class LLMOllama:
         return texto
 
 
+def criar_chat_ollama(
+    modelo: str = MODELO_PADRAO,
+    endpoint: str = ENDPOINT_PADRAO,
+    timeout_segundos: float = TIMEOUT_PADRAO,
+) -> ChatOllama:
+    """Cliente de chat cru, para quem precisa de `bind_tools`.
+
+    O `LLMOllama` acima implementa o port `ModeloLinguagem` — sistema + usuario
+    -> texto — e essa interface estreita e proposital. O agente da Camada 4
+    precisa de outra coisa: vincular ferramentas, receber `tool_calls` de volta e
+    devolver `ToolMessage`. Espremer isso no port de geracao de texto inflaria
+    justamente o contrato que se manteve minimo para ter um fake util.
+
+    Entao o agente recebe o `ChatOllama` diretamente. Ele e adapter de
+    infraestrutura conversando com biblioteca de infraestrutura; a fronteira
+    hexagonal que importa fica um nivel acima, no port `AgenteCredito`, que
+    devolve `TrilhaAgente` — tipo de dominio, sem nada de LangChain.
+
+    Sem `format="json"` aqui: forcar JSON quebra tool calling, porque a resposta
+    com chamada de ferramenta tem estrutura propria no protocolo do Ollama.
+    """
+    from langchain_ollama import ChatOllama
+
+    return ChatOllama(
+        model=modelo,
+        base_url=endpoint,
+        temperature=TEMPERATURA,
+        num_ctx=NUM_CTX,
+        client_kwargs={"timeout": timeout_segundos},
+    )
+
+
 def ollama_disponivel(endpoint: str = ENDPOINT_PADRAO, timeout: float = 2.0) -> bool:
     """Verifica se o daemon do Ollama responde.
 

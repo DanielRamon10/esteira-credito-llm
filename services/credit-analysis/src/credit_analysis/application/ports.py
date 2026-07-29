@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
+from credit_analysis.domain.agente import TrilhaAgente
 from credit_analysis.domain.documento import ImagemDocumento, ResultadoOCR
 from credit_analysis.domain.entities import AnaliseCredito
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
@@ -154,6 +155,31 @@ class ModeloLinguagem(Protocol):
     @property
     def identificacao(self) -> str:
         """Modelo em uso, para registro no parecer e rastreabilidade."""
+        ...
+
+
+@runtime_checkable
+class AgenteCredito(Protocol):
+    """Atendimento assistido por agente, com ferramentas.
+
+    Port separado do `ModeloLinguagem` em vez de inchar aquele — como estava
+    previsto ali. Sao contratos diferentes: um gera texto a partir de um prompt;
+    este **decide acoes** e devolve a trilha do que fez. Um fake do primeiro e
+    uma string fixa; um fake deste precisa simular uma sequencia de decisoes.
+
+    `analise_id` vem por parametro e nao dentro do pedido: o agente nunca
+    escolhe qual analise ler. Se o identificador viesse do texto que o modelo
+    produz, bastaria uma alucinacao — ou uma injecao no documento de um cliente
+    — para o agente abrir o caso de outra pessoa.
+    """
+
+    async def atender(self, pergunta: str, analise_id: UUID | None = None) -> TrilhaAgente:
+        """Responde a pergunta, usando ferramentas quando necessario."""
+        ...
+
+    @property
+    def identificacao(self) -> str:
+        """Modelo em uso, para registro na trilha."""
         ...
 
 
