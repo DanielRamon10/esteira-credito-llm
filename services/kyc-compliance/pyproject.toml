@@ -1,0 +1,74 @@
+[project]
+name = "kyc-compliance"
+version = "0.1.0"
+description = "Triagem de KYC contra listas restritivas, com decisao deterministica e explicavel"
+requires-python = ">=3.12"
+
+# ## O tamanho desta lista e o ponto
+#
+# Sete dependencias, contra vinte e uma do `credit-analysis`. Nao ha numpy, pandas,
+# OpenCV, ONNX, LangChain nem cliente de banco — o dominio deste servico e
+# comparacao de string, e a biblioteca padrao resolve (`difflib`, `unicodedata`).
+#
+# A consequencia pratica aparece na imagem: ~200MB contra 1,18GB. E o argumento
+# concreto a favor de separar por dominio em vez de manter um monolito: o servico
+# que precisa ficar disponivel para o outro sobe em segundos e nao carrega 600MB
+# de dependencia nativa que ele nunca usa.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kyc_compliance"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S", "BLE", "SLF"]
+ignore = [
+    "S101",  # assert em teste
+    "N818",  # nome de excecao sem sufixo Error: o dominio e em portugues
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["SLF001", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+warn_unreachable = true
+# O dominio nao tem dependencia externa; nao ha stub faltando a tolerar.
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: exercita a API completa",
+    "eval: medicao de qualidade do casamento de nomes (nao e teste binario)",
+]
+addopts = "-ra --strict-markers -m 'not eval'"

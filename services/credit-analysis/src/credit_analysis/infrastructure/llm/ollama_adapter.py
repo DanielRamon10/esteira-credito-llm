@@ -224,6 +224,33 @@ def criar_chat_ollama(
     )
 
 
+ESQUEMAS_PERMITIDOS = frozenset({"http", "https"})
+
+
+def _validar_endpoint(endpoint: str) -> str:
+    """Recusa esquema que nao seja HTTP.
+
+    `urlopen` aceita `file:`, `ftp:` e esquemas customizados. Como o endpoint vem
+    de variavel de ambiente, um valor como `file:///etc/passwd/api/version` faria a
+    checagem de disponibilidade ler arquivo local — SSRF de configuracao.
+
+    Aqui o risco e baixo (quem edita a variavel de ambiente ja tem acesso ao
+    processo), mas o custo de fechar e uma funcao de tres linhas, e o padrao
+    "urlopen sobre string configuravel" e o mesmo que vira vulnerabilidade quando o
+    endpoint passa a vir de um cadastro no banco. Fechar agora evita que a proxima
+    pessoa copie o padrao aberto.
+    """
+    from urllib.parse import urlsplit
+
+    esquema = urlsplit(endpoint).scheme.lower()
+    if esquema not in ESQUEMAS_PERMITIDOS:
+        raise ValueError(
+            f"Endpoint do Ollama com esquema nao permitido: {esquema or '(vazio)'}. "
+            f"Use um de: {sorted(ESQUEMAS_PERMITIDOS)}"
+        )
+    return endpoint.rstrip("/")
+
+
 def ollama_disponivel(endpoint: str = ENDPOINT_PADRAO, timeout: float = 2.0) -> bool:
     """Verifica se o daemon do Ollama responde.
 
@@ -234,7 +261,14 @@ def ollama_disponivel(endpoint: str = ENDPOINT_PADRAO, timeout: float = 2.0) -> 
     import urllib.request
 
     try:
-        with urllib.request.urlopen(f"{endpoint}/api/version", timeout=timeout) as resposta:
+        alvo = f"{_validar_endpoint(endpoint)}/api/version"
+    except ValueError:
+        logger.warning("llm.endpoint_invalido", endpoint=endpoint)
+        return False
+
+    try:
+        # O esquema ja foi validado acima; `urlopen` nao pode mais abrir `file:`.
+        with urllib.request.urlopen(alvo, timeout=timeout) as resposta:  # noqa: S310
             return bool(resposta.status == 200)
     except (urllib.error.URLError, OSError, ValueError):
         return False
@@ -251,7 +285,13 @@ def modelos_instalados(endpoint: str = ENDPOINT_PADRAO, timeout: float = 3.0) ->
     import urllib.request
 
     try:
-        with urllib.request.urlopen(f"{endpoint}/api/tags", timeout=timeout) as resposta:
+        alvo = f"{_validar_endpoint(endpoint)}/api/tags"
+    except ValueError:
+        return ()
+
+    try:
+        # Esquema validado; ver `_validar_endpoint`.
+        with urllib.request.urlopen(alvo, timeout=timeout) as resposta:  # noqa: S310
             dados = json.loads(resposta.read())
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return ()

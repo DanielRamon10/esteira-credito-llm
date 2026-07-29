@@ -74,8 +74,30 @@ target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
+# Inclui as regras de seguranca (`S`, do bandit) e as de encapsulamento (`BLE`,
+# `SLF`). Elas entraram depois, quando o `kyc-compliance` nasceu com esse conjunto
+# e a diferenca de regua entre os dois servicos ficou evidente — duas reguas num
+# mesmo monorepo significa que o codigo mais novo e mais seguro por acidente, e
+# nao por politica.
+#
+# O que elas encontraram, e o que foi feito:
+#
+#   S310  urlopen sobre endpoint configuravel sem validar o esquema. **Achado
+#         legitimo**, corrigido de verdade: `_validar_endpoint` recusa qualquer
+#         coisa que nao seja http/https, porque `file:///etc/passwd/api/version`
+#         faria a checagem de disponibilidade ler arquivo local.
+#   S608  SQL montado com f-string em `pgvector_store`. **Falso positivo**,
+#         verificado: interpola apenas a constante `_COLUNAS`, e todo valor de
+#         dado entra por bind parameter `%(nome)s`. Ignorado por arquivo abaixo.
+#   S101  `assert` em `src`. Sao estreitamentos de tipo depois de validacao
+#         Pydantic, nao garantias de runtime. Ignorados por arquivo.
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S", "BLE", "SLF"]
 ignore = [
+    # S101: `assert`. E a forma de escrever teste em pytest, e em `src` os poucos
+    # asserts que existem sao estreitamento de tipo depois de validacao Pydantic —
+    # se o Python rodar com -O eles desaparecem e o codigo continua correto,
+    # porque nao carregam garantia de negocio.
+    "S101",
     # RUF001-003: caracteres "ambiguos" (acentos, travessao) em strings e
     # comentarios. O dominio e escrito em portugues; a regra e ruido aqui.
     "RUF001",
@@ -86,6 +108,27 @@ ignore = [
     # para satisfazer a regra deixaria o vocabulario inconsistente.
     "N818",
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# S608 verificado linha por linha: o f-string interpola somente `_COLUNAS`,
+# constante de modulo com a lista fixa de colunas; todo valor de dado entra por
+# bind parameter `%(nome)s`, que o psycopg envia separado do texto da consulta.
+#
+# O `noqa` inline nao serve neste caso: o diagnostico aponta para a **abertura** de
+# uma string multilinha, e o comentario cairia dentro do SQL — onde `#` nao e
+# comentario em PostgreSQL. Descobri isso quebrando a consulta.
+"src/credit_analysis/infrastructure/rag/pgvector_store.py" = ["S608"]
+
+# Leitura de atributo interno, com a justificativa no proprio codigo: o nome da
+# metrica no `prometheus_client` e o `_compilar` do agente, usado para desenhar o
+# grafo em Mermaid.
+"src/credit_analysis/infrastructure/observabilidade/metricas.py" = ["SLF001"]
+"src/credit_analysis/infrastructure/agente/grafo.py" = ["SLF001"]
+
+# Gerador de documento sintetico: `random` com seed fixa, para que o eval de OCR
+# seja comparavel entre execucoes. Nao ha uso criptografico.
+"tests/apoio/documentos_sinteticos.py" = ["S311"]
+"tests/**" = ["SLF001", "S105", "S106", "S108"]
 
 [tool.mypy]
 python_version = "3.12"

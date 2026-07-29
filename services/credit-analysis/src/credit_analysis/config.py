@@ -51,7 +51,10 @@ class Settings(BaseSettings):
     debug: bool = False
 
     # --- API ---
-    host: str = "0.0.0.0"
+    # `0.0.0.0` e o valor correto num container: bind em `127.0.0.1` deixaria o
+    # processo inalcancavel de fora do namespace de rede. O isolamento e feito pelo
+    # namespace e pela NetworkPolicy (infra/k8s), nao pelo endereco de bind.
+    host: str = "0.0.0.0"  # noqa: S104
     porta: int = 8000
     prefixo_api: str = "/v1"
 

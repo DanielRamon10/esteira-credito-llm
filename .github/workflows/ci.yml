@@ -136,6 +136,52 @@ jobs:
             exit 1
           fi
 
+  qualidade-kyc:
+    name: Lint, tipagem e testes (kyc-compliance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    # Job separado, e nao uma matriz sobre os dois servicos. A matriz obrigaria a
+    # tornar o Postgres condicional, e um `if` no meio de um service container
+    # custa mais em legibilidade do que a duplicacao de seis passos. Alem disso, os
+    # dois jobs correm em paralelo de qualquer forma.
+    #
+    # O contraste vale ser notado: este servico nao precisa de banco, de modelo,
+    # nem de binario de OCR. Sao seis dependencias contra vinte e uma, e o job
+    # termina em menos de um minuto.
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "services/kyc-compliance/pyproject.toml"
+
+      - name: Instalar dependencias
+        working-directory: services/kyc-compliance
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install -e ".[dev]"
+
+      - name: Formatacao, lint e tipagem
+        working-directory: services/kyc-compliance
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+
+      - name: Testes
+        working-directory: services/kyc-compliance
+        run: uv run pytest -q --cov=kyc_compliance --cov-report=term-missing
+
+      - name: Medicao do casamento de nomes
+        working-directory: services/kyc-compliance
+        # Os evals do outro servico ficam fora do CI porque baixam 2,24GB de
+        # modelo. Estes nao dependem de nada externo — sao comparacao de string —
+        # entao rodam aqui: custam segundos e protegem a propriedade que sustenta
+        # os limiares de decisao (a faixa vazia entre positivos e negativos).
+        run: uv run pytest -m eval -v
+
   seguranca:
     name: Varredura de segredo
     runs-on: ubuntu-latest

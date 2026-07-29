@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any
@@ -111,18 +112,39 @@ async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> int:
     Checar `arquivo.size` antes nao basta: o header `Content-Length` e informado
     pelo cliente e pode mentir. O limite tem que ser aplicado sobre o que
     realmente chega.
+
+    ## As escritas vao para uma thread, e nao para o event loop
+
+    A versao anterior chamava `saida.write(bloco)` direto dentro da corrotina. O
+    lint de seguranca do outro servico apontou isso (regra ASYNC), e o apontamento
+    esta correto: escrita em disco e chamada bloqueante, e enquanto ela roda **o
+    event loop inteiro para**. Num upload de 10MB isso significa segurar todas as
+    outras requisicoes do processo durante a gravacao.
+
+    O padrao aqui e o que importa mais que a magnitude: `async def` cria a
+    expectativa de que a funcao cede controle, e I/O sincrono dentro dela quebra
+    essa expectativa em silencio. `asyncio.to_thread` move a operacao para o pool
+    de threads, e o loop segue atendendo.
     """
     total = 0
-    with destino.open("wb") as saida:
+    saida = await asyncio.to_thread(destino.open, "wb")
+    try:
         while bloco := await arquivo.read(BLOCO):
             total += len(bloco)
             if total > TAMANHO_MAXIMO_BYTES:
-                saida.close()
-                destino.unlink(missing_ok=True)
                 raise ArquivoGrandeDemais(
                     f"Arquivo excede o limite de {TAMANHO_MAXIMO_BYTES // (1024 * 1024)}MB"
                 )
-            saida.write(bloco)
+            await asyncio.to_thread(saida.write, bloco)
+    except ArquivoGrandeDemais:
+        # Fecha antes de remover: no Windows, apagar arquivo com handle aberto
+        # levanta PermissionError, e o parcial ficaria em disco.
+        await asyncio.to_thread(saida.close)
+        await asyncio.to_thread(destino.unlink, True)
+        raise
+    finally:
+        # Idempotente: fechar duas vezes nao levanta.
+        await asyncio.to_thread(saida.close)
 
     if total == 0:
         raise ValorInvalido("Arquivo vazio")
