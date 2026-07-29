@@ -139,6 +139,23 @@ ONNX) carrega sob demanda. O carregamento tardio é deliberado, para que uma
 réplica que nunca recebe consulta de política não pague isso no boot; o que a
 Camada 5 mudou é que o custo dessa escolha agora está medido em vez de estimado.
 
+## Container (Camada 6)
+
+```bash
+docker build -t credit-analysis:dev .
+docker run --rm -p 8000:8000 -e CREDIT_PROVEDOR_LLM=fake credit-analysis:dev
+```
+
+Multi-stage, usuário sem privilégio (uid 10001), Tesseract com `por`, healthcheck
+no `/health` — e não no `/ready`, porque healthcheck de container responde "o
+processo está vivo?"; usar o readiness aqui faria o Docker matar um container
+saudável cuja dependência está lenta. Quem decide sobre tráfego é o orquestrador.
+
+Duas coisas ficam **fora** da imagem de propósito: o modelo de embedding de
+2,24GB (baixado no primeiro uso, para um volume — assá-lo acoplaria versão de
+modelo a versão de aplicação) e o corpus indexado (ingestão é passo de deploy, não
+de build; o mesmo binário precisa servir ambientes com corpora diferentes).
+
 ## Decisões que valem explicar
 
 **`Decimal`, nunca `float`, para dinheiro.** `0.1 + 0.2 != 0.3` em ponto

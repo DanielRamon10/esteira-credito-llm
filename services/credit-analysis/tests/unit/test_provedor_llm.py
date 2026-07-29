@@ -31,6 +31,19 @@ def settings(**kwargs: object) -> Settings:
         "log_json": False,
         "postgres_dsn": "",
         "anthropic_api_key": "",
+        # `auto` EXPLICITO, e nao herdado do ambiente.
+        #
+        # Sem esta linha os testes de selecao automatica liam
+        # `CREDIT_PROVEDOR_LLM` do ambiente. Na maquina de desenvolvimento a
+        # variavel nao existe e o default do `Settings` ja e `auto`, entao
+        # passavam. No CI, que define `CREDIT_PROVEDOR_LLM=fake` para nao chamar
+        # Ollama, tres testes falharam — eles afirmavam "o modo automatico escolhe
+        # Anthropic" enquanto o modo em vigor era `fake`.
+        #
+        # E o mesmo defeito que apareceu no `conftest` com o DSN do Postgres:
+        # argumento de construtor vence variavel de ambiente no pydantic-settings,
+        # e teste que depende do ambiente nao e teste, e coincidencia.
+        "provedor_llm": ProvedorLLM.AUTO,
     }
     base.update(kwargs)
     return Settings(**base)  # type: ignore[arg-type]

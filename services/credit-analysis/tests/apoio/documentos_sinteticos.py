@@ -23,12 +23,46 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-# Fontes do Windows. A monoespacada e usada nas colunas numericas: digito com
-# largura fixa reduz erro de segmentacao do Tesseract em tabela.
-_DIR_FONTES = Path("C:/Windows/Fonts")
-_FONTES_TEXTO = ("arial.ttf", "calibri.ttf", "tahoma.ttf")
-_FONTES_TITULO = ("arialbd.ttf", "consolab.ttf")
-_FONTES_MONO = ("consola.ttf", "cour.ttf")
+# Fontes TrueType, procuradas em varios sistemas.
+#
+# A primeira versao disto olhava apenas `C:/Windows/Fonts`, e a suite passava na
+# maquina de desenvolvimento e falhava no CI em Linux — "funciona na minha
+# maquina" na forma mais literal. O CI foi o que expos: quatro testes de OCR
+# morreram com `Nenhuma fonte encontrada`.
+#
+# A monoespacada e usada nas colunas numericas: digito de largura fixa reduz erro
+# de segmentacao do Tesseract em tabela. Por isso as listas sao separadas em vez
+# de uma fonte unica para tudo.
+_DIRS_FONTES = (
+    Path("C:/Windows/Fonts"),  # Windows
+    Path("/usr/share/fonts/truetype/dejavu"),  # Debian, Ubuntu
+    Path("/usr/share/fonts/dejavu"),  # Fedora, Arch
+    Path("/usr/share/fonts/truetype/liberation"),  # alternativa comum
+    Path("/Library/Fonts"),  # macOS
+    Path("/System/Library/Fonts/Supplemental"),  # macOS
+)
+_FONTES_TEXTO = (
+    "arial.ttf",
+    "calibri.ttf",
+    "tahoma.ttf",
+    "DejaVuSans.ttf",
+    "LiberationSans-Regular.ttf",
+    "Arial.ttf",
+)
+_FONTES_TITULO = (
+    "arialbd.ttf",
+    "consolab.ttf",
+    "DejaVuSans-Bold.ttf",
+    "LiberationSans-Bold.ttf",
+    "Arial Bold.ttf",
+)
+_FONTES_MONO = (
+    "consola.ttf",
+    "cour.ttf",
+    "DejaVuSansMono.ttf",
+    "LiberationMono-Regular.ttf",
+    "Courier New.ttf",
+)
 
 LARGURA_A4_200DPI = 1654  # 8.27in * 200
 ALTURA_A4_200DPI = 2339
@@ -41,13 +75,14 @@ def _carregar_fonte(candidatas: tuple[str, ...], tamanho: int) -> ImageFont.Free
     erraria por motivo de renderizacao, nao por degradacao — mediria a coisa
     errada. Melhor falhar dizendo o que falta.
     """
-    for nome in candidatas:
-        caminho = _DIR_FONTES / nome
-        if caminho.exists():
-            return ImageFont.truetype(str(caminho), tamanho)
+    for diretorio in _DIRS_FONTES:
+        for nome in candidatas:
+            caminho = diretorio / nome
+            if caminho.exists():
+                return ImageFont.truetype(str(caminho), tamanho)
 
     raise RuntimeError(
-        f"Nenhuma fonte encontrada entre {candidatas} em {_DIR_FONTES}. "
+        f"Nenhuma fonte encontrada entre {candidatas} em {[str(d) for d in _DIRS_FONTES]}. "
         "O gerador de documentos sinteticos precisa de uma fonte TrueType."
     )
 
