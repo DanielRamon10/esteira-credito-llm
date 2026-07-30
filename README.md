@@ -27,8 +27,8 @@ esteira-credito-llm/
 ├── infra/
 │   ├── postgres/            # Schema e init do pgvector
 │   ├── observabilidade/     # Prometheus, Tempo, Grafana provisionados
-│   ├── k8s/                 # Manifests (base + overlay de produção)
-│   └── terraform/           # ECR, S3, Secrets Manager, IAM, ECS Fargate
+│   ├── k8s/                 # Um componente por serviço + overlay de produção
+│   └── terraform/           # Módulo `servico` instanciado 3x + recursos compartilhados
 ├── .github/workflows/       # CI, evals de IA e deploy
 └── docker-compose.yml       # Stack local completa
 ```
@@ -186,18 +186,63 @@ Verificado, não presumido: o container roda como uid 10001, tem Tesseract com
 
 ### Kubernetes e Terraform são dois caminhos, não dois ambientes
 
-`infra/k8s/` (Kustomize, base + overlay) e `infra/terraform/` (ECS Fargate) fazem
-a mesma coisa em runtimes diferentes. A duplicação é proposital e a escolha não é
-técnica em abstrato: **já existe cluster e time de plataforma?** Sem cluster,
-Fargate elimina gestão de nó; com cluster, subir um runtime separado para um
-serviço é desperdício.
+`infra/k8s/` (Kustomize, um componente por serviço + overlay) e `infra/terraform/`
+(ECS Fargate, um módulo local instanciado três vezes) fazem a mesma coisa em
+runtimes diferentes. A duplicação é proposital e a escolha não é técnica em
+abstrato: **já existe cluster e time de plataforma?** Sem cluster, Fargate elimina
+gestão de nó; com cluster, subir um runtime separado é desperdício.
 
-O que vale olhar nos manifests: `readOnlyRootFilesystem` com os dois únicos
-caminhos graváveis declarados, `startupProbe` para dar folga ao boot sem afrouxar
-o liveness, **sem limite de CPU** (limite provoca throttling do CFS exatamente no
-burst de inferência), NetworkPolicy com egress fechado por namespace, e um HPA
-que declara sua própria imprecisão numa anotação — escalar por CPU é uma
-aproximação ruim quando o tempo dominante é *espera* por inferência.
+**As duas não são equivalentes hoje**, e isso está registrado nos dois lados: em
+Kubernetes o egress é fechado por namespace; em ECS o security group tem egress
+aberto, porque fechar exigiria VPC endpoints para ECR, S3, Secrets Manager e
+CloudWatch. É dívida anotada, não paridade sugerida.
+
+O que vale olhar nos manifests: `readOnlyRootFilesystem` com os únicos caminhos
+graváveis declarados, `startupProbe` para dar folga ao boot sem afrouxar o
+liveness, **sem limite de CPU** (limite provoca throttling do CFS exatamente no
+burst de inferência), NetworkPolicy com egress fechado por namespace, e um HPA que
+declara sua própria imprecisão numa anotação — escalar por CPU é uma aproximação
+ruim quando o tempo dominante é *espera* por inferência. No `kyc-compliance` a
+mesma métrica é adequada, e a nota explica a inversão: lá a triagem é comparação
+de string em memória, ou seja CPU pura.
+
+#### Aplicados num cluster de verdade, e o que isso pegou
+
+Até a camada anterior os manifests passavam por `kubeconform --strict` e nunca
+tinham tocado um API server. Subi um k3s em container e apliquei. Duas coisas que
+validação de schema não pega:
+
+- **`/health` afirmava a condição mais grave do domínio.** Os campos
+  `entradas_carregadas` e `artigos_publicos` tinham default `0` no schema, e a
+  sonda de liveness — que não consulta dependência de propósito — reportava zero
+  num pod com 15 entradas carregadas. Zero é exatamente a condição pela qual o
+  `/ready` reprova. Agora os campos são omitidos: a ausência é honesta, aquela
+  sonda não sabe.
+
+- **A fronteira de divulgação vale na rede.** O `customer-support` tem três
+  defesas de aplicação contra revelar limiar interno, e todas são quebráveis por
+  refatoração. A NetworkPolicy não é. Verificado com o experimento discriminante,
+  e não só pela negativa:
+
+  ```
+  pod rotulado credit-analysis  → kyc-compliance:80    200
+  pod rotulado credit-analysis  → customer-support:80  bloqueado
+  pod customer-support          → kyc-compliance:80    bloqueado
+  ```
+
+Encontrei também dois defeitos nos manifests do `credit-analysis`, anteriores à
+integração do KYC: o ConfigMap não definia `CREDIT_KYC_URL` (o gate rodaria
+**desligado em silêncio**, porque o default vazio monta o cliente fake) e não
+havia regra de egress para o KYC. A segunda foi verificada removendo só ela —
+sem a regra, bloqueado; com ela, 200.
+
+`infra/k8s/verificar_politica.py` roda no CI e exige de cada serviço as três
+sondas, `readOnlyRootFilesystem`, requests, PDB, NetworkPolicy com DNS liberado, e
+**ausência** de limite de CPU e de egress do suporte para os serviços internos. A
+primeira versão dessa checagem era `grep -A 3 "limits:" | grep "cpu:"` e acusou os
+três serviços de um limite que nenhum tem — `kustomize build` remove comentários e
+a janela atravessava para o bloco `requests`. Checagem com falso positivo faz o
+time desligar a checagem, não corrigir o defeito.
 
 No Terraform, o ponto central é a separação entre a role de **execução** (usada
 pelo agente do ECS: puxar imagem, ler segredo) e a role da **task** (usada pelo
@@ -417,13 +462,41 @@ ar?", e as métricas que respondem isso são as que um dashboard genérico não 
 | `credito_agente_atendimentos_total{motivo_parada}` | Quantos atendimentos **não** chegam ao fim (limite de passos, tempo) |
 | `credito_agente_passos` | Distribuição de ferramentas por atendimento — zero passos é abstenção, o caso saudável |
 | `credito_revisao_humana_total{motivo}` | Fila de revisão, separando degradação de OCR de tentativa de fraude |
+| `suporte_vazamentos_bloqueados_total{categoria}` | Quantas respostas ao cliente o guard de divulgação descartou — o equivalente, no atendimento, da citação rejeitada |
+| `kyc_triagens_total{decisao,nivel_risco}` | Proporção de `revisao_manual`, que mede fila de analista e afrouxamento do casamento de nomes |
+| `kyc_correspondencias_total{nivel}` | Deslocamento de `forte` para `parcial` sem mudança de código indica lista com nomes mais abreviados |
 
-São 6 regras de alerta, e o critério para uma regra existir é que **alguém
-precise agir quando ela disparar**. Por isso não há alerta de "latência do LLM
-alta": 80s é o normal medido deste sistema em CPU, e alertar sobre o esperado
-treina o time a ignorar alerta.
+Cada serviço tem a métrica que ninguém mais tem, e é ela que justifica o painel.
+A do `customer-support` é a mais direta: sem `vazamentos_bloqueados`, o guard
+trabalharia em silêncio e ninguém saberia que passou a descartar 30% das respostas
+depois de uma troca de modelo. **Guardrail sem contador é guardrail que ninguém
+audita.**
 
-### Três coisas que a instrumentação encontrou
+O `kyc-compliance` deliberadamente **não** expõe `injecao_detectada`, e há dois
+testes protegendo a ausência. Ele não processa conteúdo não confiável — recebe nome
+e CPF validados na borda e compara contra lista própria. Um contador ali ficaria
+permanentemente em zero: ruído no painel e, pior, sugere uma cobertura que não
+existe.
+
+São 12 regras de alerta (`promtool check rules`), e o critério para uma regra
+existir é que **alguém precise agir quando ela disparar**. Por isso não há alerta de
+"latência do LLM alta": 80s é o normal medido deste sistema em CPU, e alertar sobre
+o esperado treina o time a ignorar alerta.
+
+Duas delas vêm em par, e o par é o ponto: `VazamentoDeConteudoInternoAlto` avisa
+que o guard está trabalhando demais, e `GuardDeDivulgacaoSilencioso` avisa que ele
+**parou** de trabalhar — volume normal de resposta gerada e zero bloqueios em 6h.
+Guard que para de bloquear não é boa notícia por si só: pode ser o padrão tendo
+deixado de casar depois de uma refatoração, que é exatamente o que aconteceu com
+`limiar_de_score` quando ele não pegava "abaixo de 700".
+
+O `ServicoForaDoAr` estava **disparando permanentemente** desde a Camada 5. Cada
+serviço é raspado por dois alvos mutuamente exclusivos por construção (container ou
+host, nunca os dois), então `up == 0` por alvo era sempre verdadeiro em
+desenvolvimento — o alerta que o cabeçalho do próprio arquivo condena. Virou
+`max by (servico)`, que dispara só quando nenhum modo responde.
+
+### Quatro coisas que a instrumentação encontrou
 
 **Os buckets padrão do Prometheus mentiriam.** Eles terminam em 10s. Com a
 fundamentação levando ~80s (e até 148s), *toda* chamada de LLM cairia no bucket
@@ -447,6 +520,16 @@ pegaria — o código que vazava não está no repositório, está na biblioteca
 instrumentação. Corrigido com um `server_request_hook` que corta a query string,
 mantendo o caminho e o UUID (que em trace é justamente o que permite cruzar com
 o log).
+
+**Duas fontes contando o mesmo evento.** No `customer-support`, a injeção era
+contada pelo gancho de `plataforma.seguranca` **e** por um laço na borda: uma única
+mensagem marcava 2. É a mesma classe do scrape duplicado que a Camada 6 já tinha
+corrigido (`api:8000` e `host.docker.internal:8000` alcançando o mesmo processo), e
+é o erro mais difícil de perceber, porque o gráfico continua com a forma certa e só
+a escala mente. Todas as asserções dos testes de métrica comparam **delta** em volta
+da ação medida, nunca valor absoluto — o registry é criado no import, então os
+contadores acumulam pela suíte inteira e um `== 1.0` passaria ou falharia conforme a
+ordem de execução.
 
 ### Cardinalidade e LGPD, na mesma decisão
 

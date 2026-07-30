@@ -1,31 +1,41 @@
-# Deploy para AWS (ECR + ECS Fargate).
+# Deploy para AWS (ECR + ECS Fargate), os tres servicos.
 #
 # ## Estado honesto deste arquivo
 #
-# **Nunca foi executado.** Ele exige uma conta AWS com a role de OIDC criada e as
-# variaveis de repositorio preenchidas; nada disso existe neste projeto de
-# portfolio. O que esta aqui e a estrutura que o `infra/terraform/` provisiona,
-# escrita para ser lida — nao um pipeline verificado.
+# **Nunca foi executado.** Ele exige uma conta AWS com a role de OIDC criada e as variaveis
+# de repositorio preenchidas; nada disso existe neste projeto de portfolio. O que esta aqui e
+# a estrutura que o `infra/terraform/` provisiona, escrita para ser lida — nao um pipeline
+# verificado.
 #
 # Dizer isso e mais util que deixar o arquivo implicar que ha um ambiente rodando.
 #
 # ## Sem chave de longa duracao, e isso e o ponto principal
 #
-# A autenticacao usa **OIDC**: o GitHub emite um token de curta duracao que a AWS
-# troca por credencial temporaria, com base numa role que confia neste repositorio
-# e nesta branch. Nao ha `AWS_SECRET_ACCESS_KEY` guardada como segredo do
-# repositorio.
+# A autenticacao usa **OIDC**: o GitHub emite um token de curta duracao que a AWS troca por
+# credencial temporaria, com base numa role que confia neste repositorio e nesta branch. Nao
+# ha `AWS_SECRET_ACCESS_KEY` guardada como segredo do repositorio.
 #
-# A diferenca importa: chave de longa duracao em segredo de CI vaza por log, por
-# action de terceiro comprometida e por fork malicioso, e continua valida depois de
-# vazar. Token de OIDC dura minutos e so vale para a role especifica.
+# A diferenca importa: chave de longa duracao em segredo de CI vaza por log, por action de
+# terceiro comprometida e por fork malicioso, e continua valida depois de vazar. Token de OIDC
+# dura minutos e so vale para a role especifica.
 #
 # ## Deploy so a partir de `main`, e so com CI verde
 #
-# `workflow_run` em vez de `push`: o deploy roda depois de o CI concluir com
-# sucesso. Amarrar deploy ao push permitiria publicar imagem que nao passou nos
-# testes — e num servico de credito isso e uma decisao de negocio errada tomada
-# por conveniencia de pipeline.
+# `workflow_run` em vez de `push`: o deploy roda depois de o CI concluir com sucesso. Amarrar
+# deploy ao push permitiria publicar imagem que nao passou nos testes — e num servico de
+# credito isso e uma decisao de negocio errada tomada por conveniencia de pipeline.
+#
+# ## O que mudou com o segundo e o terceiro servico
+#
+# Duas coisas que estavam **erradas**, e nao apenas incompletas:
+#
+# 1. O contexto de build era `services/credit-analysis`. Desde a extracao de
+#    `packages/plataforma`, os tres Dockerfiles precisam da **raiz** do repositorio como
+#    contexto: Docker nao copia acima do contexto, e a biblioteca compartilhada esta fora do
+#    diretorio de cada servico. Com o contexto antigo, o build falharia no `COPY`.
+#
+# 2. Cluster e servico eram `credit-analysis-prod`, do tempo em que havia um so. O Terraform
+#    agora cria `esteira-credito-prod` com os tres dentro.
 
 name: Deploy
 
@@ -37,30 +47,83 @@ on:
   workflow_dispatch:
 
 permissions:
-  # `id-token: write` e o que habilita OIDC. Sem esta permissao explicita, o
-  # GitHub nao emite o token — e o padrao e nao emitir, corretamente.
+  # `id-token: write` e o que habilita OIDC. Sem esta permissao explicita, o GitHub nao emite
+  # o token — e o padrao e nao emitir, corretamente.
   id-token: write
   contents: read
 
 env:
-  SERVICO: services/credit-analysis
   AWS_REGIAO: sa-east-1
+  CLUSTER: esteira-credito-prod
 
 jobs:
-  publicar:
-    name: Build, push e deploy
+  imagens:
+    name: Build e push (${{ matrix.servico }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Roda so se o CI passou. Sem esta condicao, um CI vermelho dispararia o
-    # deploy do mesmo commit.
+    # Roda so se o CI passou. Sem esta condicao, um CI vermelho dispararia o deploy do mesmo
+    # commit.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
 
-    # Environment do GitHub permite exigir aprovacao manual antes de o job rodar.
-    # Para producao de credito, deploy automatico sem revisao humana e uma escolha
-    # que precisa ser deliberada — aqui ela e explicitamente "nao".
+    # Matrix aqui porque os tres builds sao genuinamente independentes: nenhum le a imagem do
+    # outro. O que **nao** e independente e a ordem de implantacao, e por isso ela fica no job
+    # seguinte, fora da matrix.
+    strategy:
+      fail-fast: true
+      matrix:
+        servico: [credit-analysis, kyc-compliance, customer-support]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Assumir a role via OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_DEPLOY }}
+          aws-region: ${{ env.AWS_REGIAO }}
+          # Nome de sessao com o SHA: no CloudTrail, cada acao fica ligada ao commit que a
+          # originou.
+          role-session-name: deploy-${{ matrix.servico }}-${{ github.sha }}
+
+      - name: Login no ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          # Raiz do repositorio, e nao o diretorio do servico: os Dockerfiles copiam
+          # `packages/plataforma`, que esta fora deles. O `.dockerignore` da raiz e o que
+          # mantem o contexto pequeno — e ele ja causou um incidente, excluindo `**/*.md` e
+          # esvaziando os dois corpora do projeto.
+          context: .
+          file: services/${{ matrix.servico }}/Dockerfile
+          push: true
+          # Tag pelo SHA do commit, nunca `latest`. Com tag mutavel, duas tasks do mesmo
+          # servico podem rodar codigo diferente conforme quando baixaram a imagem — e o
+          # rollback deixa de ter para onde voltar. O repositorio ECR e `IMMUTABLE`, entao
+          # republicar a mesma tag falha em vez de sobrescrever em silencio.
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ matrix.servico }}:${{ github.sha }}
+          # Cache por servico: uma chave unica faria o cache do `credit-analysis` (1,18GB de
+          # dependencia nativa) ser invalidado por uma mudanca no `kyc-compliance`.
+          cache-from: type=gha,scope=${{ matrix.servico }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.servico }}
+
+  implantar:
+    name: Atualizar os servicos no ECS
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: imagens
+
+    # Environment do GitHub permite exigir aprovacao manual antes de o job rodar. Para
+    # producao de credito, deploy automatico sem revisao humana e uma escolha que precisa ser
+    # deliberada — aqui ela e explicitamente "nao".
     environment:
       name: producao
 
@@ -72,72 +135,70 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_ROLE_DEPLOY }}
           aws-region: ${{ env.AWS_REGIAO }}
-          # Nome de sessao com o SHA: no CloudTrail, cada acao fica ligada ao
-          # commit que a originou.
-          role-session-name: deploy-${{ github.sha }}
+          role-session-name: implantar-${{ github.sha }}
 
       - name: Login no ECR
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build e push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ env.SERVICO }}
-          push: true
-          # Tag pelo SHA do commit, nunca `latest`. Com tag mutavel, duas tasks do
-          # mesmo servico podem rodar codigo diferente conforme quando baixaram a
-          # imagem — e o rollback deixa de ter para onde voltar.
-          tags: |
-            ${{ steps.ecr.outputs.registry }}/credit-analysis:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Registrar nova revisao da task e atualizar o servico
+      - name: Registrar revisoes e atualizar, na ordem de dependencia
         env:
           REGISTRO: ${{ steps.ecr.outputs.registry }}
-          CLUSTER: credit-analysis-prod
-          SERVICO_ECS: credit-analysis-prod
+        # A ordem e explicita e sequencial, e nao uma matrix.
+        #
+        # `kyc-compliance` primeiro porque o `credit-analysis` o consome de forma sincrona e o
+        # contrato entre os dois **nao tem versionamento**: subir o consumidor antes do
+        # provedor abriria uma janela em que o codigo novo fala com o KYC antigo. O disjuntor
+        # do `credit-analysis` trataria isso como indisponibilidade e mandaria toda analise
+        # para revisao humana — comportamento correto diante de um problema que o deploy
+        # criou.
+        #
+        # `customer-support` por ultimo porque nao depende de nenhum dos dois — nem por rede, e
+        # isso e garantido pela NetworkPolicy em `infra/k8s/`.
         run: |
           set -eu
 
-          # Le a definicao atual, troca so a imagem e registra nova revisao. O
-          # Terraform ignora mudanca em `task_definition` (ver o `lifecycle` no
-          # main.tf) exatamente para que este passo nao entre em conflito com ele.
-          aws ecs describe-task-definition \
-            --task-definition "$SERVICO_ECS" \
-            --query taskDefinition > atual.json
+          for servico in kyc-compliance credit-analysis customer-support; do
+            echo "::group::$servico"
+            ecs="$CLUSTER-$servico"
 
-          jq --arg imagem "$REGISTRO/credit-analysis:${{ github.sha }}" \
-            '.containerDefinitions[0].image = $imagem
-             | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
-                   .compatibilities, .registeredAt, .registeredBy)' \
-            atual.json > nova.json
+            # Le a definicao atual, troca so a imagem e registra nova revisao. O Terraform
+            # ignora mudanca em `task_definition` (ver o `lifecycle` no modulo) exatamente
+            # para que este passo nao entre em conflito com ele.
+            aws ecs describe-task-definition \
+              --task-definition "$ecs" \
+              --query taskDefinition > atual.json
 
-          ARN=$(aws ecs register-task-definition \
-            --cli-input-json file://nova.json \
-            --query "taskDefinition.taskDefinitionArn" --output text)
+            jq --arg imagem "$REGISTRO/$servico:${{ github.sha }}" \
+              '.containerDefinitions[0].image = $imagem
+               | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                     .compatibilities, .registeredAt, .registeredBy)' \
+              atual.json > nova.json
 
-          aws ecs update-service \
-            --cluster "$CLUSTER" \
-            --service "$SERVICO_ECS" \
-            --task-definition "$ARN" > /dev/null
+            arn=$(aws ecs register-task-definition \
+              --cli-input-json file://nova.json \
+              --query "taskDefinition.taskDefinitionArn" --output text)
 
-          echo "Aguardando o servico estabilizar..."
-          # O circuit breaker do servico faz rollback sozinho se as tasks novas
-          # nao ficarem saudaveis; este wait garante que o job so termina verde
-          # quando o deploy de fato assentou.
-          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICO_ECS"
+            aws ecs update-service \
+              --cluster "$CLUSTER" --service "$ecs" --task-definition "$arn" > /dev/null
+
+            echo "Aguardando $servico estabilizar..."
+            # O circuit breaker do servico faz rollback sozinho se as tasks novas nao ficarem
+            # saudaveis; este wait garante que o proximo servico da fila so sobe depois de este
+            # ter assentado. Sem ele, a ordem de dependencia acima nao valeria nada.
+            aws ecs wait services-stable --cluster "$CLUSTER" --services "$ecs"
+            echo "::endgroup::"
+          done
 
       - name: Reindexar o corpus de politicas
-        # Ingestao e passo de deploy e nao de boot: o container nao indexa ao
-        # subir, senao cada replica reindexaria o mesmo corpus em paralelo. Roda
-        # como task pontual depois de o servico estabilizar.
-        env:
-          CLUSTER: credit-analysis-prod
+        # Ingestao e passo de deploy e nao de boot: o container nao indexa ao subir, senao cada
+        # replica reindexaria o mesmo corpus em paralelo. Roda como task pontual depois de o
+        # servico estabilizar.
+        #
+        # Vale so para o `credit-analysis`: o `kyc-compliance` le CSV do proprio filesystem e o
+        # `customer-support` indexa BM25 em memoria no boot, que custa milissegundos e nao toca
+        # banco nenhum.
         run: |
-          echo "Passo pendente: rodar `python -m credit_analysis.ingestao --recriar`"
+          echo "Passo pendente: rodar 'python -m credit_analysis.ingestao --recriar'"
           echo "como RunTask pontual, com a mesma task definition e override de comando."
           echo "Nao implementado porque exige a rede (subnets/SG) resolvida do ambiente."
