@@ -57,3 +57,16 @@ entradas_avaliadas = Histogram(
     buckets=(10, 50, 100, 500, 1000, 5000, 10000),
     registry=REGISTRO,
 )
+
+auth_decisoes = Counter(
+    f"{PREFIXO}_auth_decisoes_total",
+    "Decisoes de autenticacao, por evento e motivo.",
+    # O `aceito` e contado junto com as negativas, e o denominador e o ponto: "50 negativas em
+    # 10 minutos" nao distingue um cliente recem-integrado com configuracao errada de forca
+    # bruta. O que separa os dois e a proporcao sobre o total.
+    #
+    # `motivo` vem do dominio fechado de `plataforma.autenticacao`. Nada de conteudo de token
+    # aqui: seria cardinalidade ilimitada e, pior, credencial vazando para o painel.
+    labelnames=("evento", "motivo"),
+    registry=REGISTRO,
+)

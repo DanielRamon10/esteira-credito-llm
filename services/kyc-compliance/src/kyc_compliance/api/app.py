@@ -18,14 +18,17 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from plataforma import autenticacao as autenticacao_compartilhada
 from plataforma.logging import configurar_logging
 from plataforma.metricas import rotulo_de_rota
 
 from kyc_compliance.api.routers import health, triagens
 from kyc_compliance.api.routers import metricas as rota_metricas
+from kyc_compliance.api.schemas import ErroResponse
+from kyc_compliance.api.seguranca import montar_chaveiro
 from kyc_compliance.application.ports import RepositorioListas, RepositorioTriagens
 from kyc_compliance.config import Settings, get_settings
 from kyc_compliance.infrastructure import metricas
@@ -51,6 +54,10 @@ def criar_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configurar_logging(nivel=settings.nivel_log, formato_json=settings.log_json)
+    # Diferente do gancho de injecao, que este servico deliberadamente NAO liga (ele
+    # nao processa conteudo nao confiavel), o de autenticacao vale aqui: toda
+    # requisicao passa por validacao de token.
+    autenticacao_compartilhada.registrar_observador(_medir_autenticacao)
     metricas.http.publicar_info(versao=settings.versao, ambiente=settings.ambiente.value)
 
     # Carregado aqui e nao no lifespan: se a lista nao existe, o objetivo e falhar
@@ -83,6 +90,22 @@ def criar_app(
         redoc_url="/redoc" if settings.docs_habilitados else None,
         openapi_url="/openapi.json" if settings.docs_habilitados else None,
     )
+
+    # Chaveiro montado **no boot**, nao por requisicao.
+
+    #
+
+    # Com JWKS, construir por requisicao refaria a chamada HTTP ao IdP e jogaria
+
+    # fora o cache. E `montar_chaveiro` levanta se a configuracao estiver
+
+    # incompleta: o lugar certo para isso falhar e a subida do processo, nao a
+
+    # primeira requisicao — o servico ficaria de pe respondendo 500 a tudo, com o
+
+    # `/health` dizendo "ok".
+
+    app.state.chaveiro = montar_chaveiro(settings)
 
     app.state.settings = settings
     app.state.listas = listas_resolvidas
@@ -128,6 +151,64 @@ def criar_app(
         logger.info("http.requisicao", status=response.status_code, duracao_ms=int(duracao * 1000))
         return response
 
+    @app.exception_handler(autenticacao_compartilhada.EscopoInsuficiente)
+    async def _escopo(request: Request, exc: Exception) -> JSONResponse:
+        """403, nunca 401 — e `EscopoInsuficiente` NAO herda de `TokenInvalido` para isso.
+
+            401  "suas credenciais nao servem, tente outras"
+            403  "suas credenciais servem e nao bastam"
+
+        Devolver 401 aqui manda um cliente correto reautenticar num laco que nunca resolve, e
+        esconde de quem opera que o problema e de permissao e nao de credencial.
+
+        A mensagem nao diz qual escopo falta: enumerar escopos para quem nao os tem e
+        entregar o mapa de permissoes do servico.
+        """
+        identidade = getattr(request.state, "identidade", None)
+        logger.warning(
+            "auth.escopo_insuficiente",
+            sujeito=getattr(identidade, "sujeito", None),
+            escopo_faltante=str(exc),
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=ErroResponse(
+                codigo="escopo_insuficiente",
+                mensagem="Credencial valida, sem permissao para esta operacao.",
+            ).model_dump(),
+        )
+
+    @app.exception_handler(autenticacao_compartilhada.ErroDeAutenticacao)
+    async def _autenticacao(request: Request, exc: Exception) -> JSONResponse:
+        """401 com `WWW-Authenticate`, como manda a RFC 6750 secao 3.
+
+        Sem o cabecalho, biblioteca HTTP que renova token sozinha nao dispara a renovacao, e o
+        sintoma e "o cliente parou de funcionar" sem erro que aponte para o servidor.
+
+        O `motivo` interno (expirado, audiencia_incorreta, ...) fica no log e na metrica, nao
+        na resposta: dizer ao cliente que a audiencia estava errada confirma que existe um
+        servico com outra audiencia.
+        """
+        motivo = getattr(exc, "motivo", "desconhecido")
+        logger.warning("auth.negado", motivo=motivo, path=request.url.path)
+        ausente = motivo == "ausente"
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer realm="kyc-compliance"'
+                    if ausente
+                    # Token ausente nao e token invalido: sem `error`, o cliente sabe que
+                    # precisa apresentar credencial em vez de trocar a que tem.
+                    else 'Bearer realm="kyc-compliance", error="invalid_token"'
+                )
+            },
+            content=ErroResponse(
+                codigo="nao_autenticado", mensagem="Credencial ausente ou invalida."
+            ).model_dump(),
+        )
+
     @app.exception_handler(RequestValidationError)
     async def validacao(_: Request, exc: RequestValidationError) -> JSONResponse:
         """Formato de erro igual ao do outro servico.
@@ -153,6 +234,7 @@ def criar_app(
 
     return app
 
+
 # **Nao ha `app = criar_app()` em nivel de modulo, e a ausencia e deliberada.**
 #
 # Havia, e ela construia a aplicacao inteira a cada **import** do modulo. O sintoma apareceu
@@ -166,3 +248,8 @@ def criar_app(
 #
 # O uvicorn recebe uma **factory** (`factory=True` no `__main__.py`), que e o mecanismo
 # proprio dele para isto.
+
+
+def _medir_autenticacao(evento: str, motivo: str) -> None:
+    """Traduz o gancho de autenticacao da plataforma na metrica deste servico."""
+    metricas.auth_decisoes.labels(evento=evento, motivo=motivo).inc()

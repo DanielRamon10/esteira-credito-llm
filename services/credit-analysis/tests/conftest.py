@@ -161,7 +161,13 @@ def emitir_token(
     *,
     escopos: Sequence[str] = seguranca.TODOS_OS_ESCOPOS,
     audiencia: str = "credit-analysis",
-    **kwargs: object,
+    # Parametros explicitos e nao `**kwargs`: com `**kwargs: object` o `--strict` recusa o
+    # repasse, e a saida facil seria `Any` — perder tipagem num helper que constroi credencial
+    # e onde menos se quer.
+    emissor: str = emissor_local.EMISSOR_LOCAL,
+    validade_segundos: int = emissor_local.VALIDADE_PADRAO_SEGUNDOS,
+    agora: int | None = None,
+    locatario: str | None = None,
 ) -> str:
     """Token de teste. O default carrega **todos** os escopos.
 
@@ -174,7 +180,13 @@ def emitir_token(
     dezenas de testes que nao tratam de autorizacao, e o reflexo seria afrouxar o escopo.
     """
     return emissor_local.emitir(
-        audiencia=audiencia, escopos=list(escopos), diretorio=chaves, **kwargs
+        audiencia=audiencia,
+        escopos=list(escopos),
+        diretorio=chaves,
+        emissor=emissor,
+        validade_segundos=validade_segundos,
+        agora=agora,
+        locatario=locatario,
     )
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from kyc_compliance.api.deps import ConsultarDep, ListarDep, TriarDep
 from kyc_compliance.api.observabilidade import registrar_triagem
@@ -15,6 +15,7 @@ from kyc_compliance.api.schemas import (
     TriagemRequest,
     TriagemResponse,
 )
+from kyc_compliance.api.seguranca import TRIAGENS_EXECUTAR, TRIAGENS_LER, Escopo
 from kyc_compliance.application.use_cases.triar_cliente import ComandoTriar
 
 router = APIRouter(prefix="/triagens", tags=["Triagem de KYC"])
@@ -22,6 +23,7 @@ router = APIRouter(prefix="/triagens", tags=["Triagem de KYC"])
 
 @router.post(
     "",
+    dependencies=[Depends(Escopo(TRIAGENS_EXECUTAR))],
     response_model=TriagemResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Tria um cliente contra as listas restritivas",
@@ -40,7 +42,12 @@ async def triar(payload: TriagemRequest, caso: TriarDep) -> TriagemResponse:
     return TriagemResponse.de_dominio(triagem)
 
 
-@router.get("/{triagem_id}", response_model=TriagemResponse, summary="Consulta uma triagem")
+@router.get(
+    "/{triagem_id}",
+    response_model=TriagemResponse,
+    summary="Consulta uma triagem",
+    dependencies=[Depends(Escopo(TRIAGENS_LER))],
+)
 async def consultar(triagem_id: UUID, caso: ConsultarDep) -> TriagemResponse:
     triagem = await caso.executar(triagem_id)
     if triagem is None:
@@ -54,7 +61,12 @@ async def consultar(triagem_id: UUID, caso: ConsultarDep) -> TriagemResponse:
     return TriagemResponse.de_dominio(triagem)
 
 
-@router.get("", response_model=PaginaTriagens, summary="Lista triagens")
+@router.get(
+    "",
+    response_model=PaginaTriagens,
+    summary="Lista triagens",
+    dependencies=[Depends(Escopo(TRIAGENS_LER))],
+)
 async def listar(
     caso: ListarDep,
     limite: int = Query(default=50, ge=1, le=200),

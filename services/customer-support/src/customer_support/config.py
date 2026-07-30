@@ -11,7 +11,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,7 +63,56 @@ class Settings(BaseSettings):
     modelo_ollama: str = "llama3.2:3b"
     ollama_timeout_segundos: float = Field(default=60.0, gt=0)
 
+    # --- Autenticacao (Camada 7) ---
+    #
+    # **Nao existe `auth_habilitado`.** Autenticacao que se desliga por variavel de ambiente
+    # e autenticacao que vai estar desligada em algum ambiente, por um motivo temporario que
+    # ninguem reverteu, sem nada falhando para avisar.
+    #
+    # As duas fontes de chave sao mutuamente exclusivas e uma e obrigatoria — ver o validador
+    # no fim desta classe.
+    auth_emissor: str = ""
+    auth_audiencia: str = "customer-support"
+
+    # PEM da chave **publica**, para desenvolvimento e ambientes sem IdP com JWKS.
+    auth_chave_publica: str = ""
+
+    # JWKS do IdP. Preferivel em producao: permite rotacao de chave sem redeploy, porque o
+    # emissor publica a nova e os servicos a veem no proximo ciclo de cache.
+    auth_jwks_url: str = ""
+
     otlp_endpoint: str = ""
+
+    @model_validator(mode="after")
+    def _conferir_fonte_de_chave(self) -> Settings:
+        """Exige **exatamente uma** fonte de chave de verificacao.
+
+        Nenhuma: o servico nao sabe verificar token, e falhar aqui e melhor que recusar tudo
+        (indisponivel) ou aceitar tudo (aberto). As duas: ambiguidade sobre qual manda, e uma
+        configuracao antiga esquecida numa delas aceitaria token que deveria ser rejeitado.
+        """
+        tem_pem = bool(self.auth_chave_publica.strip())
+        tem_jwks = bool(self.auth_jwks_url.strip())
+
+        if tem_pem and tem_jwks:
+            raise ValueError(
+                "SUP_AUTH_CHAVE_PUBLICA e SUP_AUTH_JWKS_URL sao mutuamente "
+                "exclusivas: defina apenas uma."
+            )
+        if not tem_pem and not tem_jwks:
+            raise ValueError(
+                "autenticacao exige SUP_AUTH_CHAVE_PUBLICA ou SUP_AUTH_JWKS_URL.\n"
+                "Para desenvolvimento, sem conta em provedor nenhum:\n"
+                "  python -m plataforma.emissor_local gerar-chaves\n"
+                '  export SUP_AUTH_CHAVE_PUBLICA="$(cat .chaves/publica.pem)"\n'
+                "  export SUP_AUTH_EMISSOR=https://local.esteira-credito.invalid\n"
+                "Nao ha modo desligado, e a ausencia e deliberada: ver api/seguranca.py."
+            )
+        if not self.auth_emissor.strip():
+            # Sem emissor, o PyJWT compararia `iss` contra "" e nenhum token passaria — o
+            # sintoma (401 universal) nao aponta para configuracao ausente.
+            raise ValueError("SUP_AUTH_EMISSOR e obrigatorio")
+        return self
 
     @property
     def producao(self) -> bool:

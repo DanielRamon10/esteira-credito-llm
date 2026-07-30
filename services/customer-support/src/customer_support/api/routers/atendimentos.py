@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
 from customer_support.api.deps import AtenderDep
 from customer_support.api.observabilidade import registrar_atendimento
 from customer_support.api.schemas import AtendimentoResponse, ErroResponse, PerguntaRequest
+from customer_support.api.seguranca import ATENDIMENTOS_CRIAR, Escopo
 from customer_support.application.use_cases.atender import ComandoAtender
 
 router = APIRouter(prefix="/atendimentos", tags=["Atendimento"])
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/atendimentos", tags=["Atendimento"])
 
 @router.post(
     "",
+    dependencies=[Depends(Escopo(ATENDIMENTOS_CRIAR))],
     response_model=AtendimentoResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Responde a mensagem de um cliente",

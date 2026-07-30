@@ -17,7 +17,7 @@ dependencies = [
     "pydantic-settings>=2.6",
     "structlog>=24.4",
     "prometheus-client>=0.21",
-    "plataforma[llm,metricas]",
+    "plataforma[llm,metricas,auth]",
 ]
 
 [project.optional-dependencies]

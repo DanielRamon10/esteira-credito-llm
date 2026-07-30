@@ -43,6 +43,7 @@ import structlog
 from credit_analysis.domain.kyc import DecisaoKYC, ResultadoKYC
 from credit_analysis.infrastructure.observabilidade import metricas
 from credit_analysis.infrastructure.observabilidade.tracing import span
+from credit_analysis.infrastructure.tokens import ProvedorDeToken
 
 logger = structlog.get_logger(__name__)
 
@@ -152,7 +153,13 @@ class ClienteKYCHttp:
         timeout_segundos: float = TIMEOUT_PADRAO,
         tentativas: int = TENTATIVAS,
         disjuntor: Disjuntor | None = None,
+        provedor_de_token: ProvedorDeToken | None = None,
     ) -> None:
+        # `provedor_de_token` e opcional na assinatura e **obrigatorio em producao** — quem
+        # garante isso e `_montar_kyc` no `app.py`, que recusa subir sem ele. Aqui e opcional
+        # porque a suite tem dezenas de casos sobre disjuntor e retry que nao tratam de
+        # credencial, e exigir um provedor em cada um deles adicionaria ruido sem cobrir nada.
+        self._provedor_de_token = provedor_de_token
         self._url = url_base.rstrip("/")
         self._timeout = timeout_segundos
         self._tentativas = max(1, tentativas)
@@ -244,14 +251,46 @@ class ClienteKYCHttp:
     async def _chamar(self, nome: str, cpf: str) -> ResultadoKYC:
         cliente = self._obter_cliente()
 
+        cabecalhos = _cabecalhos_de_correlacao()
+
+        if self._provedor_de_token is not None:
+            try:
+                cabecalhos["Authorization"] = f"Bearer {await self._provedor_de_token.obter()}"
+            except Exception as exc:
+                # Falha ao obter token e **transitoria**, e a classificacao importa: sem ela, o
+                # `_ErroPermanente` faria a triagem falhar sem retry e sem contar para o
+                # disjuntor. Um IdP momentaneamente fora do ar viraria uma analise perdida em
+                # vez de uma tentativa.
+                raise _ErroTransitorio(f"{type(exc).__name__} ao obter token de servico") from exc
+
         try:
             resposta = await cliente.post(
                 "/v1/triagens",
                 json={"nome": nome, "cpf": cpf},
-                headers=_cabecalhos_de_correlacao(),
+                headers=cabecalhos,
             )
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise _ErroTransitorio(f"{type(exc).__name__} ao consultar o KYC") from exc
+
+        if resposta.status_code in (401, 403):
+            # **Permanente, e nao transitorio.** Retry com a mesma credencial invalida nao muda
+            # o resultado: gastaria as tentativas e abriria o disjuntor, transformando um erro
+            # de configuracao em "KYC indisponivel" — diagnostico errado que manda quem
+            # investiga olhar a rede em vez do token.
+            #
+            # O log distingue os dois casos porque a acao e diferente: 401 e credencial
+            # (expirada, audiencia errada, chave rotacionada); 403 e escopo ausente na
+            # credencial deste servico.
+            logger.error(
+                "kyc.credencial_recusada",
+                status=resposta.status_code,
+                acao=(
+                    "conferir CREDIT_KYC_TOKEN / client_credentials"
+                    if resposta.status_code == 401
+                    else "o cliente deste servico precisa do escopo triagens:executar"
+                ),
+            )
+            raise _ErroPermanente(f"KYC recusou a credencial ({resposta.status_code})")
 
         if resposta.status_code >= 500:
             raise _ErroTransitorio(f"KYC respondeu {resposta.status_code}")

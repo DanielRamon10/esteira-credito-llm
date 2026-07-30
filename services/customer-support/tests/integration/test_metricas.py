@@ -18,7 +18,7 @@ from plataforma import seguranca
 from customer_support.api.app import criar_app
 from customer_support.config import Settings
 from customer_support.infrastructure.llm import LLMFake
-from tests.conftest import ConhecimentoFalso
+from tests.conftest import ConhecimentoFalso, montar_cliente
 
 pytestmark = pytest.mark.integration
 
@@ -26,7 +26,7 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def client(settings_teste: Settings, conhecimento: ConhecimentoFalso) -> Iterator[TestClient]:
     app = criar_app(settings=settings_teste, conhecimento=conhecimento, llm=LLMFake())
-    with TestClient(app) as c:
+    with montar_cliente(app) as c:
         yield c
 
 
@@ -44,7 +44,7 @@ def client_vazando(
         conhecimento=conhecimento,
         llm=LLMFake("Voce precisa de score acima de 700 pontos, conforme a POL-001."),
     )
-    with TestClient(app) as c:
+    with montar_cliente(app) as c:
         yield c
 
 

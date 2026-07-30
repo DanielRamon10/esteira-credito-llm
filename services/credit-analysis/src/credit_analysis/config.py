@@ -119,8 +119,26 @@ class Settings(BaseSettings):
     # servico fora do ar. Ver `_montar_kyc` em `api/app.py`.
     kyc_url: str = ""
 
-    # Timeout por tentativa. A triagem do outro servico e comparacao em memoria;
-    # passar de 3s indica rede ou saturacao, nao calculo.
+    # Credencial de servico para chamar o KYC, que a partir da Camada 7 exige token.
+    #
+    # O token deste servico (`aud=credit-analysis`) **nao pode ser repassado** ao KYC: seria a
+    # escalada lateral que a validacao de audiencia existe para impedir. Ele precisa de
+    # credencial propria, via `client_credentials`.
+    #
+    # Duas formas, e a escolha e explicita — nunca `auto`. Um fallback do IdP para o token
+    # estatico transformaria indisponibilidade do IdP em uso de credencial possivelmente
+    # expirada, e o sintoma seria 401 intermitente vindo do KYC.
+    kyc_token_url: str = ""
+    kyc_client_id: str = ""
+    kyc_client_secret: str = ""
+
+    # Token pronto, para desenvolvimento e para o compose: o projeto roda sem conta em provedor
+    # nenhum, e nao ha IdP local com endpoint de token. Emitido por
+    # `python -m plataforma.emissor_local token --audiencia kyc-compliance`.
+    kyc_token: str = ""
+
+    # Timeout por tentativa. A triagem do outro servico e comparacao em memoria; passar de 3s
+    # indica rede ou saturacao, nao calculo.
     kyc_timeout_segundos: float = Field(default=3.0, gt=0)
     kyc_tentativas: int = Field(default=2, ge=1, le=5)
 

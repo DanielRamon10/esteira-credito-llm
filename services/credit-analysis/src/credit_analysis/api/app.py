@@ -56,6 +56,11 @@ from credit_analysis.infrastructure.rag.embeddings import EmbedderFastEmbed
 from credit_analysis.infrastructure.rag.pgvector_store import VectorStorePgVector, criar_pool
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.repositories.memoria import RepositorioAnalisesMemoria
+from credit_analysis.infrastructure.tokens import (
+    ProvedorDeToken,
+    TokenDeClientCredentials,
+    TokenEstatico,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -323,7 +328,59 @@ def _montar_kyc(settings: Settings) -> ConsultaKYC | None:
         url_base=settings.kyc_url,
         timeout_segundos=settings.kyc_timeout_segundos,
         tentativas=settings.kyc_tentativas,
+        provedor_de_token=_montar_provedor_de_token(settings),
     )
+
+
+def _montar_provedor_de_token(settings: Settings) -> ProvedorDeToken | None:
+    """Credencial de servico para chamar o KYC, ou recusa a subir em producao.
+
+    A mesma assimetria de `_montar_kyc`, e pelo mesmo motivo: fora de producao, sem credencial
+    o cliente chama o KYC sem token — o que hoje resulta em 401 e vira revisao humana, o que e
+    aceitavel em desenvolvimento. Em producao, subir sem credencial garantiria que **toda**
+    analise cai em revisao manual, e o `/health` diria "ok" enquanto a fila cresce.
+
+    A ordem confere `kyc_token_url` primeiro: se as duas formas estiverem configuradas, a do
+    IdP ganha. E ha um erro explicito quando as duas aparecem, porque a alternativa —
+    escolher em silencio — deixaria um token estatico esquecido na configuracao parecendo
+    inofensivo enquanto na verdade nao e usado, e alguem o renovaria sem efeito.
+    """
+    tem_idp = bool(settings.kyc_token_url.strip())
+    tem_estatico = bool(settings.kyc_token.strip())
+
+    if tem_idp and tem_estatico:
+        raise RuntimeError(
+            "CREDIT_KYC_TOKEN_URL e CREDIT_KYC_TOKEN sao mutuamente exclusivas: com as duas, "
+            "o token estatico ficaria na configuracao sem ser usado."
+        )
+
+    if tem_idp:
+        if not (settings.kyc_client_id.strip() and settings.kyc_client_secret.strip()):
+            raise RuntimeError(
+                "CREDIT_KYC_TOKEN_URL exige CREDIT_KYC_CLIENT_ID e CREDIT_KYC_CLIENT_SECRET."
+            )
+        return TokenDeClientCredentials(
+            url_do_token=settings.kyc_token_url,
+            client_id=settings.kyc_client_id,
+            client_secret=settings.kyc_client_secret,
+            audiencia="kyc-compliance",
+        )
+
+    if tem_estatico:
+        return TokenEstatico(settings.kyc_token)
+
+    if settings.producao:
+        raise RuntimeError(
+            "o KYC exige credencial: configure CREDIT_KYC_TOKEN_URL (client_credentials) ou "
+            "CREDIT_KYC_TOKEN. Sem ela, toda analise cai em revisao manual em silencio."
+        )
+
+    logger.warning(
+        "kyc.sem_credencial",
+        motivo="CREDIT_KYC_TOKEN e CREDIT_KYC_TOKEN_URL vazias",
+        efeito="as chamadas ao KYC sairao sem token e serao recusadas com 401",
+    )
+    return None
 
 
 def _rotulo_de_rota(request: Request) -> str:

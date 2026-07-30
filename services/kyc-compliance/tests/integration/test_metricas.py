@@ -19,7 +19,7 @@ from kyc_compliance.api.app import criar_app
 from kyc_compliance.config import Settings
 from kyc_compliance.domain.triagem import EntradaRestritiva
 from kyc_compliance.infrastructure.listas import ListasEmMemoria
-from tests.conftest import CPF_DA_PEP, CPF_LIMPO
+from tests.conftest import CPF_DA_PEP, CPF_LIMPO, montar_cliente
 
 pytestmark = pytest.mark.integration
 
@@ -27,7 +27,7 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def client(settings_teste: Settings, entradas: list[EntradaRestritiva]) -> Iterator[TestClient]:
     app = criar_app(settings=settings_teste, listas=ListasEmMemoria(entradas, "teste"))
-    with TestClient(app) as c:
+    with montar_cliente(app) as c:
         yield c
 
 
