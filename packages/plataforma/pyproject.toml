@@ -28,7 +28,20 @@ llm = ["langchain-ollama>=1.0"]
 # Helper de metricas HTTP. Opt-in: o nucleo continua sem conhecer Prometheus, e um
 # servico que use outra stack de observabilidade nao instala isto.
 metricas = ["prometheus-client>=0.21"]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "prometheus-client>=0.21"]
+# Validacao de token. `pyjwt[crypto]` e nao `pyjwt` puro: sem o extra, o `cryptography`
+# nao entra e **RS256 fica indisponivel** — a biblioteca aceita apenas HMAC. O sintoma
+# seria `NotImplementedError: Algorithm not supported` no primeiro token, ou pior, alguem
+# "resolvendo" isso trocando para HS256 e dando a todo resource server a capacidade de
+# emitir token.
+auth = ["pyjwt[crypto]>=2.10"]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "prometheus-client>=0.21",
+    "pyjwt[crypto]>=2.10",
+]
 
 [build-system]
 requires = ["hatchling"]

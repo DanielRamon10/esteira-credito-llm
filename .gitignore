@@ -17,6 +17,15 @@ coverage.xml
 .env
 .env.local
 *.pem
+
+# Chaves do emissor local (Camada 7). A protecao desta chave privada e **nao estar aqui**:
+# sem ela, `plataforma.emissor_local` nao consegue assinar nada, e e isso que impede um
+# resource server de virar emissor em producao. A garantia e estrutural, nao um `if`.
+#
+# O `*.pem` acima ja cobriria, mas o diretorio entra explicito porque a intencao precisa
+# ser legivel: quem for "organizar" o .gitignore nao deve poder remover isto sem perceber
+# o que esta removendo.
+.chaves/
 *.key
 
 # Dados locais
