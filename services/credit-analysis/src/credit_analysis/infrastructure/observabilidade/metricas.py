@@ -47,6 +47,7 @@ sistema de verdade.
 
 from __future__ import annotations
 
+from plataforma.metricas import BUCKETS_HTTP, BUCKETS_INFERENCIA
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 # Registry proprio em vez do global.
@@ -60,13 +61,16 @@ REGISTRO = CollectorRegistry()
 
 PREFIXO = "credito"
 
-# Buckets de latencia HTTP. Terminam em 10s porque uma requisicao REST que passa
-# disso e um incidente, nao um ponto de distribuicao.
-BUCKETS_HTTP = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
-
-# Buckets de inferencia. Vao a 320s porque o medido em CPU e 80s (agente) e ate
-# 148s (fundamentacao com llama3.1:8b) — ver o cabecalho do modulo.
-BUCKETS_INFERENCIA = (0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0, 80.0, 160.0, 320.0)
+# `BUCKETS_HTTP` e `BUCKETS_INFERENCIA` vem de `plataforma.metricas`.
+#
+# Eles foram medidos **aqui**, neste servico, e e justamente por isso que subiram para a
+# biblioteca: 80s para o agente e 148s para fundamentacao com llama3.1:8b nao sao numeros
+# deste dominio, sao numeros do Ollama nesta maquina. Qualquer servico do monorepo que
+# chame o mesmo modelo herda a mesma distribuicao, e mante-los duplicados garantiria que
+# um dia dois servicos teriam escalas diferentes sem ninguem ter decidido isso.
+#
+# `BUCKETS_RETRIEVAL` continua aqui embaixo porque e o oposto: ele descreve a busca
+# vetorial **deste** corpus, e nenhum outro servico tem esse componente.
 
 # Retrieval nao chama modelo generativo: e busca vetorial mais BM25.
 #

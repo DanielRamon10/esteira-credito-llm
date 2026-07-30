@@ -176,16 +176,25 @@ jobs:
         working-directory: packages/plataforma
         run: uv run pytest -q
 
-      - name: Conferir que a biblioteca nao conhece observabilidade
-        # A regra de dependencia mais importante desta biblioteca, verificada em vez
-        # de apenas documentada: se `prometheus_client` ou `opentelemetry` aparecerem
-        # num import aqui, todo consumidor futuro fica preso a esta stack.
+      - name: Conferir que o NUCLEO nao conhece observabilidade
+        # A regra de dependencia mais importante desta biblioteca, verificada em vez de
+        # apenas documentada. O check distingue dois casos:
+        #
+        # - **nucleo** (logging, seguranca, bm25, llm): nao pode importar biblioteca de
+        #   observabilidade, porque prenderia todo consumidor a mesma stack;
+        # - **`metricas.py`**: modulo opt-in, instalado so por quem pede o extra, e por
+        #   isso PODE importar `prometheus_client`.
+        #
+        # A primeira versao proibia em todo `src/`, o que teria bloqueado o helper
+        # compartilhado de metricas HTTP e me obrigado a triplicar `template_de_rota` —
+        # uma funcao que ja esteve errada uma vez.
         run: |
-          if grep -rn "import prometheus_client\|from prometheus_client\|import opentelemetry\|from opentelemetry" packages/plataforma/src; then
-            echo "::error::plataforma passou a importar biblioteca de observabilidade — use os ganchos"
+          NUCLEO="packages/plataforma/src/plataforma/logging.py packages/plataforma/src/plataforma/seguranca.py packages/plataforma/src/plataforma/bm25.py packages/plataforma/src/plataforma/llm.py"
+          if grep -n "import prometheus_client\|from prometheus_client\|import opentelemetry\|from opentelemetry" $NUCLEO; then
+            echo "::error::modulo de nucleo importou biblioteca de observabilidade — use os ganchos (registrar_observador)"
             exit 1
           fi
-          echo "  nenhum import de observabilidade (correto)"
+          echo "  nucleo limpo; metricas.py e opt-in (correto)"
 
   qualidade-kyc:
     name: Lint, tipagem e testes (kyc-compliance)

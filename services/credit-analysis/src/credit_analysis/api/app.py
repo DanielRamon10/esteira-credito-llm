@@ -23,6 +23,7 @@ from plataforma.llm import (
     ollama_disponivel,
 )
 from plataforma.logging import configurar_logging
+from plataforma.metricas import rotulo_de_rota
 
 from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
@@ -303,45 +304,25 @@ def _montar_kyc(settings: Settings) -> ConsultaKYC | None:
 
 
 def _rotulo_de_rota(request: Request) -> str:
-    """Devolve o **template** da rota, nunca o caminho concreto.
+    """Adapta o `Request` do Starlette ao helper da plataforma.
 
-    `/v1/analises/8c1f9e.../documentos` como label criaria uma serie temporal por
-    analise, e serie temporal no Prometheus custa memoria para sempre — nao
-    apenas enquanto o valor aparece.
+    A logica morava aqui inteira, escrita antes de existir uma biblioteca compartilhada.
+    Quando o terceiro servico apareceu, mantê-la neste arquivo teria produzido tres
+    copias de uma funcao que **ja esteve errada uma vez** — a primeira versao usava
+    `route.path`, que omite o prefixo do `include_router` e somaria `/v1` e um futuro
+    `/v2` na mesma serie temporal. Triplicar codigo com esse historico e exatamente o que
+    a extracao serviu para evitar.
 
-    Requisicao que nao casou com rota alguma vira `desconhecida` em vez do
-    caminho pedido. Sem isso, qualquer varredura de URL (`/wp-admin`, `/.env`,
-    `/api/v2/...`) viraria uma serie nova cada, e um scanner automatizado seria
-    capaz de inflar a memoria do Prometheus de fora para dentro.
-
-    ## Por que nao usar `route.path` direto
-
-    Seria a forma obvia, e esta errada. Medido: com
-    `include_router(analises.router, prefix="/v1")`, o `route.path` da rota
-    resultante e `/analises/{analise_id}` — **sem o `/v1`**. O prefixo do
-    `include_router` nao entra no atributo.
-
-    A consequencia seria silenciosa e ruim: no dia em que existir um `/v2`, as
-    duas versoes da API cairiam na mesma serie temporal, e o painel mostraria
-    latencia de v1 e v2 somadas sem que nada indicasse a mistura.
-
-    Por isso o template e reconstruido do caminho real, trocando cada valor de
-    path param pelo nome do parametro. A troca e por **segmento inteiro**: trocar
-    por substring quebraria um caminho em que o valor do parametro aparece
-    tambem em outro pedaco da URL.
+    O que sobra aqui e so a traducao: `plataforma` nao depende de FastAPI, entao o
+    servico extrai do `scope` o que o helper precisa e passa valores simples. Ver
+    `plataforma.metricas.rotulo_de_rota` para o raciocinio de cardinalidade e para a
+    defesa contra varredura de URL.
     """
-    if request.scope.get("route") is None:
-        return "desconhecida"
-
-    parametros: dict[str, object] = request.scope.get("path_params") or {}
-    if not parametros:
-        # Rota sem parametro: o caminho ja e o template, e a cardinalidade e
-        # limitada pelo numero de rotas declaradas.
-        return request.url.path
-
-    substituicoes = {str(valor): f"{{{nome}}}" for nome, valor in parametros.items()}
-    segmentos = [substituicoes.get(s, s) for s in request.url.path.split("/")]
-    return "/".join(segmentos)
+    return rotulo_de_rota(
+        request.url.path,
+        request.scope.get("path_params"),
+        casou_com_rota=request.scope.get("route") is not None,
+    )
 
 
 def _montar_llm(settings: Settings) -> ModeloLinguagem:

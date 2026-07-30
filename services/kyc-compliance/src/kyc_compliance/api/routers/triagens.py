@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
 from kyc_compliance.api.deps import ConsultarDep, ListarDep, TriarDep
+from kyc_compliance.api.observabilidade import registrar_triagem
 from kyc_compliance.api.schemas import (
     ErroResponse,
     PaginaTriagens,
@@ -32,7 +34,9 @@ async def triar(payload: TriagemRequest, caso: TriarDep) -> TriagemResponse:
     de modelo, entao nao existe o problema de latencia que torna o endpoint de
     agente do outro servico questionavel em produto.
     """
+    inicio = time.perf_counter()
     triagem = await caso.executar(ComandoTriar(nome=payload.nome, cpf=payload.cpf))
+    registrar_triagem(triagem, time.perf_counter() - inicio)
     return TriagemResponse.de_dominio(triagem)
 
 

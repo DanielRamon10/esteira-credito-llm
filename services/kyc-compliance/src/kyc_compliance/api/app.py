@@ -22,16 +22,26 @@ from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from plataforma.logging import configurar_logging
+from plataforma.metricas import rotulo_de_rota
 
 from kyc_compliance.api.routers import health, triagens
+from kyc_compliance.api.routers import metricas as rota_metricas
 from kyc_compliance.application.ports import RepositorioListas, RepositorioTriagens
 from kyc_compliance.config import Settings, get_settings
+from kyc_compliance.infrastructure import metricas
 from kyc_compliance.infrastructure.listas import ListasDeArquivo
 from kyc_compliance.infrastructure.repositories.memoria import RepositorioTriagensMemoria
 
 logger = structlog.get_logger(__name__)
 
 CABECALHO_CORRELACAO = "X-Request-ID"
+
+
+# Este servico NAO liga observador de injecao, ao contrario do `credit-analysis` e do
+# `customer-support`. O motivo: ele nao processa conteudo nao confiavel — recebe nome e
+# CPF validados na borda e compara contra lista propria. Registrar um gancho para um
+# sinal que nunca ocorre criaria uma serie temporal permanentemente em zero, que e
+# ruido no painel e sugere cobertura que nao existe.
 
 
 def criar_app(
@@ -41,6 +51,7 @@ def criar_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configurar_logging(nivel=settings.nivel_log, formato_json=settings.log_json)
+    metricas.http.publicar_info(versao=settings.versao, ambiente=settings.ambiente.value)
 
     # Carregado aqui e nao no lifespan: se a lista nao existe, o objetivo e falhar
     # na construcao, antes de o servidor abrir porta. Falhar no lifespan tambem
@@ -96,8 +107,22 @@ def criar_app(
         )
 
         inicio = time.perf_counter()
-        response: Response = await call_next(request)
+        metricas.http.em_andamento.inc()
+        try:
+            response: Response = await call_next(request)
+        finally:
+            metricas.http.em_andamento.dec()
         duracao = time.perf_counter() - inicio
+
+        # Template da rota, nunca o caminho concreto: `/v1/triagens/<uuid>` como label
+        # criaria uma serie temporal por triagem. A funcao vem da plataforma porque a
+        # logica e sutil — ela ja esteve errada uma vez, omitindo o prefixo de versao.
+        rota = rotulo_de_rota(
+            request.url.path,
+            request.scope.get("path_params"),
+            casou_com_rota=request.scope.get("route") is not None,
+        )
+        metricas.http.registrar(request.method, rota, response.status_code, duracao)
 
         response.headers[CABECALHO_CORRELACAO] = request_id
         logger.info("http.requisicao", status=response.status_code, duracao_ms=int(duracao * 1000))
@@ -122,6 +147,7 @@ def criar_app(
             },
         )
 
+    app.include_router(rota_metricas.router)
     app.include_router(health.router)
     app.include_router(triagens.router, prefix=settings.prefixo_api)
 

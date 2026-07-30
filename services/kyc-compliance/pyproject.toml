@@ -22,7 +22,7 @@ dependencies = [
     "structlog>=24.4",
     # Compartilhada, SEM o extra `llm`: este servico nao usa modelo de linguagem, e
     # nao deve instalar o cliente do Ollama por tabela.
-    "plataforma",
+    "plataforma[metricas]",
     "prometheus-client>=0.21",
 ]
 

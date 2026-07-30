@@ -62,16 +62,151 @@ groups:
             distribuicao de `credito_agente_passos`: concentracao no teto indica
             loop de ferramenta, nao pergunta difícil.
 
+  - name: guardrails-do-atendimento
+    interval: 30s
+    rules:
+      # O par de alertas mais importante do customer-support, e eles vem em par de
+      # proposito: um mede o guard trabalhando demais, o outro mede o guard tendo
+      # parado de trabalhar. Sozinho, cada um deixa passar metade do problema.
+      - alert: VazamentoDeConteudoInternoAlto
+        expr: |
+          sum(rate(suporte_vazamentos_bloqueados_total[15m]))
+            /
+          clamp_min(sum(rate(suporte_atendimentos_total[15m])), 0.001)
+            > 0.15
+        for: 10m
+        labels:
+          severidade: aviso
+          dominio: ia
+        annotations:
+          resumo: "Mais de 15% das respostas ao cliente estao sendo descartadas pelo guard"
+          acao: >-
+            O modelo passou a produzir conteudo interno. As causas possiveis sao
+            poucas e todas acionaveis: troca de modelo, mudanca de prompt, ou um
+            artigo publico que passou a citar numero interno. O label `categoria`
+            separa os tres casos — `limiar_de_score` aponta para o modelo,
+            `referencia_politica_interna` costuma apontar para o corpus.
+
+      # A contrapartida, e o alerta menos obvio dos dois: guard que para de bloquear
+      # nao e boa noticia por si so. Pode ser o padrao tendo deixado de casar depois de
+      # uma refatoracao — exatamente o que aconteceu com `limiar_de_score`, que na
+      # primeira versao nao pegava "abaixo de 700" nem numero longe da palavra.
+      #
+      # Por isso a condicao exige trafego (`> 50` atendimentos): sem ela, um periodo de
+      # baixo volume dispararia o alerta a noite, todas as noites.
+      - alert: GuardDeDivulgacaoSilencioso
+        expr: |
+          sum(increase(suporte_atendimentos_total{origem="modelo"}[6h])) > 50
+            and
+          sum(increase(suporte_vazamentos_bloqueados_total[6h])) == 0
+        for: 30m
+        labels:
+          severidade: aviso
+          dominio: ia
+        annotations:
+          resumo: "Volume normal de resposta gerada, e nenhum bloqueio em 6h"
+          acao: >-
+            Pode ser legitimo, mas verificar se algum padrao de
+            `divulgacao._PADROES` parou de casar depois de mudanca de codigo. O
+            eval `test_vazamento` roda contra o corpus real e e o primeiro lugar
+            para checar.
+
+      - alert: InjecaoNaMensagemDoCliente
+        expr: sum(increase(suporte_injecao_detectada_total[10m])) > 0
+        for: 0m
+        labels:
+          severidade: aviso
+          dominio: seguranca
+        annotations:
+          resumo: "Padrao de injecao detectado na mensagem do proprio cliente"
+          acao: >-
+            Severidade **aviso**, e nao critico como no credit-analysis, e a
+            diferenca e deliberada: la o conteudo vem de documento enviado e uma
+            injecao e indicio de fraude; aqui vem de um canal aberto ao publico,
+            onde chega curiosidade e teste. O roteamento e deterministico e fora
+            do prompt, logo a injecao nao muda a decisao — o que se mede e
+            volume, para detectar sondagem sistematica.
+
+      - alert: FilaDeOuvidoriaCrescendo
+        expr: sum(rate(suporte_encaminhamentos_total{motivo="ouvidoria"}[30m])) * 1800 > 15
+        for: 30m
+        labels:
+          severidade: aviso
+          dominio: operacao
+        annotations:
+          resumo: "Mais de 15 reclamacoes encaminhadas a ouvidoria por 30min"
+          acao: >-
+            A Resolucao CMN 4.860 da prazo de resposta, e prazo legal exige
+            dimensionar a fila antes de estourar. `motivo="vazamento_sem_texto_seguro"`
+            e uma fila diferente, de engenharia, e nao entra nesta conta.
+
+  - name: guardrails-de-conformidade
+    interval: 30s
+    rules:
+      # O equivalente, no KYC, da taxa de citacao rejeitada: mede o casamento de nomes
+      # ficando mais frouxo. Fila de revisao manual e custo de gente, e cresce sem que
+      # nada no servico pareca errado.
+      - alert: RevisaoManualDeKycAcumulando
+        expr: |
+          sum(rate(kyc_triagens_total{decisao="revisao_manual"}[30m]))
+            /
+          clamp_min(sum(rate(kyc_triagens_total[30m])), 0.001)
+            > 0.25
+        for: 20m
+        labels:
+          severidade: aviso
+          dominio: conformidade
+        annotations:
+          resumo: "Mais de 25% das triagens caindo em revisao manual"
+          acao: >-
+            Cruzar com `kyc_correspondencias_total{nivel}`: deslocamento de
+            `forte` para `parcial` indica lista com nomes mais abreviados que
+            antes, nao aumento real de risco. Casamento so por CPF tambem cai
+            aqui, por decisao do dominio.
+
+      # O cenario perigoso deste servico: sem lista, ele aprova todo mundo relatando
+      # "nenhuma correspondencia". O `/ready` reprova e o pod sai do balanceador, mas o
+      # alerta existe porque a mesma condicao pode aparecer degradada — lista carregada
+      # pela metade depois de uma atualizacao parcial.
+      - alert: ListaRestritivaEncolheu
+        expr: |
+          histogram_quantile(0.5, sum(rate(kyc_entradas_avaliadas_bucket[30m])) by (le))
+            < 10
+        for: 10m
+        labels:
+          severidade: critico
+          dominio: conformidade
+        annotations:
+          resumo: "As triagens estao avaliando menos de 10 entradas de lista"
+          acao: >-
+            Aprovacao em massa por lista vazia e o pior modo de falha deste
+            servico, porque ele nao **parece** quebrado: responde 201, com
+            `correspondencias: []`. Verificar a origem do CSV e o log
+            `listas.carregadas`.
+
   - name: disponibilidade
     interval: 30s
     rules:
+      # `max by (servico)` e nao `up == 0`, e a diferenca corrige um defeito que a versao
+      # anterior desta regra tinha desde a Camada 5.
+      #
+      # Cada servico e raspado por **dois** alvos, um para execucao em container e um
+      # para execucao no host, e eles sao mutuamente exclusivos por construcao: sempre
+      # um dos dois esta `down`. Com `up == 0` por alvo, a regra dispararia
+      # permanentemente em desenvolvimento — e o cabecalho deste arquivo diz que alerta
+      # que nao gera acao treina o time a ignorar alerta. Era o caso.
+      #
+      # `max by (servico)` colapsa os alvos de um mesmo servico: o alerta so dispara
+      # quando **nenhum** modo de execucao responde, que e a condicao que realmente
+      # significa "fora do ar". O `servico!=""` exclui o job do proprio Prometheus, que
+      # nao tem esse label.
       - alert: ServicoForaDoAr
-        expr: up{job="credit-analysis"} == 0
+        expr: max by (servico) (up{servico!=""}) == 0
         for: 2m
         labels:
           severidade: critico
         annotations:
-          resumo: "O servico credit-analysis nao responde ao scrape"
+          resumo: "O servico {{ $labels.servico }} nao responde por nenhum alvo"
 
       - alert: TaxaDeErro5xx
         expr: |

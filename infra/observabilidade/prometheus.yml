@@ -39,6 +39,34 @@ scrape_configs:
           servico: credit-analysis
           execucao: host
 
+  # Os dois servicos novos seguem o mesmo par de alvos, e a escolha de porta segue a
+  # mesma regra: a porta interna (8100, 8200) difere da publicada (8101, 8201), o que
+  # torna os dois alvos mutuamente exclusivos por construcao. Foi essa colisao que
+  # produziu o painel contando em dobro na primeira versao.
+  - job_name: kyc-compliance
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["kyc:8100"]
+        labels:
+          servico: kyc-compliance
+          execucao: container
+      - targets: ["host.docker.internal:8100"]
+        labels:
+          servico: kyc-compliance
+          execucao: host
+
+  - job_name: customer-support
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["suporte:8200"]
+        labels:
+          servico: customer-support
+          execucao: container
+      - targets: ["host.docker.internal:8200"]
+        labels:
+          servico: customer-support
+          execucao: host
+
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]

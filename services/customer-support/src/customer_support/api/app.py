@@ -11,17 +11,48 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from plataforma import seguranca
 from plataforma.logging import configurar_logging
+from plataforma.metricas import rotulo_de_rota
 
 from customer_support.api.routers import atendimentos, health
+from customer_support.api.routers import metricas as rota_metricas
 from customer_support.application.ports import BaseDeConhecimento, ModeloLinguagem
 from customer_support.application.use_cases.atender import Atender
 from customer_support.config import ProvedorLLM, Settings, get_settings
+from customer_support.infrastructure import metricas
 from customer_support.infrastructure.conhecimento import ConhecimentoEmArquivos
 
 logger = structlog.get_logger(__name__)
 
 CABECALHO_CORRELACAO = "X-Request-ID"
+
+
+_observadores_ligados = False
+
+
+def _ligar_observadores() -> None:
+    """Liga o gancho de deteccao de injecao da plataforma a metrica deste servico.
+
+    Idempotente: `criar_app` e chamada dezenas de vezes na suite, e sem a guarda cada
+    chamada empilharia mais um observador — o contador passaria a incrementar N vezes
+    por evento e o painel mentiria para cima.
+    """
+    global _observadores_ligados
+    if _observadores_ligados:
+        return
+    seguranca.registrar_observador(_medir_injecao)
+    _observadores_ligados = True
+
+
+def _medir_injecao(superficie: str, categoria: str) -> None:
+    """Traduz o gancho da plataforma na metrica deste servico.
+
+    A `superficie` e ignorada aqui de proposito: neste servico ha apenas uma —
+    a mensagem do proprio cliente. Registra-la como label criaria uma dimensao com um
+    unico valor possivel, que nao separa nada e ocupa espaco na serie.
+    """
+    metricas.injecao_detectada.labels(categoria=categoria).inc()
 
 
 def criar_app(
@@ -31,6 +62,8 @@ def criar_app(
 ) -> FastAPI:
     settings = settings or get_settings()
     configurar_logging(nivel=settings.nivel_log, formato_json=settings.log_json)
+    metricas.http.publicar_info(versao=settings.versao, ambiente=settings.ambiente.value)
+    _ligar_observadores()
 
     base = conhecimento or ConhecimentoEmArquivos(settings.diretorio_conhecimento)
     modelo = llm if llm is not None else _montar_llm(settings)
@@ -81,8 +114,22 @@ def criar_app(
         )
 
         inicio = time.perf_counter()
-        response: Response = await call_next(request)
+        metricas.http.em_andamento.inc()
+        try:
+            response: Response = await call_next(request)
+        finally:
+            metricas.http.em_andamento.dec()
         duracao = time.perf_counter() - inicio
+
+        # Template da rota, nunca o caminho concreto: `/v1/triagens/<uuid>` como label
+        # criaria uma serie temporal por triagem. A funcao vem da plataforma porque a
+        # logica e sutil — ela ja esteve errada uma vez, omitindo o prefixo de versao.
+        rota = rotulo_de_rota(
+            request.url.path,
+            request.scope.get("path_params"),
+            casou_com_rota=request.scope.get("route") is not None,
+        )
+        metricas.http.registrar(request.method, rota, response.status_code, duracao)
 
         response.headers[CABECALHO_CORRELACAO] = request_id
         logger.info("http.requisicao", status=response.status_code, duracao_ms=int(duracao * 1000))
@@ -102,6 +149,7 @@ def criar_app(
             },
         )
 
+    app.include_router(rota_metricas.router)
     app.include_router(health.router)
     app.include_router(atendimentos.router, prefix=settings.prefixo_api)
 

@@ -10,4 +10,7 @@ negocio; cada servico e um bounded context e evolui por pressao propria. O preco
 alguma duplicacao consciente, anotada nos dois lados.
 """
 
+# `metricas` fica fora desta lista de proposito: e modulo opcional, e importa
+# `prometheus_client`. Quem quiser usa `from plataforma.metricas import ...` depois de
+# instalar o extra `metricas`; o nucleo continua livre da dependencia.
 __all__ = ["bm25", "llm", "logging", "seguranca"]

@@ -25,7 +25,10 @@ dependencies = [
 
 [project.optional-dependencies]
 llm = ["langchain-ollama>=1.0"]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13"]
+# Helper de metricas HTTP. Opt-in: o nucleo continua sem conhecer Prometheus, e um
+# servico que use outra stack de observabilidade nao instala isto.
+metricas = ["prometheus-client>=0.21"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "prometheus-client>=0.21"]
 
 [build-system]
 requires = ["hatchling"]
@@ -59,7 +62,7 @@ files = ["src", "tests"]
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["langchain_ollama.*"]
+module = ["langchain_ollama.*", "prometheus_client.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
