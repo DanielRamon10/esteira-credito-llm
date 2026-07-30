@@ -2,12 +2,23 @@
 #
 # ## Estado honesto deste arquivo
 #
-# **Nunca foi executado.** Ele exige uma conta AWS com a role de OIDC criada e as variaveis
-# de repositorio preenchidas; nada disso existe neste projeto de portfolio. O que esta aqui e
-# a estrutura que o `infra/terraform/` provisiona, escrita para ser lida — nao um pipeline
+# **Nunca implantou nada.** Ele exige uma conta AWS com a role de OIDC criada e a variavel
+# `AWS_ROLE_DEPLOY` preenchida; nada disso existe neste projeto de portfolio. O que esta aqui
+# e a estrutura que o `infra/terraform/` provisiona, escrita para ser lida — nao um pipeline
 # verificado.
 #
-# Dizer isso e mais util que deixar o arquivo implicar que ha um ambiente rodando.
+# ## E ele estava falhando a cada push, o que e pior que nao existir
+#
+# A versao anterior dizia "nunca foi executado", e isso era **falso**: `workflow_run` disparava
+# o deploy a cada CI verde, o job subia e morria no `configure-aws-credentials` porque
+# `vars.AWS_ROLE_DEPLOY` estava vazia. Cinco falhas consecutivas, cada uma deixando um X
+# vermelho no historico — e um repositorio com pipeline permanentemente vermelho ensina quem
+# olha a ignorar o vermelho. E o mesmo problema do alerta que dispara sempre, corrigido nos
+# alertas do Prometheus no commit anterior.
+#
+# A guarda `if: vars.AWS_ROLE_DEPLOY != ''` faz os jobs serem **pulados** em vez de falharem.
+# Pulado e a descricao correta do estado: nao ha para onde implantar. Preencher a variavel
+# liga o pipeline sem editar este arquivo.
 #
 # ## Sem chave de longa duracao, e isso e o ponto principal
 #
@@ -62,11 +73,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
-    # Roda so se o CI passou. Sem esta condicao, um CI vermelho dispararia o deploy do mesmo
-    # commit.
+    # Duas condicoes, e as duas sao necessarias.
+    #
+    # A primeira: sem ambiente configurado, pular em vez de falhar. `vars.AWS_ROLE_DEPLOY`
+    # vazia significa que nao ha para onde implantar, e isso nao e um erro deste commit.
+    #
+    # A segunda: roda so se o CI passou. Sem ela, um CI vermelho dispararia o deploy do mesmo
+    # commit — e num servico de credito publicar imagem que nao passou nos testes e uma decisao
+    # de negocio errada tomada por conveniencia de pipeline.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
+      vars.AWS_ROLE_DEPLOY != '' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
 
     # Matrix aqui porque os tres builds sao genuinamente independentes: nenhum le a imagem do
     # outro. O que **nao** e independente e a ordem de implantacao, e por isso ela fica no job
@@ -120,6 +138,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: imagens
+
+    # Repetido de proposito. Sem a guarda aqui, com o job `imagens` pulado este job herdaria
+    # `needs` satisfeito por skip e tentaria rodar — falhando no OIDC exatamente como antes.
+    if: vars.AWS_ROLE_DEPLOY != ''
 
     # Environment do GitHub permite exigir aprovacao manual antes de o job rodar. Para
     # producao de credito, deploy automatico sem revisao humana e uma escolha que precisa ser
