@@ -367,15 +367,47 @@ jobs:
       - uses: azure/setup-kubectl@v4
 
       - name: Validar schema dos manifests (kubeconform, modo estrito)
+        # Os componentes por servico entram na lista junto com a base agregada e o
+        # overlay. Validar so o agregado esconderia um componente que nao constroi
+        # sozinho — e construir sozinho e o requisito de poder aplicar um servico
+        # isolado, que e o que se quer num rollback.
         run: |
           curl -sSL -o kubeconform.tar.gz \
             https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
           tar xzf kubeconform.tar.gz kubeconform
-          for alvo in infra/k8s/base infra/k8s/overlays/producao; do
+          for alvo in \
+            infra/k8s/base/credit-analysis \
+            infra/k8s/base/kyc-compliance \
+            infra/k8s/base/customer-support \
+            infra/k8s/base \
+            infra/k8s/overlays/producao
+          do
             echo "::group::$alvo"
             kubectl kustomize "$alvo" | ./kubeconform -summary -strict -kubernetes-version 1.31.0 -
             echo "::endgroup::"
           done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Politica dos manifests (sondas, recursos, isolamento de rede)
+        # Complementa o kubeconform, que valida **schema**: um Deployment sem readiness,
+        # sem request de memoria ou rodando como root passa no modo estrito sem uma
+        # reclamacao.
+        #
+        # A logica esta num script versionado e nao inline aqui, e a razao e concreta: a
+        # primeira versao era `grep -A 3 "limits:" | grep "cpu:"` e acusou os tres
+        # servicos de terem limite de CPU que nenhum tem — `kustomize build` remove
+        # comentarios, e a janela do `-A 3` passou a atravessar do bloco `limits` para o
+        # `requests` logo abaixo. Checagem de politica com falso positivo faz o time
+        # desligar a checagem, nao corrigir o defeito.
+        #
+        # Como script, ela roda igual na maquina de quem escreve o manifest e tem os
+        # proprios casos de falha exercitados.
+        run: |
+          pip install pyyaml
+          python infra/k8s/verificar_politica.py
 
       - uses: hashicorp/setup-terraform@v3
         with:

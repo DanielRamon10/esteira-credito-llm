@@ -1,0 +1,43 @@
+# Service e ConfigMap do kyc-compliance.
+#
+# **Nao ha Secret aqui, e a ausencia e o ponto.** Este servico nao tem credencial: nao
+# fala com banco, nao chama API paga, nao usa modelo. Criar um Secret vazio "por
+# simetria" com os outros dois faria alguem preenche-lo um dia sem que nada precisasse
+# daquilo.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kyc-compliance
+  labels:
+    app.kubernetes.io/name: kyc-compliance
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kyc-compliance
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kyc-compliance-config
+data:
+  KYC_AMBIENTE: "prod"
+  KYC_LOG_JSON: "true"
+  KYC_NIVEL_LOG: "INFO"
+  # Documentacao interativa fechada em producao: ela expoe o schema completo da API, que
+  # e material de reconhecimento para quem procura superficie.
+  KYC_DOCS_HABILITADOS: "false"
+
+  # Caminho relativo ao WORKDIR `/app` da imagem, onde o Dockerfile copia `dados/`.
+  #
+  # As listas versionadas sao **sinteticas** (ver dados/listas/README.md). Em producao
+  # de verdade elas vem do COAF e das listas de sancoes por um initContainer que baixa e
+  # valida antes de o pod subir. O `/ready` reprovando com lista vazia e o que impede
+  # esse initContainer de falhar em silencio.
+  KYC_DIRETORIO_LISTAS: "dados/listas"
+
+  KYC_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
+  KYC_TRACE_AMOSTRAGEM: "1.0"

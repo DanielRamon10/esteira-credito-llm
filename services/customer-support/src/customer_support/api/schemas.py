@@ -82,10 +82,28 @@ class ErroResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Corpo comum de `/health` e `/ready`.
+
+    Os tres ultimos campos sao `None` e nao `0`/`""`, e a razao apareceu rodando o pod
+    num cluster de verdade — o mesmo defeito estava no `kyc-compliance`:
+
+        GET /health -> {..., "artigos_carregados":0, "artigos_publicos":0, "llm":""}
+        GET /ready  -> {..., "artigos_carregados":12, "artigos_publicos":9, "llm":"..."}
+
+    O `/health` nao consulta a base de proposito: sonda de liveness que toca dependencia
+    transforma lentidao em restart loop. Mas os defaults faziam o corpo **afirmar** zero
+    artigo publico, que e exatamente a condicao que o `/ready` trata como motivo para sair
+    do balanceador. Uma sonda que reporta a falha mais grave do servico quando nada esta
+    errado e pior que uma sonda muda.
+
+    Com `response_model_exclude_none=True` na rota, os campos nao aparecem em `/health`.
+    A ausencia e honesta: aquela sonda nao sabe.
+    """
+
     status: str
     servico: str
     versao: str
     ambiente: str
-    artigos_carregados: int = 0
-    artigos_publicos: int = 0
-    llm: str = ""
+    artigos_carregados: int | None = None
+    artigos_publicos: int | None = None
+    llm: str | None = None

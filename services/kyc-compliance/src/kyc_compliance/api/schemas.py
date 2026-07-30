@@ -153,12 +153,38 @@ class ErroResponse(BaseModel):
 
 
 class HealthResponse(BaseModel):
+    """Corpo comum de `/health` e `/ready`.
+
+    ## Por que os dois ultimos campos sao `None` e nao `0`/`""`
+
+    Eles eram `int = 0` e `str = ""`, e isso produzia uma **afirmacao falsa** no
+    `/health` — descoberta rodando o pod num cluster de verdade:
+
+        GET /health -> {"status":"ok", ..., "entradas_carregadas":0, "procedencia_listas":""}
+        GET /ready  -> {"status":"ok", ..., "entradas_carregadas":15, "procedencia_listas":"..."}
+
+    O `/health` nao toca no repositorio de proposito (uma sonda de liveness que consulta
+    dependencia transforma lentidao da dependencia em restart loop), entao ele nunca teve
+    esse numero para dar. Mas o default preenchia `0` — e num servico cujo pior modo de
+    falha e exatamente lista vazia, dizer `0` na sonda de saude e pior que nao dizer
+    nada. Quem lesse `/health` durante um incidente concluiria o oposto da verdade.
+
+    Com `None` mais `response_model_exclude_none=True` na rota, os campos simplesmente
+    nao aparecem em `/health`. A ausencia e honesta: aquela sonda nao sabe. Quem quer
+    saber consulta `/ready`, que sabe.
+
+    A exclusao mora na **rota** e nao aqui: `model_config` nao tem como controlar a
+    serializacao que o FastAPI faz do `response_model`, e um `json_schema_extra` com
+    `exclude_none` afetaria apenas o OpenAPI — o corpo continuaria saindo com os zeros,
+    agora com um schema mentindo sobre isso.
+    """
+
     status: str
     servico: str
     versao: str
     ambiente: str
-    # Quantas entradas de lista estao carregadas. Vai no health de proposito:
-    # zero entradas significa que o servico aprovaria todo mundo, e isso precisa
-    # ser visivel numa sonda e nao apenas num log de boot.
-    entradas_carregadas: int = 0
-    procedencia_listas: str = ""
+    # Quantas entradas de lista estao carregadas. Vai no `/ready` de proposito: zero
+    # entradas significa que o servico aprovaria todo mundo, e isso precisa ser visivel
+    # numa sonda e nao apenas num log de boot.
+    entradas_carregadas: int | None = None
+    procedencia_listas: str | None = None

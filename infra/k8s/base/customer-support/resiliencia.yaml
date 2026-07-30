@@ -1,0 +1,108 @@
+﻿# HPA, PodDisruptionBudget e NetworkPolicy do customer-support.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: customer-support
+  annotations:
+    limitacao-conhecida: >-
+      Escala por CPU, mas parte do tempo e espera pelo Ollama, que nao aparece
+      como CPU. A limitacao e menor que no credit-analysis (llama3.2:3b responde
+      em segundos, nao em 80s) e some quando o fallback para artigo entra em
+      acao, que e CPU puro. Proximo passo seria
+      suporte_http_em_andamento via Prometheus Adapter.
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: customer-support
+  minReplicas: 2
+  # Teto mais alto que os outros dois: este e o unico servico exposto ao publico, e
+  # volume de atendimento nao segue o volume de analise de credito â€” uma campanha de
+  # marketing ou uma noticia ruim geram pico aqui e nada nos outros.
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      # A janela mais curta dos tres: cliente na fila de atendimento desiste, e nao ha
+      # modelo para baixar que justifique esperar.
+      stabilizationWindowSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 180
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: customer-support
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: customer-support
+---
+# Nega tudo e libera o necessario.
+#
+# ## A fronteira de divulgacao, aplicada tambem na rede
+#
+# O servico tem tres defesas contra revelar limiar interno ao cliente: filtro de
+# visibilidade na entrada, guard na saida, e roteamento deterministico fora do prompt.
+# Todas as tres sao de aplicacao.
+#
+# Esta policy e a quarta, e a unica que nao depende de codigo estar correto: **nao ha
+# egress para o `credit-analysis` nem para o `kyc-compliance`.** Nenhum bug de prompt,
+# nenhuma injecao bem-sucedida e nenhuma refatoracao infeliz consegue fazer este servico
+# consultar o score de alguem ou a triagem de PEP, porque o pacote nao sai.
+#
+# E a diferenca entre "o codigo nao faz isso" e "isso nao e possivel". A ausencia dessas
+# duas regras e conteudo, nao lacuna â€” se um dia alguem precisar do dado, a discussao
+# passa obrigatoriamente por editar este arquivo, que e onde ela deve acontecer.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: customer-support
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: customer-support
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress
+      ports:
+        - port: 8200
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 8200
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ia
+      ports:
+        - port: 11434
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 4318

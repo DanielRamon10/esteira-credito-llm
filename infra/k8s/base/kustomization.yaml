@@ -1,26 +1,38 @@
-# Base do Kustomize.
+# Base agregadora dos tres servicos.
 #
-# Kustomize e nao Helm nesta escala: um servico com dois ambientes nao precisa de
-# templating com condicional e loop. Kustomize aplica patch sobre YAML valido, o
-# que significa que a base pode ser lida e validada como manifest de verdade —
-# um chart Helm com `{{ if }}` no meio nao pode.
+# ## Por que a base deixou de ser um servico so
 #
-# Helm passaria a valer com muitos servicos parecidos ou distribuicao para
-# terceiros; nenhum dos dois e o caso aqui.
+# Ate a camada anterior, `base/` continha os manifests do `credit-analysis` direto na
+# raiz. Funcionava com um servico e viraria um problema no segundo: os nomes de arquivo
+# (`deployment.yaml`, `configuracao.yaml`) nao dizem de quem sao, e dois Deployments no
+# mesmo arquivo tornariam impossivel aplicar um servico sozinho — que e justamente o que
+# se quer num rollback.
+#
+# Agora cada servico tem o proprio diretorio com o proprio `kustomization.yaml`, e os
+# tres sao aplicaveis de forma independente:
+#
+#     kubectl apply -k infra/k8s/base/kyc-compliance    # so o KYC
+#     kubectl apply -k infra/k8s/base                   # os tres
+#
+# ## Por que os rotulos comuns subiram para ca
+#
+# `part-of` e `managed-by` valem para os tres, e repeti-los em cada servico faria com
+# que um dia divergissem sem ninguem decidir isso. O que continua em cada servico e o
+# `app.kubernetes.io/name`, que e o que os separa.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  - deployment.yaml
-  - configuracao.yaml
-  - resiliencia.yaml
+  - credit-analysis
+  - kyc-compliance
+  - customer-support
 
 # `labels` com `includeSelectors: false`, e nao o `commonLabels` (deprecado).
 #
-# A diferenca nao e so de nome: `commonLabels` injeta os rotulos tambem no
-# `selector` do Deployment, e selector de Deployment e **imutavel**. Um dia depois
-# de aplicado, mudar qualquer rotulo comum passa a exigir recriar o objeto — o que
-# em producao significa downtime para uma alteracao cosmetica.
+# A diferenca nao e so de nome: `commonLabels` injeta os rotulos tambem no `selector` do
+# Deployment, e selector de Deployment e **imutavel**. Um dia depois de aplicado, mudar
+# qualquer rotulo comum passa a exigir recriar o objeto — o que em producao significa
+# downtime para uma alteracao cosmetica.
 labels:
   - includeSelectors: false
     pairs:

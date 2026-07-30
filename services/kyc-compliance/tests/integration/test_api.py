@@ -139,6 +139,24 @@ class TestSondas:
         # loop sem resolver nada.
         assert client_sem_listas.get("/health").status_code == 200
 
+    def test_health_omite_a_contagem_em_vez_de_afirmar_zero(self, client: TestClient) -> None:
+        """Regressao encontrada rodando o pod num cluster de verdade, nao pela suite.
+
+        Com `entradas_carregadas: int = 0` no schema, o `/health` afirmava zero entradas
+        num pod com 15 carregadas. Zero e a condicao mais grave deste dominio — o servico
+        aprovando todo mundo por falta de lista —, e quem lesse a sonda durante um
+        incidente concluiria o oposto da verdade.
+
+        A sonda de liveness nao consulta o repositorio de proposito, logo ela nunca teve
+        esse numero. Omitir e honesto; preencher com o default nao era.
+        """
+        corpo = client.get("/health").json()
+
+        assert "entradas_carregadas" not in corpo
+        assert "procedencia_listas" not in corpo
+        # E o /ready, que de fato consulta, continua respondendo o numero real.
+        assert client.get("/ready").json()["entradas_carregadas"] > 0
+
     def test_ready_reprova_com_lista_vazia(self, client_sem_listas: TestClient) -> None:
         resposta = client_sem_listas.get("/ready")
 

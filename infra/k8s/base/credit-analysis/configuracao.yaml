@@ -46,6 +46,22 @@ data:
   CREDIT_AGENTE_MAX_PASSOS: "6"
   CREDIT_AGENTE_TIMEOUT_SEGUNDOS: "180"
 
+  # Gate de conformidade. **Estava ausente deste ConfigMap**, e a falta era silenciosa:
+  # `kyc_url` tem default `""`, e com string vazia o `_montar_kyc` monta o cliente fake.
+  # Ou seja, em Kubernetes a esteira rodaria sem consultar lista de sancoes e sem nada
+  # falhar — o pior tipo de defeito de conformidade, porque o parecer sai com aparencia
+  # de completo.
+  #
+  # O manifest foi escrito antes de o gate existir e nunca foi revisitado. Vale como
+  # lembrete de que manifest nao tem teste: as 389 provas do servico passavam.
+  #
+  # A porta e a do container (8100), nao a do Service (80): o `credit-analysis` fala com
+  # o Service, que redireciona para `targetPort: http`. Aqui vale o nome do Service e a
+  # porta **dele**.
+  CREDIT_KYC_URL: "http://kyc-compliance.credito.svc.cluster.local"
+  CREDIT_KYC_TIMEOUT_SEGUNDOS: "3.0"
+  CREDIT_KYC_TENTATIVAS: "2"
+
   CREDIT_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
   CREDIT_TRACE_AMOSTRAGEM: "1.0"
 ---

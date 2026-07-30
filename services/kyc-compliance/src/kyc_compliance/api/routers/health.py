@@ -15,9 +15,22 @@ from kyc_compliance.api.schemas import HealthResponse
 router = APIRouter(tags=["Observabilidade"])
 
 
-@router.get("/health", response_model=HealthResponse, summary="Liveness probe")
+@router.get(
+    "/health",
+    response_model=HealthResponse,
+    # `exclude_none` porque esta sonda nao consulta o repositorio: sem ele, os defaults
+    # do schema fariam o corpo afirmar `entradas_carregadas: 0` — a condicao mais grave
+    # do dominio — num endpoint que nunca teve esse numero para dar.
+    response_model_exclude_none=True,
+    summary="Liveness probe",
+)
 async def health(settings: SettingsDep) -> HealthResponse:
-    """Nao toca em dependencia externa de proposito."""
+    """Nao toca em dependencia externa de proposito.
+
+    Uma sonda de liveness que consulta dependencia transforma lentidao da dependencia em
+    restart loop: o pod morre, sobe frio, falha de novo. Por isso ela nao sabe quantas
+    entradas ha — e o corpo omite o campo em vez de inventar zero.
+    """
     return HealthResponse(
         status="ok",
         servico=settings.nome_servico,

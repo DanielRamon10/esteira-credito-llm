@@ -1,0 +1,112 @@
+# HPA, PodDisruptionBudget e NetworkPolicy do kyc-compliance.
+#
+# ## Aqui o HPA por CPU esta certo, e vale dizer por que
+#
+# No `credit-analysis` o autoscaling por CPU e uma aproximacao declaradamente ruim: o
+# tempo dominante de uma requisicao e **espera** por inferencia, e espera nao aparece
+# como uso de CPU. Neste servico e o oposto — a triagem e comparacao de string em
+# memoria, ou seja CPU pura, sem I/O e sem espera. A mesma metrica que la mede a coisa
+# errada, aqui mede exatamente o recurso que satura.
+#
+# E a diferenca de escala que vem disso: sem modelo para baixar, um pod novo entra em
+# servico em segundos, o que permite janelas de estabilizacao muito mais curtas nas duas
+# direcoes.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: kyc-compliance
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kyc-compliance
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      # 120s contra os 300s do credit-analysis: aqui remover um pod cedo demais custa
+      # apenas subir outro, nao rebaixar 2,24GB de modelo.
+      stabilizationWindowSeconds: 120
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kyc-compliance
+spec:
+  # Valor absoluto e nao porcentagem, mesma razao dos outros: com 1 replica, `50%`
+  # arredondaria para zero e um drain de no levaria o servico inteiro.
+  #
+  # O PDB pesa mais aqui do que a contagem de replicas sugere: se o KYC sai do ar, o
+  # `credit-analysis` abre o disjuntor e manda **toda** analise para revisao humana.
+  # Indisponibilidade deste servico nao derruba a esteira, transforma ela em fila.
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kyc-compliance
+---
+# Nega tudo e libera o necessario.
+#
+# ## Este e o servico com a policy mais fechada dos tres, e de proposito
+#
+# Ele nao tem ingress do namespace `ingress`. Nao e esquecimento: **o KYC nao e uma API
+# publica.** O unico cliente legitimo e o `credit-analysis`, dentro do cluster. Expor
+# triagem de PEP e lista de sancoes a qualquer chamador daria a quem descobrisse a rota
+# um oraculo para descobrir quem esta em lista restritiva — informacao de conformidade
+# consultavel de fora e um problema por si so, independente de quem consulta.
+#
+# O egress e o menor possivel: so DNS e o coletor de traces. Sem banco, sem Ollama, sem
+# internet. Um pod comprometido aqui nao alcanca lugar nenhum.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kyc-compliance
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kyc-compliance
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # Sem `namespaceSelector`: um `podSelector` sozinho casa apenas pods do **mesmo**
+    # namespace, que e exatamente o escopo desejado. Adicionar `namespaceSelector: {}`
+    # por descuido abriria para o cluster todo.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: credit-analysis
+      ports:
+        - port: 8100
+    # Scrape do Prometheus, que vive em outro namespace.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 8100
+  egress:
+    # DNS primeiro. Esquecer esta regra e o erro classico de NetworkPolicy: tudo passa a
+    # falhar com erro de resolucao de nome, e a policy raramente e a primeira suspeita.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 4318

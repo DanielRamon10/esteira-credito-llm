@@ -132,6 +132,21 @@ class TestSondas:
     def test_health_nao_depende_da_base(self, client: TestClient) -> None:
         assert client.get("/health").status_code == 200
 
+    def test_health_omite_as_contagens_em_vez_de_afirmar_zero(self, client: TestClient) -> None:
+        """Regressao encontrada rodando o pod num cluster de verdade, nao pela suite.
+
+        Com os defaults `= 0` no schema, o `/health` afirmava `artigos_publicos: 0` — que
+        e exatamente a condicao pela qual o `/ready` reprova e tira o pod do balanceador.
+        Uma sonda relatando a falha mais grave do servico quando nada esta errado e pior
+        que uma sonda muda.
+        """
+        corpo = client.get("/health").json()
+
+        assert "artigos_publicos" not in corpo
+        assert "artigos_carregados" not in corpo
+        assert "llm" not in corpo
+        assert client.get("/ready").json()["artigos_publicos"] > 0
+
 
 class TestCorrelacao:
     def test_reaproveita_o_request_id(self, client: TestClient) -> None:

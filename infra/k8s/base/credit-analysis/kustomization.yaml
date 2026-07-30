@@ -1,0 +1,16 @@
+# Componente do credit-analysis.
+#
+# Kustomize e nao Helm nesta escala: tres servicos com dois ambientes nao precisam de
+# templating com condicional e loop. Kustomize aplica patch sobre YAML valido, o que
+# significa que a base pode ser lida e validada como manifest de verdade — um chart Helm
+# com `{{ if }}` no meio nao pode.
+#
+# Helm passaria a valer com muitos servicos parecidos ou distribuicao para terceiros;
+# nenhum dos dois e o caso aqui.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - configuracao.yaml
+  - resiliencia.yaml

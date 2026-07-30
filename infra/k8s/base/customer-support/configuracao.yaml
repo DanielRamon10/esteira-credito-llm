@@ -1,0 +1,58 @@
+# Service e ConfigMap do customer-support.
+#
+# Tambem sem Secret: a base de conhecimento vem assada na imagem e o Ollama do cluster
+# nao pede autenticacao. A unica credencial que este servico poderia ter e de um provedor
+# pago, e a decisao do projeto foi nao usar nenhum.
+apiVersion: v1
+kind: Service
+metadata:
+  name: customer-support
+  labels:
+    app.kubernetes.io/name: customer-support
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: customer-support
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-support-config
+data:
+  SUP_AMBIENTE: "prod"
+  SUP_LOG_JSON: "true"
+  SUP_NIVEL_LOG: "INFO"
+  SUP_DOCS_HABILITADOS: "false"
+
+  SUP_DIRETORIO_CONHECIMENTO: "conhecimento"
+  SUP_ARTIGOS_NO_PROMPT: "3"
+
+  # `auto`, e aqui esta a diferenca mais importante em relacao ao credit-analysis.
+  #
+  # No ConfigMap do `credit-analysis`, `CREDIT_PROVEDOR_LLM` e **`ollama` explicito**, e
+  # a nota diz que `auto` seria perigoso: com o Ollama fora do ar o servico cairia no
+  # fake deterministico e devolveria parecer de credito com texto inventado. Melhor nao
+  # subir.
+  #
+  # Neste servico o raciocinio se inverte, porque o fallback e outro: sem Ollama, a
+  # resposta e **o texto do artigo revisado por gente**, nao prosa sintetica. Entre
+  # entregar ao cliente um artigo cru e nao atender, o artigo ganha — e o campo `origem`
+  # no contrato diz ao canal qual dos caminhos produziu o texto, para ele decidir se
+  # mostra, alerta ou transfere.
+  #
+  # Ou seja: `auto` nao e o padrao preguicoso aqui, e a escolha certa por causa de qual e
+  # o modo degradado.
+  SUP_PROVEDOR_LLM: "auto"
+  SUP_OLLAMA_ENDPOINT: "http://ollama.ia.svc.cluster.local:11434"
+  # Modelo pequeno de proposito: a tarefa e reescrever um artigo curto em linguagem
+  # simples, e o cliente esta esperando. O modelo grande da fundamentacao (llama3.1:8b)
+  # nao melhora reescrita e custa dezenas de segundos.
+  SUP_MODELO_OLLAMA: "llama3.2:3b"
+  SUP_OLLAMA_TIMEOUT_SEGUNDOS: "60"
+
+  SUP_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
+  SUP_TRACE_AMOSTRAGEM: "1.0"

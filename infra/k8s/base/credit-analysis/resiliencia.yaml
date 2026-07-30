@@ -108,6 +108,23 @@ spec:
               kubernetes.io/metadata.name: ia
       ports:
         - port: 11434
+    # Gate de conformidade, no mesmo namespace.
+    #
+    # Esta regra **faltava**, e o sintoma seria confuso: com o `CREDIT_KYC_URL` agora
+    # preenchido, a chamada sairia e o pacote seria descartado pela policy. O
+    # `credit-analysis` interpretaria isso como o KYC fora do ar, abriria o disjuntor
+    # depois de 5 falhas e mandaria toda analise para revisao humana — comportamento
+    # correto do disjuntor diante de um diagnostico errado. A fila cresceria e nada nos
+    # logs apontaria para rede.
+    #
+    # `podSelector` sem `namespaceSelector` casa somente o mesmo namespace, que e o
+    # escopo certo: nao existe motivo para alcancar um KYC de outro ambiente.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kyc-compliance
+      ports:
+        - port: 8100
     - to:
         - namespaceSelector:
             matchLabels:

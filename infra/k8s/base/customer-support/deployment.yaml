@@ -1,0 +1,105 @@
+# Deployment do customer-support.
+#
+# ## O que a decisao de nao usar embedding economiza, em manifest
+#
+# A busca deste servico e BM25 puro, da biblioteca compartilhada, e a medicao que
+# justificou isso foi 92% de acerto em top-1 e 100% em top-3 sobre a base real. O efeito
+# aparece aqui: nenhum volume de 4Gi para cache de modelo, `startupProbe` de 30s em vez
+# de 2 minutos, e nenhum pod frio pagando 5,8s na primeira consulta.
+#
+# Num canal em que o cliente esta do outro lado esperando, essa ultima linha vale mais
+# do que valia no fluxo interno de analise.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-support
+  labels:
+    app.kubernetes.io/name: customer-support
+    app.kubernetes.io/component: api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: customer-support
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: customer-support
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8200"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: customer-support:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8200
+          envFrom:
+            - configMapRef:
+                name: customer-support-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # O `/ready` deste servico reprova quando **nenhum artigo** foi carregado, e
+          # esse comportamento ja pagou por si: quando o `.dockerignore` da raiz passou a
+          # excluir todo markdown, este servico quebrou alto no boot enquanto o
+          # `credit-analysis` subiu calado com zero politicas. Falhar ruidosamente e o
+          # que fez o bug do vizinho aparecer.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          resources:
+            requests:
+              # Mais que o KYC e muito menos que o credit-analysis: o indice BM25 da base
+              # inteira cabe em memoria sem esforco, mas ha o buffer das respostas do
+              # modelo, que sao chamadas HTTP com timeout de 60s.
+              memory: 384Mi
+              cpu: 150m
+            limits:
+              memory: 768Mi
+              # SEM limite de CPU. Aqui a razao volta a ser a do credit-analysis: o pico
+              # e a chamada ao Ollama, e throttling no meio de uma inferencia com o
+              # cliente esperando e o pior momento possivel para economizar CPU.
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+      terminationGracePeriodSeconds: 30
