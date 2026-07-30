@@ -1,0 +1,69 @@
+[project]
+name = "customer-support"
+version = "0.1.0"
+description = "Atendimento ao cliente sobre credito, com fronteira de divulgacao"
+requires-python = ">=3.12"
+
+# Oito dependencias. Nao ha numpy, pandas, OpenCV, ONNX nem cliente de banco: a busca
+# e BM25 puro (stdlib, via `plataforma`) e a medicao em `tests/eval` mostra que basta
+# para uma base de dezenas de artigos curtos.
+#
+# `plataforma[llm]` traz o cliente Ollama compartilhado — este foi o servico que
+# motivou a extracao da biblioteca.
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "structlog>=24.4",
+    "prometheus-client>=0.21",
+    "plataforma[llm]",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.uv.sources]
+plataforma = { path = "../../packages/plataforma", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/customer_support"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF", "ASYNC", "S", "BLE", "SLF"]
+ignore = ["S101", "RUF001", "RUF002", "RUF003", "N818"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["SLF001"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+warn_unreachable = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: exercita a API completa",
+    "eval: medicao de qualidade da busca e do roteamento",
+]
+addopts = "-ra --strict-markers -m 'not eval'"

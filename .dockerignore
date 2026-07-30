@@ -24,8 +24,25 @@ docs/
 # Testes ficam fora da imagem de producao: o CI roda a suite no repositorio.
 **/tests/
 
+# Markdown fora, COM excecoes — e as excecoes sao criticas.
+#
+# A regra `**/*.md` foi escrita pensando em documentacao (ADR, notas, este proprio
+# arquivo). Ela silenciosamente removeu **os dois corpora do projeto**, que sao
+# markdown por design: as politicas internas do `credit-analysis` e a base de
+# conhecimento do `customer-support`.
+#
+# O `credit-analysis` nao reclamou: a imagem subiu com zero politicas e a API
+# respondeu normalmente, porque o RAG consulta o pgvector (ja indexado no host) e nao
+# os arquivos. O sintoma so apareceria no dia em que alguem rodasse a ingestao dentro
+# do container — em produção, provavelmente.
+#
+# Quem denunciou foi o `customer-support`, que **falha alto** quando a base esta
+# vazia: `RuntimeError: Nenhum artigo carregado`. Uma degradacao silenciosa e uma
+# falha ruidosa lado a lado, e a ruidosa achou o bug da outra.
 **/*.md
 !**/README.md
+!services/*/politicas/*.md
+!services/*/conhecimento/*.md
 **/Dockerfile
 .dockerignore
 docker-compose.yml

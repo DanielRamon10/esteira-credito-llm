@@ -14,6 +14,7 @@
 #   API          http://localhost:8000   rodando no host
 #                http://localhost:8080   rodando no compose (--profile api)
 #   KYC          http://localhost:8101   servico de conformidade (--profile api)
+#   Suporte      http://localhost:8201   atendimento ao cliente (--profile api)
 #   Grafana      http://localhost:3000   (painel provisionado, sem login)
 #   Prometheus   http://localhost:9090
 #   Tempo        http://localhost:3200   (OTLP em 4318)
@@ -93,6 +94,32 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+    restart: unless-stopped
+
+  suporte:
+    build:
+      context: .
+      dockerfile: services/customer-support/Dockerfile
+    image: customer-support:dev
+    container_name: credito-suporte
+    profiles: ["api"]
+    environment:
+      SUP_AMBIENTE: local
+      SUP_LOG_JSON: "true"
+      # Ollama roda no host. Modelo pequeno de proposito: a tarefa e reescrever um
+      # artigo curto em linguagem simples, e o cliente esta esperando.
+      SUP_OLLAMA_ENDPOINT: http://host.docker.internal:11434
+      SUP_MODELO_OLLAMA: llama3.2:3b
+    ports:
+      - "8201:8200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8200/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   api:

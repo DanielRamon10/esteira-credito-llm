@@ -233,6 +233,43 @@ jobs:
         # os limiares de decisao (a faixa vazia entre positivos e negativos).
         run: uv run pytest -m eval -v
 
+  qualidade-suporte:
+    name: Lint, tipagem e testes (customer-support)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "services/customer-support/pyproject.toml"
+
+      - name: Instalar dependencias
+        working-directory: services/customer-support
+        run: |
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install -e ".[dev]"
+
+      - name: Formatacao, lint e tipagem
+        working-directory: services/customer-support
+        run: |
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+
+      - name: Testes
+        working-directory: services/customer-support
+        run: uv run pytest -q --cov=customer_support --cov-report=term-missing
+
+      - name: Medicao da busca e da fronteira de divulgacao
+        working-directory: services/customer-support
+        # Roda no CI, ao contrario dos evals do credit-analysis: BM25 e stdlib, sem
+        # modelo para baixar. E o eval que protege duas decisoes — a de nao usar
+        # embedding aqui, e a de que nenhum artigo interno alcanca o cliente.
+        run: uv run pytest -m eval -v
+
   seguranca:
     name: Varredura de segredo
     runs-on: ubuntu-latest
