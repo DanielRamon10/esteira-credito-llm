@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import date
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -15,6 +16,7 @@ from credit_analysis.infrastructure.llm.anthropic_adapter import LLMFake
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFake
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.rag.vector_store import VectorStoreMemoria
+from tests.conftest import emitir_token, montar_cliente
 
 pytestmark = pytest.mark.integration
 
@@ -42,7 +44,7 @@ TRECHOS = [
 
 
 @pytest.fixture
-def client_rag(settings_teste: Settings) -> Iterator[TestClient]:
+def client_rag(settings_teste: Settings, chaves_de_teste: Path) -> Iterator[TestClient]:
     """API com o corpus em memoria e LLM fake — sem Postgres, sem chave."""
     import asyncio
 
@@ -55,14 +57,16 @@ def client_rag(settings_teste: Settings) -> Iterator[TestClient]:
         retriever=RetrieverHibrido(store, embedder),
         llm=LLMFake(),
     )
-    with TestClient(app) as c:
+    with montar_cliente(app, emitir_token(chaves_de_teste)) as c:
         yield c
 
 
 @pytest.fixture
-def client_sem_rag(settings_teste: Settings) -> Iterator[TestClient]:
+def client_sem_rag(settings_teste: Settings, chaves_de_teste: Path) -> Iterator[TestClient]:
     """API sem indice configurado — exercita a degradacao."""
-    with TestClient(criar_app(settings=settings_teste, llm=LLMFake())) as c:
+    with montar_cliente(
+        criar_app(settings=settings_teste, llm=LLMFake()), emitir_token(chaves_de_teste)
+    ) as c:
         yield c
 
 
@@ -119,7 +123,9 @@ class TestConsultaFundamentada:
         assert citacao["secao"]
         assert citacao["trecho_citado"]
 
-    def test_expoe_citacao_rejeitada_em_vez_de_esconder(self, settings_teste: Settings) -> None:
+    def test_expoe_citacao_rejeitada_em_vez_de_esconder(
+        self, settings_teste: Settings, chaves_de_teste: Path
+    ) -> None:
         """Um modelo que inventa citacao deve produzir resposta nao confiavel."""
         import asyncio
         import json
@@ -150,7 +156,7 @@ class TestConsultaFundamentada:
             retriever=RetrieverHibrido(store, embedder),
             llm=LLMFake(alucinado),
         )
-        with TestClient(app) as client:
+        with montar_cliente(app, emitir_token(chaves_de_teste)) as client:
             corpo = client.post("/v1/politicas/consultar", json={"pergunta": "Qual o teto?"}).json()
 
         assert corpo["confiavel"] is False

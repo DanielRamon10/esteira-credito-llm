@@ -15,10 +15,11 @@ de uma resposta completa para quem consome a API.
 from __future__ import annotations
 
 import structlog
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 
 from credit_analysis.api.deps import AgenteDep
-from credit_analysis.api.schemas import PerguntaAgenteRequest, TrilhaAgenteResponse
+from credit_analysis.api.schemas import ErroResponse, PerguntaAgenteRequest, TrilhaAgenteResponse
+from credit_analysis.api.seguranca import AGENTE_CONSULTAR, Escopo
 
 logger = structlog.get_logger(__name__)
 
@@ -30,7 +31,14 @@ router = APIRouter(prefix="/agente", tags=["agente"])
     response_model=TrilhaAgenteResponse,
     status_code=status.HTTP_200_OK,
     summary="Pergunta ao agente, que decide quais ferramentas usar",
+    # Escopo proprio, e nao `politicas:consultar`, apesar de o agente ter uma ferramenta de
+    # RAG. O agente tambem tem `consultar_caso`, que le a analise inteira, e
+    # `simular_proposta`, que roda o motor de score. Reaproveitar o escopo de politicas
+    # daria a quem so precisa buscar politica um caminho indireto para os outros dois.
+    dependencies=[Depends(Escopo(AGENTE_CONSULTAR))],
     responses={
+        401: {"model": ErroResponse, "description": "Credencial ausente ou invalida"},
+        403: {"model": ErroResponse, "description": "Sem o escopo agente:consultar"},
         503: {"description": "Nenhum modelo com suporte a ferramentas disponivel"},
     },
 )

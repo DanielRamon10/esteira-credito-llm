@@ -118,6 +118,24 @@ http_em_andamento = Gauge(
 )
 
 
+# ------------------------------------------------------- Autenticacao (C7)
+
+auth_decisoes = Counter(
+    f"{PREFIXO}_auth_decisoes_total",
+    "Decisoes de autenticacao, por evento e motivo.",
+    # `evento` (aceito/negado) e `motivo` juntos, e nao apenas o motivo. O aceito precisa
+    # ser contado para existir denominador: "50 negativas em 10min" nao distingue um cliente
+    # recem-integrado com configuracao errada de forca bruta — o que separa os dois e a
+    # proporcao sobre o total.
+    #
+    # `motivo` vem do dominio fechado de `plataforma.autenticacao` (ausente, invalido,
+    # expirado, audiencia_incorreta, escopo_insuficiente, ok). Nada de conteudo de token
+    # aqui: cardinalidade ilimitada e, pior, credencial vazando para o painel.
+    labelnames=("evento", "motivo"),
+    registry=REGISTRO,
+)
+
+
 # ---------------------------------------------------------------------- LLM
 
 llm_chamadas = Counter(

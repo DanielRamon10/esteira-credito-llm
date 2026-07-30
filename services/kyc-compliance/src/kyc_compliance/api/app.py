@@ -153,5 +153,16 @@ def criar_app(
 
     return app
 
-
-app = criar_app()
+# **Nao ha `app = criar_app()` em nivel de modulo, e a ausencia e deliberada.**
+#
+# Havia, e ela construia a aplicacao inteira a cada **import** do modulo. O sintoma apareceu
+# na Camada 7: como autenticacao nao tem modo desligado, `criar_app()` no import passou a
+# levantar quando a chave nao esta configurada — e a suite inteira falhava na coleta, com uma
+# mensagem sobre autenticacao vinda de um arquivo que trata de pgvector.
+#
+# O erro era o sintoma, nao a causa. Importar um modulo nao deveria abrir pool de conexao,
+# ler configuracao do ambiente nem carregar corpus; ferramenta de analise estatica,
+# autocompletar de IDE e coleta de teste importam modulos o tempo todo.
+#
+# O uvicorn recebe uma **factory** (`factory=True` no `__main__.py`), que e o mecanismo
+# proprio dele para isto.

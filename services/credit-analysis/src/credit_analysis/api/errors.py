@@ -10,6 +10,7 @@ import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from plataforma import autenticacao as auth
 
 from credit_analysis.api.routers.documentos import ArquivoGrandeDemais
 from credit_analysis.api.schemas import ErroResponse
@@ -61,6 +62,74 @@ def registrar_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=http_status,
             content=ErroResponse(codigo=exc.codigo, mensagem=str(exc)).model_dump(),
+        )
+
+    @app.exception_handler(auth.EscopoInsuficiente)
+    async def _escopo(request: Request, exc: auth.EscopoInsuficiente) -> JSONResponse:
+        """403, nunca 401 — e a ordem deste handler importa.
+
+        `EscopoInsuficiente` NAO herda de `TokenInvalido` justamente para nao cair no
+        handler abaixo. As duas respostas dizem coisas diferentes ao cliente:
+
+            401  "suas credenciais nao servem, tente outras"
+            403  "suas credenciais servem e nao bastam"
+
+        Devolver 401 aqui manda um cliente correto reautenticar num laco que nunca resolve,
+        e esconde de quem opera que o problema e de permissao e nao de credencial.
+
+        A mensagem **nao** diz qual escopo falta. Enumerar escopos para quem nao os tem e
+        entregar o mapa de permissoes do servico — a mesma logica da fronteira de
+        divulgacao do `customer-support`. Quem opera ve o escopo no log.
+        """
+        identidade = getattr(request.state, "identidade", None)
+        logger.warning(
+            "auth.escopo_insuficiente",
+            sujeito=getattr(identidade, "sujeito", None),
+            escopo_faltante=str(exc),
+            path=request.url.path,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=ErroResponse(
+                codigo="escopo_insuficiente",
+                mensagem="Credencial valida, sem permissao para esta operacao.",
+            ).model_dump(),
+        )
+
+    @app.exception_handler(auth.ErroDeAutenticacao)
+    async def _autenticacao(request: Request, exc: auth.ErroDeAutenticacao) -> JSONResponse:
+        """401 com `WWW-Authenticate`, como manda a RFC 6750 secao 3.
+
+        Sem esse cabecalho o cliente nao tem como descobrir **como** se autenticar, e
+        bibliotecas HTTP que renovam token automaticamente nao disparam a renovacao.
+
+        O `error` no cabecalho e um dominio fechado do proprio RFC (`invalid_token`); o
+        `motivo` interno (expirado, audiencia_incorreta, ...) fica no log e na metrica, nao
+        na resposta. Dizer ao cliente que a audiencia estava errada confirma que existe um
+        servico com outra audiencia — informacao util para quem esta mapeando a superficie.
+        """
+        logger.warning(
+            "auth.negado",
+            motivo=exc.motivo,
+            path=request.url.path,
+            # Sem o token, nem truncado: um prefixo de JWT ja revela emissor e audiencia,
+            # e log e o lugar de onde credencial vaza para print de Slack.
+        )
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer realm="credit-analysis", error="invalid_token"'
+                    if not isinstance(exc, auth.TokenAusente)
+                    # Token ausente nao e token invalido: sem `error`, o cliente sabe que
+                    # precisa apresentar credencial em vez de trocar a que tem.
+                    else 'Bearer realm="credit-analysis"'
+                )
+            },
+            content=ErroResponse(
+                codigo="nao_autenticado",
+                mensagem="Credencial ausente ou invalida.",
+            ).model_dump(),
         )
 
     @app.exception_handler(RequestValidationError)

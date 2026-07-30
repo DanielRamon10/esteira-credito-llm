@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request, Response
+from plataforma import autenticacao as autenticacao_compartilhada
 from plataforma import llm as llm_compartilhado
 from plataforma import seguranca
 from plataforma.llm import (
@@ -29,6 +30,7 @@ from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
 from credit_analysis.api.routers import analises, documentos, health, politicas
 from credit_analysis.api.routers import metricas as rota_metricas
+from credit_analysis.api.seguranca import montar_chaveiro
 from credit_analysis.application.ports import (
     AgenteCredito,
     ConsultaBureau,
@@ -162,6 +164,15 @@ def criar_app(
         openapi_url="/openapi.json" if settings.docs_habilitados else None,
     )
 
+    # Chaveiro montado **no boot**, nao por requisicao.
+    #
+    # Duas razoes. A primeira e custo: com JWKS, construir por requisicao refaria a chamada
+    # HTTP ao IdP e jogaria fora o cache. A segunda e mais importante — `montar_chaveiro`
+    # levanta se a configuracao estiver incompleta, e o lugar certo para isso falhar e a
+    # subida do processo. Falhando por requisicao, o servico ficaria de pe respondendo 500 a
+    # tudo, e um `/health` que nao toca no chaveiro diria "ok".
+    app.state.chaveiro = montar_chaveiro(settings)
+
     app.state.settings = settings
     app.state.repositorio = repositorio or RepositorioAnalisesMemoria()
     app.state.bureau = bureau or BureauStub()
@@ -248,7 +259,19 @@ def _ligar_observadores_da_plataforma() -> None:
         ).inc()
     )
     llm_compartilhado.registrar_observador(_medir_llm)
+    autenticacao_compartilhada.registrar_observador(_medir_autenticacao)
     _observadores_ligados = True
+
+
+def _medir_autenticacao(evento: str, motivo: str) -> None:
+    """Traduz o gancho de autenticacao da plataforma na metrica deste servico.
+
+    `aceito` tambem e contado, e nao apenas as negativas. Sem o denominador, "50 negativas
+    em 10 minutos" nao distingue um cliente recem-integrado com configuracao errada de uma
+    tentativa de forca bruta — o que separa os dois e a **proporcao** sobre o total, e ela
+    nao existe sem contar o sucesso.
+    """
+    metricas.auth_decisoes.labels(evento=evento, motivo=motivo).inc()
 
 
 def _medir_llm(
@@ -491,5 +514,16 @@ def _montar_ocr(settings: Settings) -> MotorOCR | None:
     return MotorOCRComEscalonamento(motores, suficiencia=holerite_suficiente)
 
 
-# Instancia usada pelo Uvicorn: `uvicorn credit_analysis.api.app:app`
-app = criar_app()
+# **Nao ha `app = criar_app()` em nivel de modulo, e a ausencia e deliberada.**
+#
+# Havia, e ela construia a aplicacao inteira a cada **import** do modulo. O sintoma apareceu
+# na Camada 7: como autenticacao nao tem modo desligado, `criar_app()` no import passou a
+# levantar quando a chave nao esta configurada — e a suite inteira falhava na coleta, com uma
+# mensagem sobre autenticacao vinda de um arquivo que trata de pgvector.
+#
+# O erro era o sintoma, nao a causa. Importar um modulo nao deveria abrir pool de conexao,
+# ler configuracao do ambiente nem carregar corpus; ferramenta de analise estatica,
+# autocompletar de IDE e coleta de teste importam modulos o tempo todo.
+#
+# O uvicorn recebe uma **factory** (`factory=True` no `__main__.py`), que e o mecanismo
+# proprio dele para isto.

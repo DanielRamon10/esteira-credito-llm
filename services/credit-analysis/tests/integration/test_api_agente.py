@@ -8,6 +8,7 @@ responder 503 com instrucao em vez de inventar um atendimento.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -18,12 +19,13 @@ from credit_analysis.config import Settings
 from credit_analysis.infrastructure.agente.grafo import AgenteLangGraph
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMFake
 from tests.apoio.chat_falso import ChatFalso, decisao_com_ferramenta, resposta_final
+from tests.conftest import emitir_token, montar_cliente
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-def client_com_agente(settings_teste: Settings) -> Iterator[TestClient]:
+def client_com_agente(settings_teste: Settings, chaves_de_teste: Path) -> Iterator[TestClient]:
     modelo = ChatFalso(
         respostas=[
             decisao_com_ferramenta(
@@ -37,18 +39,20 @@ def client_com_agente(settings_teste: Settings) -> Iterator[TestClient]:
         llm=LLMFake(),
         agente=AgenteLangGraph(modelo=modelo, identificacao="teste:falso"),
     )
-    with TestClient(app) as c:
+    with montar_cliente(app, emitir_token(chaves_de_teste)) as c:
         yield c
 
 
 @pytest.fixture
-def client_sem_agente(settings_teste: Settings) -> Iterator[TestClient]:
+def client_sem_agente(settings_teste: Settings, chaves_de_teste: Path) -> Iterator[TestClient]:
     """`settings_teste` fixa provedor_llm=fake, e nesse modo o agente nao sobe.
 
     Deliberado: um agente falso responderia com texto plausivel e trilha vazia,
     e quem consome a API nao teria como saber que nenhuma ferramenta rodou.
     """
-    with TestClient(criar_app(settings=settings_teste, llm=LLMFake())) as c:
+    with montar_cliente(
+        criar_app(settings=settings_teste, llm=LLMFake()), emitir_token(chaves_de_teste)
+    ) as c:
         yield c
 
 

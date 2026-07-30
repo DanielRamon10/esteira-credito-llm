@@ -18,7 +18,7 @@ dependencies = [
     # buckets da biblioteca em vez das copias locais. `prometheus-client` ja era
     # dependencia direta, mas declarar o extra deixa a intencao explicita: sem ele um
     # `uv sync` futuro poderia resolver a plataforma sem o modulo e o import quebraria.
-    "plataforma[llm,metricas]",
+    "plataforma[llm,metricas,auth]",
     # RAG: embeddings locais via ONNX (sem torch) e parsing do front-matter.
     "fastembed>=0.4",
     "pyyaml>=6.0",

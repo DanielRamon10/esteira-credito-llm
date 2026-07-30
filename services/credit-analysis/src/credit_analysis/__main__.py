@@ -30,7 +30,11 @@ def main() -> None:
     settings = get_settings()
 
     config = uvicorn.Config(
-        "credit_analysis.api.app:app",
+        # `criar_app` e nao `app`, com `factory=True`: a aplicacao passa a ser construida
+        # quando o servidor sobe, e nao no import do modulo. Ver a nota no fim de
+        # `api/app.py`.
+        "credit_analysis.api.app:criar_app",
+        factory=True,
         host=settings.host,
         port=settings.porta,
         log_config=None,  # structlog ja configura o logging

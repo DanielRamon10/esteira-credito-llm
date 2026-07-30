@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import date
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -33,6 +34,7 @@ from credit_analysis.infrastructure.observabilidade.tracing import (
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFake
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.rag.vector_store import VectorStoreMemoria
+from tests.conftest import emitir_token, montar_cliente
 
 pytestmark = pytest.mark.integration
 
@@ -40,7 +42,7 @@ TEXTO_TETO = "O comprometimento acima de 50% e vedado. O teto de 50% e limite du
 
 
 @pytest.fixture
-def client(settings_teste: Settings) -> Iterator[TestClient]:
+def client(settings_teste: Settings, chaves_de_teste: Path) -> Iterator[TestClient]:
     import asyncio
 
     trecho = TrechoPolitica(
@@ -59,7 +61,7 @@ def client(settings_teste: Settings) -> Iterator[TestClient]:
         retriever=RetrieverHibrido(store, embedder),
         llm=LLMFake(),
     )
-    with TestClient(app) as c:
+    with montar_cliente(app, emitir_token(chaves_de_teste)) as c:
         yield c
 
 

@@ -14,7 +14,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -124,6 +124,26 @@ class Settings(BaseSettings):
     kyc_timeout_segundos: float = Field(default=3.0, gt=0)
     kyc_tentativas: int = Field(default=2, ge=1, le=5)
 
+    # --- Autenticacao (Camada 7) ---
+    #
+    # **Nao existe `auth_habilitado`.** Autenticacao que se desliga por variavel de
+    # ambiente e autenticacao que vai estar desligada em algum ambiente, por um motivo
+    # temporario que ninguem reverteu, sem nada falhando para avisar.
+    #
+    # As duas fontes de chave sao mutuamente exclusivas e uma delas e obrigatoria — ver o
+    # validador no fim desta classe. Ausencia das duas e erro de subida.
+    auth_emissor: str = ""
+    auth_audiencia: str = "credit-analysis"
+
+    # PEM da chave **publica**. Para desenvolvimento e para ambientes sem IdP com JWKS.
+    auth_chave_publica: str = ""
+
+    # URL do JWKS do IdP. Preferivel em producao: permite **rotacao de chave sem
+    # redeploy**, porque o emissor publica a nova e os servicos a veem no proximo ciclo
+    # de cache. Com PEM em variavel de ambiente, rotacionar exige reiniciar os tres
+    # servicos ao mesmo tempo.
+    auth_jwks_url: str = ""
+
     # --- Observabilidade (Camada 5) ---
     # Vazio desliga o tracing. Observabilidade nunca deve impedir o servico de
     # subir: uma falha no coletor de traces viraria indisponibilidade da esteira
@@ -135,6 +155,47 @@ class Settings(BaseSettings):
     # trace que alguem vai querer investigar. Existe para o dia em que o volume
     # mudar essa conta.
     trace_amostragem: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _conferir_fonte_de_chave(self) -> Settings:
+        """Exige **exatamente uma** fonte de chave de verificacao.
+
+        Tres estados possiveis, e dois deles sao erro:
+
+        - nenhuma: o servico nao sabe verificar token. Falhar aqui e melhor que as duas
+          alternativas — recusar tudo (indisponivel) ou aceitar tudo (aberto);
+        - as duas: ambiguidade sobre qual chave manda. Uma configuracao antiga esquecida
+          numa delas aceitaria token que deveria ser rejeitado, e o `/health` diria "ok".
+
+        Em `local` o erro traz o comando exato. `FileNotFoundError` num PEM vazio mandaria
+        quem esta configurando procurar no codigo o que gera aquele arquivo.
+        """
+        tem_pem = bool(self.auth_chave_publica.strip())
+        tem_jwks = bool(self.auth_jwks_url.strip())
+
+        if tem_pem and tem_jwks:
+            raise ValueError(
+                "CREDIT_AUTH_CHAVE_PUBLICA e CREDIT_AUTH_JWKS_URL sao mutuamente "
+                "exclusivas: defina apenas uma."
+            )
+        if not tem_pem and not tem_jwks:
+            # Mensagem com os comandos exatos. Um `ValidationError` seco mandaria quem esta
+            # configurando procurar no codigo o que preenche estas variaveis — e a resposta
+            # esta em outro pacote (`plataforma.emissor_local`), o que torna a busca pior.
+            raise ValueError(
+                "autenticacao exige CREDIT_AUTH_CHAVE_PUBLICA ou CREDIT_AUTH_JWKS_URL.\n"
+                "Para desenvolvimento, sem conta em provedor nenhum:\n"
+                "  python -m plataforma.emissor_local gerar-chaves\n"
+                '  export CREDIT_AUTH_CHAVE_PUBLICA="$(cat .chaves/publica.pem)"\n'
+                "  export CREDIT_AUTH_EMISSOR=https://local.esteira-credito.invalid\n"
+                "Nao ha modo desligado, e a ausencia e deliberada: ver api/seguranca.py."
+            )
+        if not self.auth_emissor.strip():
+            # Sem emissor, `verificar` receberia string vazia e o PyJWT compararia `iss`
+            # contra "" — nenhum token passaria, e o sintoma (403/401 universal) nao aponta
+            # para configuracao ausente.
+            raise ValueError("CREDIT_AUTH_EMISSOR e obrigatorio")
+        return self
 
     @property
     def usar_pgvector(self) -> bool:

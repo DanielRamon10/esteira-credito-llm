@@ -9,12 +9,13 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from fastapi import Path as PathParam
 
 from credit_analysis.api.deps import ProcessarDocumentoDep
 from credit_analysis.api.observabilidade import registrar_processamento
 from credit_analysis.api.schemas import DocumentoProcessadoResponse, ErroResponse
+from credit_analysis.api.seguranca import DOCUMENTOS_ENVIAR, Escopo
 from credit_analysis.application.use_cases.processar_documento import (
     ComandoProcessarDocumento,
 )
@@ -59,6 +60,7 @@ _RESPOSTAS: dict[int | str, dict[str, Any]] = {
     response_model=DocumentoProcessadoResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Enviar documento para extracao",
+    dependencies=[Depends(Escopo(DOCUMENTOS_ENVIAR))],
     responses=_RESPOSTAS,
 )
 async def enviar_documento(

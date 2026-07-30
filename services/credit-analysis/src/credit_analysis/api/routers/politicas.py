@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from credit_analysis.api.deps import FundamentarDep, RetrieverDep
 from credit_analysis.api.observabilidade import registrar_fundamentacao
@@ -14,6 +14,7 @@ from credit_analysis.api.schemas import (
     FundamentacaoResponse,
     TrechoRecuperadoResponse,
 )
+from credit_analysis.api.seguranca import POLITICAS_CONSULTAR, Escopo
 from credit_analysis.application.use_cases.fundamentar_parecer import ComandoFundamentar
 from credit_analysis.infrastructure.rag.retriever import ConfiguracaoBusca
 
@@ -28,6 +29,7 @@ _RESPOSTA_503: dict[int | str, dict[str, Any]] = {
     "/buscar",
     response_model=list[TrechoRecuperadoResponse],
     summary="Buscar trechos de politica",
+    dependencies=[Depends(Escopo(POLITICAS_CONSULTAR))],
     responses=_RESPOSTA_503,
 )
 async def buscar(
@@ -49,6 +51,7 @@ async def buscar(
     "/consultar",
     response_model=FundamentacaoResponse,
     summary="Perguntar as politicas internas, com citacoes verificadas",
+    dependencies=[Depends(Escopo(POLITICAS_CONSULTAR))],
     responses=_RESPOSTA_503,
 )
 async def consultar(

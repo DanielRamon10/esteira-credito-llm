@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -27,6 +28,7 @@ from credit_analysis.infrastructure.llm.anthropic_adapter import LLMFake
 from credit_analysis.infrastructure.ocr.vision import OCRFake
 from credit_analysis.infrastructure.repositories.memoria import RepositorioAnalisesMemoria
 from tests.apoio.documentos_sinteticos import INJECAO_TIPICA, Holerite
+from tests.conftest import emitir_token, montar_cliente
 
 pytestmark = pytest.mark.integration
 
@@ -58,6 +60,7 @@ def imagem_png(largura: int = 60, altura: int = 40) -> bytes:
 def montar_client(
     settings: Settings,
     repositorio: RepositorioAnalisesMemoria,
+    chaves: Path,
     *,
     texto_ocr: str = HOLERITE_TEXTO,
     confianca: float = 92,
@@ -69,14 +72,14 @@ def montar_client(
         llm=LLMFake(),
         motor_ocr=motor or OCRFake(texto_ocr, Percentual.de(confianca), "fake"),  # type: ignore[arg-type]
     )
-    return TestClient(app)
+    return montar_cliente(app, emitir_token(chaves))
 
 
 @pytest.fixture
 def client_doc(
-    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria
+    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria, chaves_de_teste: Path
 ) -> Iterator[TestClient]:
-    with montar_client(settings_teste, repositorio) as c:
+    with montar_client(settings_teste, repositorio, chaves_de_teste) as c:
         yield c
 
 
@@ -141,8 +144,11 @@ class TestUploadValido:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
-        with montar_client(settings_teste, repositorio, texto_ocr=EXTRATO_TEXTO) as client:
+        with montar_client(
+            settings_teste, repositorio, chaves_de_teste, texto_ocr=EXTRATO_TEXTO
+        ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid, tipo="extrato_bancario").json()
 
@@ -199,9 +205,10 @@ class TestQualidadeDeExtracao:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         # POL-002 secao 3.2: entre 60% e 85% vai para conferencia humana.
-        with montar_client(settings_teste, repositorio, confianca=70) as client:
+        with montar_client(settings_teste, repositorio, chaves_de_teste, confianca=70) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid).json()
 
@@ -213,9 +220,10 @@ class TestQualidadeDeExtracao:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         # Abaixo de 60% a politica manda reenviar, e a mensagem diz como.
-        with montar_client(settings_teste, repositorio, confianca=45) as client:
+        with montar_client(settings_teste, repositorio, chaves_de_teste, confianca=45) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             resposta = enviar(client, aid)
 
@@ -229,9 +237,13 @@ class TestQualidadeDeExtracao:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         with montar_client(
-            settings_teste, repositorio, texto_ocr="RECIBO\nNome: JOAO DA SILVA\n"
+            settings_teste,
+            repositorio,
+            chaves_de_teste,
+            texto_ocr="RECIBO\nNome: JOAO DA SILVA\n",
         ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid).json()
@@ -252,9 +264,12 @@ class TestInjecaoDePrompt:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         texto_atacado = HOLERITE_TEXTO + "\n" + INJECAO_TIPICA
-        with montar_client(settings_teste, repositorio, texto_ocr=texto_atacado) as client:
+        with montar_client(
+            settings_teste, repositorio, chaves_de_teste, texto_ocr=texto_atacado
+        ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid).json()
 
@@ -266,9 +281,12 @@ class TestInjecaoDePrompt:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         texto_atacado = HOLERITE_TEXTO + "\n" + INJECAO_TIPICA
-        with montar_client(settings_teste, repositorio, texto_ocr=texto_atacado) as client:
+        with montar_client(
+            settings_teste, repositorio, chaves_de_teste, texto_ocr=texto_atacado
+        ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid).json()
 
@@ -283,6 +301,7 @@ class TestInjecaoDePrompt:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         """A defesa arquitetural, e nao textual.
 
@@ -292,7 +311,9 @@ class TestInjecaoDePrompt:
         com aquele texto.
         """
         texto_atacado = HOLERITE_TEXTO + "\n" + INJECAO_TIPICA
-        with montar_client(settings_teste, repositorio, texto_ocr=texto_atacado) as client:
+        with montar_client(
+            settings_teste, repositorio, chaves_de_teste, texto_ocr=texto_atacado
+        ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid).json()
 
@@ -304,6 +325,7 @@ class TestInjecaoDePrompt:
         settings_teste: Settings,
         repositorio: RepositorioAnalisesMemoria,
         payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
     ) -> None:
         """Ponta a ponta com imagem real: o ataque impresso no documento.
 
@@ -316,7 +338,9 @@ class TestInjecaoDePrompt:
         holerite.renderizar().save(buffer, "PNG")
 
         texto_que_o_ocr_leria = HOLERITE_TEXTO + "\n" + INJECAO_TIPICA
-        with montar_client(settings_teste, repositorio, texto_ocr=texto_que_o_ocr_leria) as client:
+        with montar_client(
+            settings_teste, repositorio, chaves_de_teste, texto_ocr=texto_que_o_ocr_leria
+        ) as client:
             aid = client.post("/v1/analises", json=payload_analise).json()["id"]
             corpo = enviar(client, aid, conteudo=buffer.getvalue()).json()
 

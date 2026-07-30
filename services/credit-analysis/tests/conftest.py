@@ -8,13 +8,19 @@ ruido esconde a intencao do teste.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import os
+import tempfile
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from plataforma import emissor_local
 
+from credit_analysis.api import seguranca
 from credit_analysis.api.app import criar_app
 from credit_analysis.config import Ambiente, ProvedorLLM, Settings
 from credit_analysis.domain.entities import PropostaCredito, Solicitante
@@ -27,6 +33,28 @@ from credit_analysis.infrastructure.repositories.memoria import RepositorioAnali
 # loop. Sobrescrever o fixture `event_loop_policy` faria o mesmo, mas esta
 # depreciado; o hook que o substitui exige marcar cada teste individualmente.
 ajustar_policy_global()
+
+
+# --------------------------------------------------------- Autenticacao (C7)
+#
+# As chaves sao geradas **no import** deste arquivo, e nao numa fixture. Fixture nao serve
+# aqui: `test_pgvector.py` chama `get_settings()` no proprio guard de skip, ou seja durante a
+# **coleta**, antes de qualquer fixture existir. Como autenticacao nao tem modo desligado, um
+# `Settings()` sem chave configurada levanta — e a suite inteira falhava no import do
+# conftest, com uma mensagem sobre autenticacao num arquivo que trata de pgvector.
+#
+# O par vive num diretorio temporario e **nunca** aparece literal aqui: o
+# `.githooks/pre-commit` bloqueia PEM, e a saida certa e o teste nao ter o padrao — nao
+# enfraquecer o scanner, reflexo que este projeto ja teve duas vezes por outros motivos.
+_DIRETORIO_DE_CHAVES = Path(tempfile.mkdtemp(prefix="credit-chaves-"))
+emissor_local.gerar_chaves(_DIRETORIO_DE_CHAVES)
+CHAVE_PUBLICA_DE_TESTE = emissor_local.chave_publica(_DIRETORIO_DE_CHAVES)
+
+# Tambem no ambiente, e nao apenas no `Settings` construido pelas fixtures: os caminhos que
+# leem a configuracao do processo (`get_settings`, `ingestao`, `__main__`) nao passam pelas
+# fixtures. E o que producao faz — a chave chega por variavel de ambiente.
+os.environ.setdefault("CREDIT_AUTH_CHAVE_PUBLICA", CHAVE_PUBLICA_DE_TESTE)
+os.environ.setdefault("CREDIT_AUTH_EMISSOR", emissor_local.EMISSOR_LOCAL)
 
 # CPFs sinteticos com digitos verificadores validos, usados so em teste.
 CPF_VALIDO = "52998224725"
@@ -76,7 +104,7 @@ def repositorio() -> RepositorioAnalisesMemoria:
 
 
 @pytest.fixture
-def settings_teste() -> Settings:
+def settings_teste(chave_publica_de_teste: str) -> Settings:
     """Configuracao explicita, imune ao ambiente.
 
     `postgres_dsn` e `anthropic_api_key` sao zerados de proposito: argumentos
@@ -101,26 +129,82 @@ def settings_teste() -> Settings:
         # conforme o que esta instalado na maquina nao serve como rede de
         # seguranca.
         provedor_llm=ProvedorLLM.FAKE,
+        # Autenticacao NAO tem modo desligado (ver api/seguranca.py), entao a suite precisa
+        # de uma chave de verificacao real. E a chave da sessao, nao um valor fixo: chave
+        # literal no repositorio e chave publicada.
+        auth_chave_publica=chave_publica_de_teste,
+        auth_emissor=emissor_local.EMISSOR_LOCAL,
     )
+
+
+# --------------------------------------------------------- Autenticacao (C7)
+#
+# O par de chaves e gerado uma vez por sessao, em `tmp_path_factory`, e **nunca** aparece
+# literal neste arquivo: o `.githooks/pre-commit` bloqueia PEM, e a saida certa e o teste
+# nao ter o padrao — nao enfraquecer o scanner, o que ja foi tentado duas vezes neste
+# projeto por outros motivos.
+
+
+@pytest.fixture(scope="session")
+def chaves_de_teste() -> Path:
+    """Diretorio das chaves geradas no import. Gerar RSA custa ~100ms; uma vez por sessao."""
+    return _DIRETORIO_DE_CHAVES
+
+
+@pytest.fixture(scope="session")
+def chave_publica_de_teste() -> str:
+    return CHAVE_PUBLICA_DE_TESTE
+
+
+def emitir_token(
+    chaves: Path,
+    *,
+    escopos: Sequence[str] = seguranca.TODOS_OS_ESCOPOS,
+    audiencia: str = "credit-analysis",
+    **kwargs: object,
+) -> str:
+    """Token de teste. O default carrega **todos** os escopos.
+
+    Isso e conveniencia deliberada, com um custo assumido: nenhum dos testes existentes
+    prova autorizacao, porque todos passam com credencial total. O que cobre autorizacao e
+    `tests/integration/test_autenticacao.py`, que emite token restrito de proposito — e o
+    teste que enumera as rotas do OpenAPI, que pega a proxima rota criada sem escopo.
+
+    A alternativa — dar a cada teste o escopo minimo — faria cada mudanca de escopo quebrar
+    dezenas de testes que nao tratam de autorizacao, e o reflexo seria afrouxar o escopo.
+    """
+    return emissor_local.emitir(
+        audiencia=audiencia, escopos=list(escopos), diretorio=chaves, **kwargs
+    )
+
+
+def montar_cliente(app: FastAPI, token: str) -> TestClient:
+    """`TestClient` com o cabecalho `Authorization` em todas as requisicoes.
+
+    O cabecalho vai no construtor e nao em cada chamada: com 9 clientes e centenas de
+    requisicoes na suite, passar por chamada garantiria que alguma ficasse sem — e o teste
+    falharia com 401 por esquecimento, o que treina a ler 401 como ruido.
+    """
+    return TestClient(app, headers={"Authorization": f"Bearer {token}"})
 
 
 @pytest.fixture
 def client(
-    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria
+    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria, chaves_de_teste: Path
 ) -> Iterator[TestClient]:
     """Cliente HTTP com bureau limpo — isola o efeito do score."""
     app = criar_app(settings=settings_teste, repositorio=repositorio, bureau=BureauSempreLimpo())
-    with TestClient(app) as c:
+    with montar_cliente(app, emitir_token(chaves_de_teste)) as c:
         yield c
 
 
 @pytest.fixture
 def client_restrito(
-    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria
+    settings_teste: Settings, repositorio: RepositorioAnalisesMemoria, chaves_de_teste: Path
 ) -> Iterator[TestClient]:
     """Cliente cujo bureau sempre acusa restricao — exercita o veto duro."""
     app = criar_app(settings=settings_teste, repositorio=repositorio, bureau=BureauSempreRestrito())
-    with TestClient(app) as c:
+    with montar_cliente(app, emitir_token(chaves_de_teste)) as c:
         yield c
 
 
