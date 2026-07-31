@@ -45,6 +45,20 @@ locals {
     LOG_JSON         = "true"
     NIVEL_LOG        = "INFO"
     DOCS_HABILITADOS = "false" # a doc interativa expoe o schema completo, que e reconhecimento
+
+    # Autenticacao (Camada 7). **JWKS aqui, e nao arquivo montado como no Kubernetes**, e a
+    # diferenca nao e preferencia:
+    #
+    # - o ECS Fargate injeta segredo como **variavel de ambiente**, nao como arquivo. Montar um
+    #   PEM exigiria EFS ou um sidecar que o escreve, ou seja infraestrutura para transportar
+    #   uma chave publica;
+    # - JWKS resolve isso melhor de qualquer forma: rotacao sem tocar na task definition, e sem
+    #   uma variavel de ambiente com PEM aparecendo inteira num `describe-task-definition`.
+    #
+    # O Kubernetes usa arquivo porque la o Secret montado como volume e propagado pelo kubelet
+    # em segundos — vantagem que o Fargate nao oferece.
+    AUTH_JWKS_URL = var.jwks_url
+    AUTH_EMISSOR  = var.emissor_de_token
   }
 }
 
@@ -243,11 +257,20 @@ module "credit_analysis" {
       # Vem do output do modulo, e nao de uma string escrita a mao. Foi este endereco, ausente
       # do ConfigMap do Kubernetes, que deixou o gate de conformidade rodando desligado.
       CREDIT_KYC_URL = module.kyc_compliance.endereco_interno
+      # Endpoint de token do IdP: o `credit-analysis` obtem credencial propria para o KYC via
+      # `client_credentials`. O token dele (`aud=credit-analysis`) nao pode ser repassado —
+      # seria a escalada lateral que a validacao de audiencia existe para impedir.
+      CREDIT_KYC_TOKEN_URL = var.token_url
+      CREDIT_KYC_CLIENT_ID = var.kyc_client_id
     },
   )
 
   segredos = {
     CREDIT_POSTGRES_DSN = "${aws_secretsmanager_secret.credit_analysis.arn}:CREDIT_POSTGRES_DSN::"
+    # Por referencia, como o DSN. Em `variaveis` ele apareceria num
+    # `aws ecs describe-task-definition`, que qualquer role com leitura de ECS consegue chamar —
+    # e o `client_secret` e o que permite **emitir** token em nome deste servico.
+    CREDIT_KYC_CLIENT_SECRET = "${aws_secretsmanager_secret.credit_analysis.arn}:CREDIT_KYC_CLIENT_SECRET::"
   }
 
   arns_de_segredo_legiveis = [aws_secretsmanager_secret.credit_analysis.arn]

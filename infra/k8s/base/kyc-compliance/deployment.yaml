@@ -67,6 +67,9 @@ spec:
           # modelo nem upload de documento. Se aparecer um segundo, e sinal de que algo
           # passou a gravar onde nao devia.
           volumeMounts:
+            - name: chave-de-auth
+              mountPath: /chaves
+              readOnly: true
             - name: tmp
               mountPath: /tmp
           # Liveness no /health, readiness no /ready, e aqui a distincao e a mais
@@ -111,6 +114,13 @@ spec:
               # contencao. Aqui o burst e a varredura da lista inteira, que e curta mas
               # intensa â€” exatamente o formato que o throttling penaliza pior.
       volumes:
+        - name: chave-de-auth
+          secret:
+            secretName: kyc-compliance-auth
+            # 0444: legivel por qualquer usuario do container, nao gravavel por nenhum. O
+            # servico **verifica** assinatura e nunca assina — se ele pudesse escrever aqui,
+            # um comprometimento trocaria a chave por uma que o atacante controla.
+            defaultMode: 0444
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

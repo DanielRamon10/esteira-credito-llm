@@ -66,6 +66,9 @@ spec:
           # de documento usa. Se aparecer um terceiro, e sinal de que algo esta
           # gravando onde nao devia.
           volumeMounts:
+            - name: chave-de-auth
+              mountPath: /chaves
+              readOnly: true
             - name: modelo-cache
               mountPath: /cache
             - name: tmp
@@ -113,6 +116,13 @@ spec:
               # latencia ja e o problema (80s medidos). O request garante a fatia
               # sob contencao; o limite so puniria o pod quando ha CPU sobrando.
       volumes:
+        - name: chave-de-auth
+          secret:
+            secretName: credit-analysis-auth
+            # 0444: legivel por qualquer usuario do container, nao gravavel por nenhum. O
+            # servico **verifica** assinatura e nunca assina — se ele pudesse escrever aqui,
+            # um comprometimento trocaria a chave por uma que o atacante controla.
+            defaultMode: 0444
         - name: modelo-cache
           # emptyDir e nao PVC: o cache e reconstruivel por download, e um PVC
           # ReadWriteOnce impediria dois pods no mesmo no durante o rollout. O

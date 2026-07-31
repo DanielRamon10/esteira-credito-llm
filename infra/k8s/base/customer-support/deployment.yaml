@@ -59,6 +59,9 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
+            - name: chave-de-auth
+              mountPath: /chaves
+              readOnly: true
             - name: tmp
               mountPath: /tmp
           livenessProbe:
@@ -99,6 +102,13 @@ spec:
               # e a chamada ao Ollama, e throttling no meio de uma inferencia com o
               # cliente esperando e o pior momento possivel para economizar CPU.
       volumes:
+        - name: chave-de-auth
+          secret:
+            secretName: customer-support-auth
+            # 0444: legivel por qualquer usuario do container, nao gravavel por nenhum. O
+            # servico **verifica** assinatura e nunca assina — se ele pudesse escrever aqui,
+            # um comprometimento trocaria a chave por uma que o atacante controla.
+            defaultMode: 0444
         - name: tmp
           emptyDir:
             sizeLimit: 64Mi

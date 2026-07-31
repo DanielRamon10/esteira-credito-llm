@@ -76,6 +76,22 @@ class Settings(BaseSettings):
     # emissor publica a nova e os servicos a veem no proximo ciclo de cache.
     auth_jwks_url: str = ""
 
+    # Caminho de um arquivo com a chave publica. **E esta a forma usada pelo compose e pelo
+    # Kubernetes**, e nao a variavel com o PEM inline.
+    #
+    # Duas razoes concretas:
+    #
+    # - PEM em ConfigMap ou em variavel de ambiente aparece inteiro num `kubectl describe pod`
+    #   e num `docker inspect`. A chave e publica, entao nao e vazamento — mas o mesmo caminho
+    #   seria usado para material sensivel por analogia, e o habito importa;
+    # - arquivo e o que permite **rotacao sem recriar o pod**: o kubelet atualiza um Secret
+    #   montado como volume em segundos, enquanto variavel de ambiente e fixada na criacao do
+    #   container. Com JWKS a rotacao e ainda melhor; com arquivo, ela ao menos e possivel.
+    #
+    # Lido no boot, nao por requisicao: um arquivo ausente precisa impedir a subida, e reler a
+    # cada requisicao poria I/O de disco no caminho de toda chamada.
+    auth_chave_publica_arquivo: Path | None = None
+
     otlp_endpoint: str = ""
     trace_amostragem: float = Field(default=1.0, ge=0.0, le=1.0)
 
@@ -89,18 +105,27 @@ class Settings(BaseSettings):
         """
         tem_pem = bool(self.auth_chave_publica.strip())
         tem_jwks = bool(self.auth_jwks_url.strip())
+        tem_arquivo = self.auth_chave_publica_arquivo is not None
 
-        if tem_pem and tem_jwks:
+        # Exatamente **uma** das tres. `sum` sobre booleanos em vez de uma cadeia de `if`: com
+        # tres fontes, a cadeia tem seis combinacoes e uma delas escapa por descuido.
+        fontes = sum((tem_pem, tem_jwks, tem_arquivo))
+        if fontes > 1:
             raise ValueError(
-                "KYC_AUTH_CHAVE_PUBLICA e KYC_AUTH_JWKS_URL sao mutuamente "
-                "exclusivas: defina apenas uma."
+                "informe **uma** fonte de chave: KYC_AUTH_CHAVE_PUBLICA, "
+                "KYC_AUTH_CHAVE_PUBLICA_ARQUIVO ou KYC_AUTH_JWKS_URL. "
+                "Com mais de uma, qual delas valida fica ambiguo, e uma configuracao antiga "
+                "esquecida numa aceitaria token que deveria ser rejeitado."
             )
-        if not tem_pem and not tem_jwks:
+
+        if fontes == 0:
             raise ValueError(
-                "autenticacao exige KYC_AUTH_CHAVE_PUBLICA ou KYC_AUTH_JWKS_URL.\n"
+                "autenticacao exige uma fonte de chave: "
+                "KYC_AUTH_CHAVE_PUBLICA_ARQUIVO, KYC_AUTH_CHAVE_PUBLICA "
+                "ou KYC_AUTH_JWKS_URL.\n"
                 "Para desenvolvimento, sem conta em provedor nenhum:\n"
                 "  python -m plataforma.emissor_local gerar-chaves\n"
-                '  export KYC_AUTH_CHAVE_PUBLICA="$(cat .chaves/publica.pem)"\n'
+                "  export KYC_AUTH_CHAVE_PUBLICA_ARQUIVO=.chaves/publica.pem\n"
                 "  export KYC_AUTH_EMISSOR=https://local.esteira-credito.invalid\n"
                 "Nao ha modo desligado, e a ausencia e deliberada: ver api/seguranca.py."
             )

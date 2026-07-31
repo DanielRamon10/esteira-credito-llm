@@ -76,4 +76,16 @@ def Escopo(*exigidos: str) -> Callable[..., Coroutine[Any, Any, auth.Identidade]
 def montar_chaveiro(settings: Any) -> auth.Chaveiro:
     if settings.auth_jwks_url:
         return auth.Chaveiro.de_jwks(settings.auth_jwks_url)
+
+    if settings.auth_chave_publica_arquivo is not None:
+        caminho = settings.auth_chave_publica_arquivo
+        if not caminho.is_file():
+            # Mensagem com o caminho resolvido: `FileNotFoundError: publica.pem` num container
+            # nao diz se o volume nao foi montado ou se o nome do arquivo esta errado.
+            raise RuntimeError(
+                f"chave publica ausente em {caminho.resolve()}. "
+                "Confira o volume montado e o nome do arquivo."
+            )
+        return auth.Chaveiro.de_chave_publica(caminho.read_text(encoding="utf-8"))
+
     return auth.Chaveiro.de_chave_publica(settings.auth_chave_publica)

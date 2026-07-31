@@ -81,10 +81,24 @@ services:
       KYC_AMBIENTE: local
       KYC_LOG_JSON: "true"
       KYC_OTLP_ENDPOINT: http://tempo:4318
+      # Autenticacao (Camada 7). Nao ha modo desligado: sem estas duas o servico recusa
+      # subir, e o `docker compose up` falha com a mensagem que traz o comando de gerar
+      # as chaves.
+      KYC_AUTH_CHAVE_PUBLICA_ARQUIVO: /chaves/publica.pem
+      KYC_AUTH_EMISSOR: https://local.esteira-credito.invalid
     ports:
       # 8101 no host pelo mesmo motivo que a API usa 8080: evitar que o
       # Prometheus alcance o mesmo processo por dois alvos e conte em dobro.
       - "8101:8100"
+    volumes:
+      # Chave publica de verificacao, gerada por
+      # `python -m plataforma.emissor_local gerar-chaves`. Somente leitura: o servico
+      # verifica assinatura, nunca assina — se ele conseguisse escrever aqui, um
+      # comprometimento poderia trocar a chave por uma que o atacante controla.
+      #
+      # O diretorio contem tambem a chave **privada**, que NAO e montada. Montar o diretorio
+      # inteiro seria mais simples e daria ao container a capacidade de emitir token.
+      - ./.chaves/publica.pem:/chaves/publica.pem:ro
     healthcheck:
       # `/ready` e nao `/health` aqui: o compose usa isto para liberar o
       # `depends_on` da API, e o que importa nesse momento e "da para consultar?",
@@ -110,8 +124,19 @@ services:
       # artigo curto em linguagem simples, e o cliente esta esperando.
       SUP_OLLAMA_ENDPOINT: http://host.docker.internal:11434
       SUP_MODELO_OLLAMA: llama3.2:3b
+      SUP_AUTH_CHAVE_PUBLICA_ARQUIVO: /chaves/publica.pem
+      SUP_AUTH_EMISSOR: https://local.esteira-credito.invalid
     ports:
       - "8201:8200"
+    volumes:
+      # Chave publica de verificacao, gerada por
+      # `python -m plataforma.emissor_local gerar-chaves`. Somente leitura: o servico
+      # verifica assinatura, nunca assina — se ele conseguisse escrever aqui, um
+      # comprometimento poderia trocar a chave por uma que o atacante controla.
+      #
+      # O diretorio contem tambem a chave **privada**, que NAO e montada. Montar o diretorio
+      # inteiro seria mais simples e daria ao container a capacidade de emitir token.
+      - ./.chaves/publica.pem:/chaves/publica.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8200/ready || exit 1"]
       interval: 5s
@@ -142,6 +167,17 @@ services:
       # Gate de conformidade. Dentro da rede do compose o host e o nome do
       # servico; a porta e a interna (8100), nao a publicada.
       CREDIT_KYC_URL: http://kyc:8100
+      CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO: /chaves/publica.pem
+      CREDIT_AUTH_EMISSOR: https://local.esteira-credito.invalid
+      # Credencial de servico para chamar o KYC. Vem do ambiente de quem sobe o compose:
+      #
+      #   export CREDIT_KYC_TOKEN=$(python -m plataforma.emissor_local token \
+      #       --audiencia kyc-compliance --escopos triagens:executar)
+      #
+      # Sem ela o compose sobe (isto e `local`, nao `prod`) e as chamadas ao KYC sao
+      # recusadas com 401 — que o disjuntor le como indisponibilidade e converte em revisao
+      # humana. O log de boot avisa, e o `:-` evita que a variavel ausente quebre o parse.
+      CREDIT_KYC_TOKEN: ${CREDIT_KYC_TOKEN:-}
     ports:
       # **8080 no host, e nao 8000.** Publicar em 8000 fazia o Prometheus raspar
       # o mesmo processo duas vezes: o alvo `api:8000` pela rede do compose e o
@@ -157,6 +193,9 @@ services:
       # Cache do modelo de embedding (2,24GB). Sem este volume, cada `up`
       # rebaixaria o modelo inteiro.
       - modelo_cache:/cache
+      # Chave publica de verificacao, somente leitura. A privada fica de fora: montar o
+      # diretorio inteiro daria ao container a capacidade de emitir token.
+      - ./.chaves/publica.pem:/chaves/publica.pem:ro
     depends_on:
       postgres:
         condition: service_healthy

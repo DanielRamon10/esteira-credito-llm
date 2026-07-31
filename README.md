@@ -56,6 +56,7 @@ banco, e trocar SQLite por Postgres sem tocar em caso de uso.
 | 4 | Agente LangGraph com ferramentas, teto de passos e trilha de auditoria | ✅ Concluída |
 | 5 | Observabilidade: métricas, tracing, dashboard e alertas | ✅ Concluída |
 | 6 | Dockerfile, Kubernetes, Terraform e CI/CD | ✅ Concluída |
+| 7 | Autenticação OAuth2/JWT com escopos por endpoint | ✅ Concluída |
 
 ## Rodando
 
@@ -65,6 +66,12 @@ banco, e trocar SQLite por Postgres sem tocar em caso de uso.
 winget install UB-Mannheim.TesseractOCR
 #    O pacote não traz o português; baixe por.traineddata do repositório
 #    tesseract-ocr/tessdata para C:\Program Files\Tesseract-OCR\tessdata\
+
+# 0b. Chaves de verificação de token. Um comando, sem conta em provedor nenhum.
+#     Autenticação NÃO tem modo desligado: sem isto os serviços recusam subir.
+python -m plataforma.emissor_local gerar-chaves
+export CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO=.chaves/publica.pem
+export CREDIT_AUTH_EMISSOR=https://local.esteira-credito.invalid
 
 # 1. Banco vetorial + observabilidade (Prometheus, Tempo, Grafana)
 docker compose up -d
@@ -542,6 +549,113 @@ não contém o CPF nem o nome enviados na requisição, e outro que uma varredur
 URL (`/wp-admin`, `/.env`) cai em `rota="desconhecida"` em vez de criar uma série
 por caminho tentado — sem isso, um scanner infla a memória do Prometheus de fora
 para dentro.
+
+## Autenticação
+
+Os três serviços são **resource servers**, nunca authorization servers. A
+distinção não é vocabulário: um serviço que emite o próprio token é a autoridade
+sobre quem ele mesmo deixa entrar, e comprometê-lo passa a ser comprometer a
+identidade. Não há `/oauth/token` em lugar nenhum do projeto.
+
+Para rodar sem conta em provedor, `plataforma.emissor_local` assina token com um
+par de chaves gerado na máquina. A garantia de que ele não vira emissor de
+produção é **estrutural, não um `if`**: a chave privada nunca entra no
+repositório (`.chaves/` no `.gitignore`), e sem ela o módulo não assina nada. O
+CI confirma que nenhum `services/*/src/` o importa.
+
+### Não existe modo desligado
+
+Não há `*_AUTH_HABILITADO`. Autenticação que se desliga por variável de ambiente
+é autenticação que **vai** estar desligada em algum ambiente, por um motivo
+temporário que ninguém reverteu, sem nada falhando para avisar. O `Settings`
+exige exatamente uma fonte de chave e recusa subir sem ela — a mensagem de erro
+traz os comandos exatos.
+
+É o mesmo raciocínio de `CREDIT_PROVEDOR_LLM=ollama` explícito: um serviço de
+crédito respondendo dado pessoal a quem não se identificou é pior que um serviço
+fora do ar.
+
+### Escopos, e por que a granularidade importa
+
+| serviço | escopos |
+|---|---|
+| `credit-analysis` | `analises:ler`, `analises:escrever`, `documentos:enviar`, `politicas:consultar`, `agente:consultar` |
+| `kyc-compliance` | `triagens:executar`, `triagens:ler` |
+| `customer-support` | `atendimentos:criar` |
+
+Cinco e não um `credito:tudo`: o canal que **cria** proposta não precisa poder
+ler proposta alheia. `documentos:enviar` é separado porque enviar documento é o
+único caminho pelo qual conteúdo não confiável entra — a superfície de OCR e de
+injeção.
+
+No KYC, `executar` e `ler` são separados porque os consumidores são diferentes:
+quem executa é a esteira, no meio de uma análise; quem lê é conformidade,
+respondendo auditoria. Dar leitura à esteira daria a ela a lista de quem foi
+triado — pessoas em situação sensível.
+
+O `customer-support` tem **um** escopo porque não há rota de leitura. Inventar
+`atendimentos:ler` seria pior que não ter: escopo que nenhuma rota exige aparece
+na documentação como capacidade existente.
+
+### O teste que importa não é nenhum caso específico
+
+`test_toda_rota_de_negocio_exige_credencial` enumera o OpenAPI e confirma 401 sem
+token, rota por rota, nos três serviços. É o modo de falha **real**: adicionar
+rota é rotina, lembrar do `dependencies=[...]` não é. Comportamental e não por
+introspecção — conferir a lista de dependências do `APIRoute` provaria que algo
+foi declarado, não que ele nega acesso. Verificado por mutação: removendo o
+escopo de uma rota, o teste acusa.
+
+A contrapartida pesa igual: `/health`, `/ready` e `/metrics` continuam abertas,
+com o motivo de cada uma escrito e teste garantindo. Sem isso, alguém "fechando
+tudo" poria token no `/health` e o pod entraria em laço de reinício na primeira
+configuração errada de auth — a defesa causando a indisponibilidade que deveria
+evitar.
+
+### Serviço para serviço: `client_credentials`, nunca repasse
+
+O token do `credit-analysis` tem `aud=credit-analysis` e **não pode ser
+repassado** ao KYC — seria exatamente a escalada lateral que a validação de
+audiência existe para impedir. Ele obtém credencial própria, com cache que renova
+60s antes do vencimento (margem maior que a folga de relógio de 30s da
+plataforma) e lock com dupla leitura, para que 20 chamadas concorrentes no boot
+não virem 20 requisições ao IdP.
+
+401 e 403 vindos do KYC são tratados como **permanentes**, não transitórios:
+retry com credencial inválida não muda o resultado, gastaria as tentativas e
+abriria o disjuntor — transformando erro de configuração em "KYC indisponível",
+diagnóstico errado que manda investigar rede em vez de token.
+
+### Três coisas que o teste de mutação corrigiu
+
+Mutei 8 propriedades do provedor de token e 6 do validador da plataforma. O que
+apareceu não foi bug no código — foi **teste que passava pelo motivo errado**:
+
+- **`ALGORITMOS = ("RS256",)` não é "a linha mais importante do módulo"**, como
+  eu havia escrito. Com `HS256` na lista os dois testes de ataque continuavam
+  verdes, porque o PyJWT recusa chave assimétrica como segredo HMAC do lado de
+  quem *verifica*. O que sustenta a defesa é a escolha de RS256 somada ao
+  `verify_signature` explícito; a lista fixa é defesa em profundidade. Medido:
+  com `verify_signature: False` o token de `alg: none` passa inteiro.
+- **O teste de concorrência não concorria.** `MockTransport` com handler sem I/O
+  resolve sem suspender, então a primeira corrotina populava o cache antes de a
+  segunda começar. Não havia intercalação para o lock evitar.
+- **O teste da margem usava a própria constante** (`3600 - MARGEM - 1`), logo era
+  insensível ao valor dela.
+
+E o próprio *relatório* de mutação estava errado antes disso: procurava
+`"N failed"` no stdout do pytest, mas o `addopts` do serviço já tem `-q` e o meu
+`-q` somava para `-qq`, que suprime a linha de resumo. Passou a detectar por
+código de saída.
+
+### Verificado em containers, não só na suíte
+
+```
+POST /v1/triagens      sem token                    401  + WWW-Authenticate
+POST /v1/triagens      token triagens:executar      201
+GET  /v1/triagens      mesmo token                  403
+POST /v1/triagens      token aud=customer-support   401
+```
 
 ## Segredos
 

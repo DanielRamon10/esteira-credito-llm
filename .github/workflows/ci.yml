@@ -409,6 +409,28 @@ jobs:
           pip install pyyaml
           python infra/k8s/verificar_politica.py
 
+      - name: Nenhum servico importa o emissor de token
+        # A promessa que `plataforma/emissor_local.py` faz no proprio cabecalho.
+        #
+        # Aquele modulo assina token, e a garantia de que ele nao vira emissor de producao e
+        # **estrutural**: a chave privada nunca entra no repositorio. Esta checagem e a segunda
+        # camada — codigo de aplicacao nao tem motivo para conhecer o emissor, e o dia em que
+        # tiver, alguem decidiu algo que precisa passar por revisao.
+        #
+        # Somente `src/`: as suites **precisam** dele para emitir token de teste.
+        #
+        # E somente linhas de **import**, com `--include="*.py"`. A primeira versao procurava a
+        # string solta e acusou os tres servicos — ela aparece em comentario e na mensagem de
+        # erro do validador de configuracao, que ensina o comando de gerar chaves. Terceira vez
+        # nesta sessao que um grep por texto produz falso positivo numa checagem de politica; a
+        # licao ja esta registrada em `infra/k8s/verificar_politica.py`.
+        run: |
+          if grep -rnE "^[[:space:]]*(from|import)[[:space:]].*emissor_local"                --include="*.py" services/*/src/; then
+            echo "::error::codigo de aplicacao importando o emissor de token"
+            exit 1
+          fi
+          echo "ok: emissor_local nao e importado por codigo de aplicacao"
+
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.13.5"

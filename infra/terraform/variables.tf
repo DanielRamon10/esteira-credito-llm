@@ -94,3 +94,45 @@ variable "dias_retencao_log" {
   type        = number
   default     = 30
 }
+
+variable "emissor_de_token" {
+  description = <<-TXT
+    `iss` esperado nos tokens. Os tres servicos validam contra este valor.
+
+    Um so para os tres, e nao um por servico: eles confiam no mesmo IdP corporativo. Valores
+    diferentes significariam emissores diferentes, o que e uma decisao de arquitetura e nao de
+    configuracao — e deveria aparecer como tal.
+  TXT
+  type        = string
+  default     = "https://idp.interno.invalid"
+}
+
+variable "jwks_url" {
+  description = <<-TXT
+    JWKS do IdP, usado pelos tres para verificar assinatura.
+
+    Preferido sobre PEM em variavel de ambiente por dois motivos: permite **rotacao de chave
+    sem redeploy** (o emissor publica a nova e os servicos a veem no proximo ciclo de cache), e
+    evita que o material de chave apareça num `describe-task-definition`.
+  TXT
+  type        = string
+  default     = "https://idp.interno.invalid/.well-known/jwks.json"
+}
+
+variable "token_url" {
+  description = "Endpoint de `client_credentials` do IdP, usado pelo credit-analysis para obter credencial ao chamar o KYC."
+  type        = string
+  default     = "https://idp.interno.invalid/oauth/token"
+}
+
+variable "kyc_client_id" {
+  description = <<-TXT
+    Client ID do `credit-analysis` no IdP, para o fluxo `client_credentials`.
+
+    Somente o ID vem por variavel; o **secret** entra por Secrets Manager, porque em variavel de
+    ambiente ele apareceria num `describe-task-definition` — e o secret e o que permite emitir
+    token em nome deste servico.
+  TXT
+  type        = string
+  default     = "credit-analysis"
+}

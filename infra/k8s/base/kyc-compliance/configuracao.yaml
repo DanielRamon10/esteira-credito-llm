@@ -39,5 +39,35 @@ data:
   # esse initContainer de falhar em silencio.
   KYC_DIRETORIO_LISTAS: "dados/listas"
 
+  # Autenticacao (Camada 7). Nao ha `KYC_AUTH_HABILITADO`: sem uma fonte de chave o
+  # servico recusa subir, e o rollout do Kubernetes mantem os pods antigos no ar — que e o
+  # comportamento certo diante de configuracao incompleta.
+  #
+  # O caminho aponta para o Secret montado no Deployment. Em producao com IdP, trocar por
+  # `KYC_AUTH_JWKS_URL` e remover o volume: JWKS permite rotacao sem tocar no manifest.
+  KYC_AUTH_CHAVE_PUBLICA_ARQUIVO: "/chaves/publica.pem"
+  KYC_AUTH_EMISSOR: "https://idp.interno.invalid"
+
   KYC_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
   KYC_TRACE_AMOSTRAGEM: "1.0"
+---
+# Chave publica de verificacao de token.
+#
+# **Secret e nao ConfigMap**, apesar de a chave ser publica. Duas razoes:
+#
+# - montagem como volume permite rotacao sem recriar o pod (o kubelet propaga a mudanca em
+#   segundos), enquanto variavel de ambiente e fixada na criacao do container;
+# - em producao este objeto e substituido pelo External Secrets Operator, que sincroniza do
+#   AWS Secrets Manager — e ele produz Secrets, nao ConfigMaps. Manter o tipo evita uma
+#   migracao no dia em que houver material sensivel aqui (uma chave de assinatura, por
+#   exemplo, se este servico algum dia emitir algo).
+#
+# Placeholder de **estrutura**, com valor vazio. O hook de pre-commit bloqueia PEM, o que
+# torna dificil preencher isto por acidente.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kyc-compliance-auth
+type: Opaque
+stringData:
+  publica.pem: ""

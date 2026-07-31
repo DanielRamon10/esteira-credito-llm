@@ -24,6 +24,7 @@ from plataforma import emissor_local
 
 from kyc_compliance.api import seguranca
 from kyc_compliance.api.app import criar_app
+from kyc_compliance.api.seguranca import montar_chaveiro
 from kyc_compliance.config import Ambiente, Settings
 from kyc_compliance.domain.triagem import EntradaRestritiva
 from kyc_compliance.infrastructure.listas import ListasEmMemoria
@@ -206,11 +207,50 @@ class TestConfiguracao:
             )
 
     def test_duas_fontes_de_chave_sao_recusadas(self, chave_publica_de_teste: str) -> None:
-        with pytest.raises(ValueError, match="mutuamente"):
+        with pytest.raises(ValueError, match=r"informe \*\*uma\*\* fonte"):
             Settings(
                 ambiente=Ambiente.LOCAL,
                 auth_chave_publica=chave_publica_de_teste,
                 auth_jwks_url="https://idp.invalid/jwks",
                 auth_emissor="x",
                 _env_file=None,  # type: ignore[call-arg]
+            )
+
+    def test_chave_por_arquivo_e_a_forma_usada_por_compose_e_k8s(
+        self, chaves_de_teste: Path
+    ) -> None:
+        """A terceira fonte, e ela existe por dois motivos concretos.
+
+        PEM em variavel de ambiente aparece inteiro num `kubectl describe pod` e num
+        `docker inspect`; e variavel de ambiente e fixada na criacao do container, enquanto um
+        Secret montado como volume o kubelet atualiza em segundos — ou seja, arquivo permite
+        rotacao sem recriar o pod, e variavel nao.
+        """
+        montar_chaveiro(
+            Settings(
+                # `auth_chave_publica=""` explicito: o conftest exporta a variavel de ambiente, e
+                # `_env_file=None` desliga o `.env` mas **nao** o ambiente. Sem zerar aqui haveria
+                # duas fontes, e o validador recusaria — o teste falharia pelo motivo errado.
+                auth_chave_publica="",
+                auth_chave_publica_arquivo=chaves_de_teste / "publica.pem",
+                auth_emissor="x",
+                _env_file=None,  # type: ignore[call-arg]
+            )
+        )
+
+    def test_arquivo_ausente_e_erro_de_subida_com_o_caminho(self, tmp_path: Path) -> None:
+        """`FileNotFoundError: publica.pem` num container nao diz se o volume nao foi montado
+        ou se o nome do arquivo esta errado. A mensagem traz o caminho resolvido."""
+        with pytest.raises(RuntimeError, match="chave publica ausente"):
+            montar_chaveiro(
+                Settings(
+                    # `auth_chave_publica=""` explicito: o conftest exporta a variavel de
+                    # ambiente, e `_env_file=None` desliga o `.env` mas **nao** o ambiente. Sem
+                    # zerar aqui, haveria duas fontes e o validador recusaria — o teste falharia
+                    # com a mensagem certa pelo motivo errado.
+                    auth_chave_publica="",
+                    auth_chave_publica_arquivo=tmp_path / "nao-existe.pem",
+                    auth_emissor="x",
+                    _env_file=None,  # type: ignore[call-arg]
+                )
             )
