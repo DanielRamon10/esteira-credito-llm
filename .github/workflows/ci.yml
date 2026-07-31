@@ -469,6 +469,22 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: A imagem recusa subir sem credencial
+        # O primeiro efeito da Camada 7 neste job foi **quebrar** o passo seguinte: sem fonte de
+        # chave configurada, o container morre no boot. Esse e o comportamento desejado — nao ha
+        # modo desligado —, e virou teste proprio em vez de detalhe de setup do outro passo.
+        #
+        # O que ele protege: alguem "consertando" o CI adicionando um `AUTH_HABILITADO=false`
+        # faria este passo passar a falhar, o que forca a discussao.
+        run: |
+          if docker run --rm -e CREDIT_PROVEDOR_LLM=fake credit-analysis:ci 2>&1 \
+               | grep -q "autenticacao exige uma fonte de chave"; then
+            echo "ok: sem chave, o servico recusa subir com a mensagem que ensina o comando"
+          else
+            echo "::error::a imagem subiu (ou falhou por outro motivo) sem fonte de chave"
+            exit 1
+          fi
+
       - name: Verificar que a imagem serve trafego
         # Build que passa e container que nao sobe e um resultado inutil. Este
         # passo exercita o que o Dockerfile promete: usuario sem privilegio,
@@ -480,7 +496,21 @@ jobs:
           docker run --rm --entrypoint tesseract credit-analysis:ci --list-langs | grep -q "^por$" \
             || { echo "::error::Tesseract sem o pacote de portugues"; exit 1; }
 
-          docker run -d --name api -p 8000:8000 -e CREDIT_PROVEDOR_LLM=fake credit-analysis:ci
+          # Chave de verificacao, gerada aqui. Montada como **arquivo**, igual ao compose e ao
+          # Kubernetes, e nao passada como PEM em variavel de ambiente: se o smoke test usasse
+          # o caminho que a documentacao desaconselha, seria ele o exemplo que alguem copiaria.
+          #
+          # Somente `publica.pem` e montado. Montar `.chaves/` inteiro daria ao container a
+          # chave privada, ou seja a capacidade de emitir token.
+          python -m pip install --quiet ./packages/plataforma[auth]
+          python -m plataforma.emissor_local gerar-chaves
+
+          docker run -d --name api -p 8000:8000 \
+            -e CREDIT_PROVEDOR_LLM=fake \
+            -e CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO=/chaves/publica.pem \
+            -e CREDIT_AUTH_EMISSOR=https://local.esteira-credito.invalid \
+            -v "$PWD/.chaves/publica.pem:/chaves/publica.pem:ro" \
+            credit-analysis:ci
           for _ in $(seq 1 60); do
             curl -fsS http://localhost:8000/health > /dev/null 2>&1 && break
             sleep 2
@@ -488,10 +518,22 @@ jobs:
           curl -fsS http://localhost:8000/health | grep -q '"status":"ok"' \
             || { echo "::error::/health nao respondeu ok"; docker logs api; exit 1; }
 
+          # `/v1/analises` sem token: 401, e nao 500. Confirma na imagem real o que a suite
+          # afirma em processo — que a borda de autenticacao esta instalada e que a ausencia de
+          # credencial nao chega a codigo que nao a espera.
+          codigo=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/v1/analises \
+            -H 'Content-Type: application/json' -d '{}')
+          [ "$codigo" = "401" ] \
+            || { echo "::error::sem token o servico devolveu $codigo, esperado 401"; docker logs api; exit 1; }
+
+          TOKEN=$(python -m plataforma.emissor_local token \
+            --audiencia credit-analysis --escopos "analises:escrever analises:ler")
+
           # Uma analise de verdade: se o dominio quebrou, o health check nao
           # perceberia.
           curl -fsS -X POST http://localhost:8000/v1/analises \
             -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $TOKEN" \
             -d '{"solicitante":{"nome":"Ana Souza","cpf":"529.982.247-25","data_nascimento":"1990-05-14T00:00:00Z","renda_mensal_declarada":"8500.00"},"proposta":{"valor_solicitado":"45000.00","prazo_meses":36,"taxa_juros_mensal":"1.99"}}' \
             | grep -q '"score"' \
             || { echo "::error::a esteira nao produziu parecer"; docker logs api; exit 1; }
