@@ -33,14 +33,20 @@ from credit_analysis.api.routers import metricas as rota_metricas
 from credit_analysis.api.seguranca import montar_chaveiro
 from credit_analysis.application.ports import (
     AgenteCredito,
+    ArmazenamentoDocumentos,
     ConsultaBureau,
     ConsultaKYC,
+    FilaDeTrabalho,
     ModeloLinguagem,
     MotorOCR,
     RepositorioAnalises,
 )
 from credit_analysis.config import ProvedorLLM, Settings, get_settings
 from credit_analysis.infrastructure.agente.grafo import AgenteLangGraph
+from credit_analysis.infrastructure.armazenamento.memoria import (
+    ArmazenamentoEmMemoria,
+    FilaEmMemoria,
+)
 from credit_analysis.infrastructure.bureau import BureauStub
 from credit_analysis.infrastructure.kyc import ClienteKYCHttp
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
@@ -78,6 +84,8 @@ def criar_app(
     motor_ocr: MotorOCR | None = None,
     agente: AgenteCredito | None = None,
     kyc: ConsultaKYC | None = None,
+    armazenamento: ArmazenamentoDocumentos | None = None,
+    fila: FilaDeTrabalho | None = None,
 ) -> FastAPI:
     """Monta a aplicacao. Adapters omitidos caem no default de desenvolvimento."""
     settings = settings or get_settings()
@@ -185,6 +193,8 @@ def criar_app(
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)
     app.state.llm = llm or _montar_llm(settings)
     app.state.agente = agente  # montado no lifespan quando nao injetado
+    app.state.armazenamento = armazenamento or ArmazenamentoEmMemoria()
+    app.state.fila = fila or FilaEmMemoria()
     app.state.kyc = kyc or _montar_kyc(settings)
 
     @app.middleware("http")
@@ -234,6 +244,8 @@ def criar_app(
     app.include_router(analises.router, prefix=settings.prefixo_api)
     app.include_router(politicas.router, prefix=settings.prefixo_api)
     app.include_router(documentos.router, prefix=settings.prefixo_api)
+    # Router separado: a consulta vive em `/documentos/{id}`, fora do prefixo `/analises`.
+    app.include_router(documentos.consulta, prefix=settings.prefixo_api)
     app.include_router(rota_agente.router, prefix=settings.prefixo_api)
 
     # Depois dos routers: o instrumentador percorre as rotas registradas para

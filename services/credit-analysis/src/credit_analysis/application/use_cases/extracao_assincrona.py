@@ -41,8 +41,8 @@ terminal e carrega o motivo.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
+from typing import IO
 from uuid import UUID
 
 import structlog
@@ -78,10 +78,21 @@ PREFIXO_CHAVE = "documentos"
 
 @dataclass(frozen=True, slots=True)
 class ComandoReceberDocumento:
+    """Entrada da recepcao.
+
+    `conteudo` e um stream e `conteudo_hash` vem pronto, calculado por quem leu o upload. As
+    duas coisas andam juntas: com stream, calcular o hash aqui exigiria ler tudo (perdendo o
+    ganho) ou ler duas vezes (rebobinando um objeto que pode nao ser rebobinavel).
+
+    Quem grava o upload ja passa por cada byte uma vez — e o lugar natural para o hash.
+    """
+
     analise_id: UUID
     tipo: TipoDocumento
     nome_arquivo: str
-    conteudo: bytes
+    conteudo: IO[bytes]
+    conteudo_hash: str
+    tamanho_bytes: int
     tipo_mime: str
     request_id: str = ""
 
@@ -139,7 +150,7 @@ class ReceberDocumento:
         if analise is None:
             raise AnaliseNaoEncontrada(f"Analise {comando.analise_id} nao encontrada")
 
-        if not comando.conteudo:
+        if comando.tamanho_bytes == 0:
             # Antes do armazenamento: gravar zero byte e enfileirar produziria uma falha de
             # extracao para algo que a borda podia recusar de imediato.
             raise ValorInvalido("Arquivo vazio")
@@ -148,13 +159,13 @@ class ReceberDocumento:
             analise_id=str(comando.analise_id),
             tipo_documento=comando.tipo.value,
             arquivo=comando.nome_arquivo,
-            bytes=len(comando.conteudo),
+            bytes=comando.tamanho_bytes,
         )
 
         documento = DocumentoSubmetido(
             tipo=comando.tipo,
             nome_arquivo=comando.nome_arquivo,
-            conteudo_hash=hashlib.sha256(comando.conteudo).hexdigest(),
+            conteudo_hash=comando.conteudo_hash,
         )
 
         # A chave inclui o id do documento, nao apenas o da analise: dois documentos do mesmo

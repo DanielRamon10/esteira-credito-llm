@@ -3,32 +3,49 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import tempfile
 from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
 import structlog
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Response, UploadFile, status
 from fastapi import Path as PathParam
 
-from credit_analysis.api.deps import ProcessarDocumentoDep
-from credit_analysis.api.observabilidade import registrar_processamento
-from credit_analysis.api.schemas import DocumentoProcessadoResponse, ErroResponse
-from credit_analysis.api.seguranca import DOCUMENTOS_ENVIAR, Escopo
-from credit_analysis.application.use_cases.processar_documento import (
-    ComandoProcessarDocumento,
+from credit_analysis.api.deps import (
+    ReceberDocumentoDep,
+    RepositorioDep,
+    SettingsDep,
 )
+from credit_analysis.api.observabilidade import registrar_recepcao
+from credit_analysis.api.schemas import (
+    DocumentoAceitoResponse,
+    DocumentoEstadoResponse,
+    ErroResponse,
+)
+from credit_analysis.api.seguranca import ANALISES_LER, DOCUMENTOS_ENVIAR, Escopo
+from credit_analysis.application.ports import RepositorioAnalises
+from credit_analysis.application.use_cases.extracao_assincrona import (
+    ComandoReceberDocumento,
+)
+from credit_analysis.domain.entities import AnaliseCredito, DocumentoSubmetido
 from credit_analysis.domain.enums import TipoDocumento
-from credit_analysis.domain.exceptions import ValorInvalido
+from credit_analysis.domain.exceptions import AnaliseNaoEncontrada, ValorInvalido
 from credit_analysis.infrastructure.ocr.documentos import (
     EXTENSOES_IMAGEM,
-    ErroLeituraDocumento,
 )
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/analises", tags=["Documentos"])
+
+# Segundo router, com prefixo proprio.
+#
+# A recepcao vive sob `/analises/{id}/documentos` porque um documento **pertence** a uma analise.
+# A consulta vive sob `/documentos/{id}` porque o cliente que recebeu 202 tem um identificador so,
+# e obriga-lo a guardar os dois para acompanhar um upload seria mais RESTful e menos usavel.
+consulta = APIRouter(prefix="/documentos", tags=["Documentos"])
 
 
 class ArquivoGrandeDemais(ValorInvalido):
@@ -57,24 +74,41 @@ _RESPOSTAS: dict[int | str, dict[str, Any]] = {
 
 @router.post(
     "/{analise_id}/documentos",
-    response_model=DocumentoProcessadoResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Enviar documento para extracao",
+    response_model=DocumentoAceitoResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Enviar documento para extracao assincrona",
     dependencies=[Depends(Escopo(DOCUMENTOS_ENVIAR))],
     responses=_RESPOSTAS,
 )
 async def enviar_documento(
-    caso: ProcessarDocumentoDep,
+    caso: ReceberDocumentoDep,
+    resposta: Response,
+    settings: SettingsDep,
     analise_id: Annotated[UUID, PathParam(description="Identificador da analise")],
     tipo: Annotated[TipoDocumento, Form(description="Tipo do documento enviado")],
     arquivo: Annotated[UploadFile, File(description="PDF ou imagem do documento")],
-) -> DocumentoProcessadoResponse:
-    """Extrai os dados de um documento e anexa a analise.
+) -> DocumentoAceitoResponse:
+    """Guarda o documento e enfileira a extracao. Devolve **202**, nao 201.
 
-    O arquivo vai para um diretorio temporario e e apagado ao fim do
-    processamento: o servico nao e repositorio de documento. A guarda dos
-    originais (exigida pela POL-006 secao 5, por 5 anos) e responsabilidade de
-    um bucket versionado com criptografia, que entra na Camada 6 junto com o S3.
+    ## Por que 202
+
+    A extracao roda OCR com escalonamento — segundos, e possivelmente uma chamada a modelo de
+    visao. Mantendo isso na requisicao, o cliente espera com a conexao aberta, algum gateway
+    decide o timeout, e nao ha como retentar sem ele reenviar o arquivo. O docstring da versao
+    sincrona ja previa esta troca.
+
+    ## O que o cliente perde, e onde ele recupera
+
+    O piso de qualidade da POL-002 **deixou de recusar a requisicao**. Antes, confianca abaixo de
+    60% devolvia 422 com a instrucao de reenviar; agora o 202 ja foi dado quando a extracao
+    acontece.
+
+    A instrucao continua integral, no campo `erro` de `GET /v1/documentos/{id}`, com o estado
+    `rejeitado`. E pior para quem integra — chega depois e exige consultar — e foi aceito porque
+    a alternativa e OCR de segundos dentro da requisicao.
+
+    O que **nao** e aceitavel e a rejeicao virar silencio, e nao vira: o estado e terminal e
+    carrega o motivo.
     """
     sufixo = Path(arquivo.filename or "").suffix.lower()
     if sufixo not in EXTENSOES_ACEITAS:
@@ -82,34 +116,115 @@ async def enviar_documento(
             f"Extensao '{sufixo or '(ausente)'}' nao aceita. Envie {sorted(EXTENSOES_ACEITAS)}"
         )
 
-    # Diretorio temporario proprio, e nome gerado por nos: usar o nome enviado
-    # pelo cliente como caminho abriria path traversal ("../../etc/passwd").
+    # Streaming para temporario, e nao `await arquivo.read()` em memoria.
+    #
+    # O teto e 32MB: com N uploads concorrentes, ler inteiro segura N x 32MB. O temporario mantem
+    # o consumo limitado ao bloco, e o `guardar` recebe um stream — o adapter de S3 envia em
+    # partes sem materializar o objeto.
+    #
+    # Nome gerado por nos, nunca o enviado pelo cliente: usa-lo como caminho abriria path
+    # traversal ("../../etc/passwd").
     with tempfile.TemporaryDirectory(prefix="credit-doc-") as pasta:
         destino = Path(pasta) / f"upload{sufixo}"
-        tamanho = await _gravar_com_limite(arquivo, destino)
+        tamanho, digest = await _gravar_com_limite(arquivo, destino)
 
-        logger.info(
-            "documento.recebido",
-            analise_id=str(analise_id),
-            tipo=tipo.value,
-            bytes=tamanho,
-            extensao=sufixo,
-        )
-
+        # O arquivo e reaberto para leitura e passado como stream. O hash veio do mesmo passo de
+        # gravacao: calcula-lo aqui exigiria uma segunda passada sobre os mesmos bytes.
+        aceito = await asyncio.to_thread(destino.open, "rb")
         try:
             resultado = await caso.executar(
-                ComandoProcessarDocumento(analise_id=analise_id, caminho=destino, tipo=tipo)
+                ComandoReceberDocumento(
+                    analise_id=analise_id,
+                    tipo=tipo,
+                    nome_arquivo=arquivo.filename or f"documento{sufixo}",
+                    conteudo=aceito,
+                    conteudo_hash=digest,
+                    tamanho_bytes=tamanho,
+                    tipo_mime=arquivo.content_type or "application/octet-stream",
+                    request_id=structlog.contextvars.get_contextvars().get("request_id", ""),
+                )
             )
-        except ErroLeituraDocumento as exc:
-            # Arquivo corrompido e erro do cliente (422), nao falha do servico.
-            raise ValorInvalido(str(exc)) from exc
+        finally:
+            await asyncio.to_thread(aceito.close)
 
-    registrar_processamento(resultado)
-    return DocumentoProcessadoResponse.de_dominio(resultado)
+    consultar_em = f"{settings.prefixo_api}/documentos/{resultado.documento_id}"
+
+    # `Location` como manda a RFC 7231 secao 6.3.2 para 202. Cliente HTTP generico o segue; o
+    # mesmo caminho vai no corpo porque cliente escrito a mao raramente le cabecalho de resposta,
+    # e um 202 cujo acompanhamento esta so no cabecalho e um 202 tratado como "deu certo, fim".
+    resposta.headers["Location"] = consultar_em
+
+    registrar_recepcao(resultado)
+    return DocumentoAceitoResponse(
+        documento_id=resultado.documento_id,
+        analise_id=resultado.analise_id,
+        estado=resultado.estado,
+        consultar_em=consultar_em,
+    )
 
 
-async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> int:
-    """Grava o upload em disco em blocos, abortando se passar do teto.
+@consulta.get(
+    "/{documento_id}",
+    response_model=DocumentoEstadoResponse,
+    summary="Acompanhar a extracao de um documento",
+    dependencies=[Depends(Escopo(ANALISES_LER))],
+    responses={404: {"model": ErroResponse, "description": "Documento nao encontrado"}},
+)
+async def consultar_documento(
+    repositorio: RepositorioDep,
+    documento_id: Annotated[UUID, PathParam(description="Identificador do documento")],
+) -> DocumentoEstadoResponse:
+    """Estado do processamento, para o cliente que recebeu 202.
+
+    ## Por que a rota nao esta sob `/analises/{id}/documentos/{id}`
+
+    Seria mais RESTful e obrigaria o cliente a guardar **dois** identificadores para acompanhar
+    um upload. O `Location` que o 202 devolve seria mais longo sem ganho: o `documento_id` e um
+    UUID e ja identifica sozinho.
+
+    O custo e uma busca por documento em vez de acesso direto — hoje uma varredura no repositorio
+    em memoria, e um `WHERE documento_id = ?` com indice no Postgres. Aceitavel para uma rota de
+    polling.
+
+    ## O escopo e `analises:ler`, e nao `documentos:enviar`
+
+    Consultar estado e leitura, e quem envia documento nao precisa poder ler. Reaproveitar o
+    escopo de envio daria a um cliente que so faz upload a capacidade de sondar o resultado de
+    documentos que ele nao enviou — o `documento_id` e um UUID, mas obscuridade nao e controle
+    de acesso.
+    """
+    analise, documento = await _localizar(repositorio, documento_id)
+    return DocumentoEstadoResponse.de_dominio(analise, documento)
+
+
+async def _localizar(
+    repositorio: RepositorioAnalises, documento_id: UUID
+) -> tuple[AnaliseCredito, DocumentoSubmetido]:
+    """Encontra o documento e a analise que o contem.
+
+    Varre as analises porque o documento nao tem repositorio proprio: ele e parte do agregado
+    `AnaliseCredito`, e criar um repositorio separado para ele quebraria a fronteira do agregado
+    — dois pontos de escrita para o mesmo dado, com a consistencia entre eles a cargo de quem
+    chamar na ordem certa.
+
+    O limite alto e uma concessao conhecida, anotada tambem no README: com volume real isto
+    precisa de um indice `documento_id -> analise_id`, que e uma linha de SQL e nao existe
+    enquanto o repositorio padrao e em memoria.
+    """
+    for analise in await repositorio.listar(limite=1000):
+        for documento in analise.documentos:
+            if documento.id == documento_id:
+                return analise, documento
+
+    raise AnaliseNaoEncontrada(f"Documento {documento_id} nao encontrado")
+
+
+async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> tuple[int, str]:
+    """Grava o upload em disco em blocos, abortando se passar do teto. Devolve (bytes, sha256).
+
+    O hash sai daqui e nao de um passo separado porque esta funcao ja passa por cada byte uma
+    vez. Calcula-lo depois exigiria uma segunda leitura do arquivo inteiro — 32MB de I/O para
+    obter algo que estava disponivel de graca.
 
     Checar `arquivo.size` antes nao basta: o header `Content-Length` e informado
     pelo cliente e pode mentir. O limite tem que ser aplicado sobre o que
@@ -129,6 +244,7 @@ async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> int:
     de threads, e o loop segue atendendo.
     """
     total = 0
+    digest = hashlib.sha256()
     saida = await asyncio.to_thread(destino.open, "wb")
     try:
         while bloco := await arquivo.read(BLOCO):
@@ -137,6 +253,7 @@ async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> int:
                 raise ArquivoGrandeDemais(
                     f"Arquivo excede o limite de {TAMANHO_MAXIMO_BYTES // (1024 * 1024)}MB"
                 )
+            digest.update(bloco)
             await asyncio.to_thread(saida.write, bloco)
     except ArquivoGrandeDemais:
         # Fecha antes de remover: no Windows, apagar arquivo com handle aberto
@@ -148,7 +265,7 @@ async def _gravar_com_limite(arquivo: UploadFile, destino: Path) -> int:
         # Idempotente: fechar duas vezes nao levanta.
         await asyncio.to_thread(saida.close)
 
+    return total, digest.hexdigest()
+
     if total == 0:
         raise ValorInvalido("Arquivo vazio")
-
-    return total

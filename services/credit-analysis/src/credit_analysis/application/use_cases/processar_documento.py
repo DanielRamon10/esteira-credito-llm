@@ -1,9 +1,17 @@
-"""Caso de uso: processar um documento submetido e reavaliar a analise.
+"""Caso de uso: aplicar uma extracao a analise e reavaliar o score.
 
-Orquestra o pipeline da Camada 3 — ler arquivo, OCR com escalonamento, extrair
-campos, anexar a analise, reavaliar o score com a renda comprovada — sem
-implementar nenhuma dessas etapas. Cada uma vive atras de um port ou de um
-modulo de infraestrutura.
+Orquestra a terceira metade do fluxo de documento — envelope de injecao, piso de qualidade,
+interpretacao dos campos, reavaliacao com a renda comprovada — sem implementar nenhuma dessas
+etapas. Cada uma vive atras de um port ou de um modulo de infraestrutura.
+
+## O que a Camada 8 mudou aqui
+
+Esta classe fazia o fluxo inteiro: lia o arquivo do disco, rodava OCR, aplicava. As duas
+primeiras partes sairam para `extracao_assincrona.py`, porque o OCR precisava poder rodar fora
+da requisicao HTTP.
+
+O que sobrou e a parte que **precisa do dominio de credito**: repositorio, bureau e motor de
+score. E por isso que ela nao cabe numa Lambda, e por isso que a fronteira foi desenhada aqui.
 
 Duas decisoes de seguranca ficam visiveis aqui:
 
@@ -28,8 +36,7 @@ from plataforma.seguranca import (
     preparar_conteudo_nao_confiavel,
 )
 
-from credit_analysis.application.ports import ConsultaBureau, MotorOCR, RepositorioAnalises
-from credit_analysis.application.use_cases.extracao_assincrona import obter_texto
+from credit_analysis.application.ports import ConsultaBureau, RepositorioAnalises
 from credit_analysis.domain import scoring
 from credit_analysis.domain.documento import (
     ExtracaoHolerite,
@@ -44,19 +51,27 @@ from credit_analysis.domain.exceptions import (
 )
 from credit_analysis.domain.extrato import ResumoExtrato, Transacao, analisar_extrato
 from credit_analysis.domain.value_objects import Dinheiro
-from credit_analysis.infrastructure.ocr import documentos as leitor
 from credit_analysis.infrastructure.ocr.extracao import extrair_holerite, extrair_transacoes
 
 logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class ComandoProcessarDocumento:
-    """Entrada do caso de uso."""
+class ComandoAplicarExtracao:
+    """Entrada do caso de uso.
+
+    Recebe `documento_id` e nao `tipo`: o documento **ja esta anexado** a analise desde a
+    recepcao, com tipo, nome e hash. Passar o tipo de novo abriria a possibilidade de ele
+    divergir do que foi gravado, e a interpretacao (holerite ou extrato) usaria o valor errado.
+
+    O `ocr` vem pronto. Este caso de uso nao tem motor de OCR entre as dependencias — o que
+    garante, estruturalmente, que ele nao volte a rodar reconhecimento por descuido.
+    """
 
     analise_id: UUID
-    caminho: Path
-    tipo: TipoDocumento
+    documento_id: UUID
+    ocr: ResultadoOCR
+    paginas_ignoradas: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +86,16 @@ class ResultadoProcessamento:
     transacoes_rejeitadas: int = 0
     conteudo: ConteudoSanitizado | None = None
     paginas_ignoradas: int = 0
+
+    # True quando a extracao chegou para um documento ja em estado terminal, ou seja quando a
+    # mensagem foi reentregue depois de o trabalho ter sido concluido.
+    #
+    # Campo explicito porque o trabalhador tentou inferir isso de `entrega.tentativas > 1` e
+    # estava **errado**: aquilo indica retentativa (a primeira falhou de forma transitoria), nao
+    # reaplicacao. Com a inferencia, toda retentativa bem-sucedida seria contada como
+    # `ja_aplicada`, e a metrica que serve para detectar trabalhador morrendo antes de confirmar
+    # passaria a medir outra coisa.
+    reaplicacao: bool = False
 
     @property
     def renda_comprovada(self) -> Dinheiro | None:
@@ -97,94 +122,123 @@ class ResultadoProcessamento:
         return self.renda_comprovada is None
 
 
-class ProcessarDocumento:
-    """Le, extrai e anexa um documento a uma analise existente."""
+class AplicarExtracao:
+    """Aplica o resultado de uma extracao ao documento ja anexado, e reavalia.
+
+    **Sem `motor_ocr` entre as dependencias**, e a ausencia e uma garantia: este caso de uso nao
+    tem como rodar reconhecimento, nem por descuido numa alteracao futura. O OCR ja aconteceu.
+    """
 
     def __init__(
         self,
         repositorio: RepositorioAnalises,
-        motor_ocr: MotorOCR,
         bureau: ConsultaBureau,
     ) -> None:
         self._repositorio = repositorio
-        self._motor = motor_ocr
         self._bureau = bureau
 
-    async def executar(self, comando: ComandoProcessarDocumento) -> ResultadoProcessamento:
+    async def executar(self, comando: ComandoAplicarExtracao) -> ResultadoProcessamento:
         analise = await self._repositorio.buscar_por_id(comando.analise_id)
         if analise is None:
             raise AnaliseNaoEncontrada(f"Analise {comando.analise_id} nao encontrada")
 
+        documento = next((d for d in analise.documentos if d.id == comando.documento_id), None)
+        if documento is None:
+            # Nao deveria acontecer: a recepcao anexa antes de enfileirar. Se acontecer, e erro
+            # **permanente** — retentar nao faz o documento aparecer —, e por isso levanta em vez
+            # de devolver a mensagem para a fila.
+            raise AnaliseNaoEncontrada(
+                f"Documento {comando.documento_id} nao esta na analise {comando.analise_id}"
+            )
+
         log = logger.bind(
             analise_id=str(comando.analise_id),
-            tipo_documento=comando.tipo.value,
-            arquivo=comando.caminho.name,
+            documento_id=str(comando.documento_id),
+            tipo_documento=documento.tipo.value,
+            arquivo=documento.nome_arquivo,
         )
 
-        carregado = leitor.carregar(comando.caminho)
-        ocr = await self._obter_texto(carregado)
-
-        # Envelopa e inspeciona antes de qualquer coisa tocar o texto: se ha
-        # tentativa de injecao, ela deve estar registrada mesmo que o
-        # processamento falhe adiante.
-        conteudo = preparar_conteudo_nao_confiavel(
-            ocr.texto,
-            contexto={"analise_id": str(comando.analise_id), "arquivo": comando.caminho.name},
-        )
-
-        documento = DocumentoSubmetido(
-            tipo=comando.tipo,
-            nome_arquivo=comando.caminho.name,
-            conteudo_hash=_hash_arquivo(comando.caminho),
-        )
-        # Transicao explicita em vez de `texto_extraido=` no construtor.
+        # ## Idempotencia, e ela mora aqui e nao na fila
         #
-        # Desde a Camada 8, `estado` e a fonte de verdade de `processado`, e atribuir o texto
-        # sozinho deixaria o documento como `recebido` com texto dentro — um estado que nao
-        # existe no fluxo. Chamar a transicao mantem os tres campos coerentes num lugar so.
-        documento.concluir_extracao(ocr.texto, ocr.confianca)
+        # Entrega de mensagem e *at-least-once*: SQS reentrega, evento de S3 duplica, e o
+        # trabalhador pode morrer entre aplicar e confirmar. A defesa nao e evitar a reentrega —
+        # e nao ter efeito na segunda vez.
+        #
+        # Sem esta guarda, reaplicar uma extracao rodaria `reabrir_para_reavaliacao` e
+        # incrementaria o contador de reavaliacoes por um evento que nao aconteceu, poluindo a
+        # trilha de auditoria com reabertura que ninguem pediu.
+        if documento.estado.terminal:
+            log.info("extracao.ja_aplicada", estado=documento.estado.value)
+            return self._resultado_de(analise, documento, comando, reaplicacao=True)
 
-        if ocr.qualidade is QualidadeExtracao.REJEITADA:
-            log.warning(
-                "documento.rejeitado",
-                confianca=float(ocr.confianca.valor),
-                motor=ocr.motor,
-            )
-            raise DadosInsuficientes(
-                f"Qualidade da extracao insuficiente ({ocr.confianca}). "
+        documento.marcar_extraindo()
+
+        # Envelopa e inspeciona antes de qualquer coisa tocar o texto: se ha tentativa de
+        # injecao, ela deve estar registrada mesmo que o processamento falhe adiante.
+        conteudo = preparar_conteudo_nao_confiavel(
+            comando.ocr.texto,
+            contexto={
+                "analise_id": str(comando.analise_id),
+                "arquivo": documento.nome_arquivo,
+            },
+        )
+
+        if comando.ocr.qualidade is QualidadeExtracao.REJEITADA:
+            # ## A rejeicao virou estado, e nao mais excecao
+            #
+            # Antes da Camada 8 isto levantava `DadosInsuficientes` e o cliente recebia 422 com a
+            # instrucao de reenviar. Agora ele ja recebeu 202, e nao ha requisicao para recusar.
+            #
+            # A instrucao continua integral, no campo `erro` do documento, e o `GET` a devolve. O
+            # que **nao** pode acontecer e a rejeicao virar silencio: o estado e terminal e
+            # carrega o motivo, e o documento nao entra no parecer.
+            motivo = (
+                f"Qualidade da extracao insuficiente ({comando.ocr.confianca}). "
                 f"Reenvie o documento com resolucao minima de 200 DPI, bordas "
                 f"visiveis e sem corte de campos numericos (POL-002 secao 3.2)."
             )
+            documento.rejeitar_por_qualidade(motivo, comando.ocr.confianca)
+            await self._repositorio.salvar(analise)
 
-        # Analise ja avaliada precisa ser reaberta antes de receber documento:
-        # o parecer nao pode ficar descolado da evidencia que o sustenta.
-        if analise.status is StatusAnalise.CONCLUIDA:
-            analise.reabrir_para_reavaliacao(
-                f"documento {comando.tipo.value} apresentado pelo solicitante"
+            log.warning(
+                "documento.rejeitado",
+                confianca=float(comando.ocr.confianca.valor),
+                motor=comando.ocr.motor,
             )
-            log.info("analise.reaberta", reavaliacoes=analise.reavaliacoes)
+            return self._resultado_de(analise, documento, comando, conteudo=conteudo)
 
-        # O documento so e anexado depois de passar no piso de qualidade: a
-        # analise nao deve carregar documento que a politica manda reenviar.
-        analise.anexar_documento(documento)
-
-        extracao, resumo, rejeitadas = self._interpretar(comando.tipo, ocr)
-        self._registrar_dados(analise, documento, extracao, resumo, ocr)
+        extracao, resumo, rejeitadas = self._interpretar(documento.tipo, comando.ocr)
+        self._registrar_dados(analise, documento, extracao, resumo, comando.ocr)
 
         resultado = ResultadoProcessamento(
             analise=analise,
             documento=documento,
-            ocr=ocr,
+            ocr=comando.ocr,
             extracao_holerite=extracao,
             resumo_extrato=resumo,
             transacoes_rejeitadas=len(rejeitadas),
             conteudo=conteudo,
-            paginas_ignoradas=carregado.paginas_truncadas,
+            paginas_ignoradas=comando.paginas_ignoradas,
+            # `reaplicacao` fica no default (False): este e o caminho que **fez** o trabalho. A
+            # reaplicacao sai por `_resultado_de`, na guarda de estado terminal la em cima.
         )
 
-        # Reavalia com a renda comprovada. E o ponto do documento existir: sem
-        # isto a extracao viraria metadado decorativo e o score continuaria
-        # baseado no valor declarado pelo proprio solicitante.
+        # A conclusao vem **depois** de montar o resultado, e nao antes: `exige_revisao_humana` e
+        # propriedade dele (combina qualidade, injecao e ausencia de renda), e gravar antes
+        # obrigaria a recalcular a mesma regra em dois lugares.
+        documento.concluir_extracao(
+            comando.ocr.texto,
+            comando.ocr.confianca,
+            injecao_suspeita=conteudo.suspeito,
+            categorias_injecao=tuple(conteudo.categorias),
+            motor_ocr=comando.ocr.motor,
+            exige_revisao_humana=resultado.exige_revisao_humana,
+            renda_comprovada=resultado.renda_comprovada,
+        )
+
+        # Reavalia com a renda comprovada. E o ponto do documento existir: sem isto a extracao
+        # viraria metadado decorativo e o score continuaria baseado no valor declarado pelo
+        # proprio solicitante.
         parecer_anterior = analise.parecer
         await self._reavaliar(analise, resultado)
 
@@ -201,14 +255,38 @@ class ProcessarDocumento:
 
         log.info(
             "documento.processado",
-            motor=ocr.motor,
-            confianca=float(ocr.confianca.valor),
-            qualidade=ocr.qualidade.value,
+            motor=comando.ocr.motor,
+            confianca=float(comando.ocr.confianca.valor),
+            qualidade=comando.ocr.qualidade.value,
             renda_apurada=str(resultado.renda_comprovada) if resultado.renda_comprovada else None,
             revisao_humana=resultado.exige_revisao_humana,
             injecao_suspeita=conteudo.suspeito,
         )
         return resultado
+
+    def _resultado_de(
+        self,
+        analise: AnaliseCredito,
+        documento: DocumentoSubmetido,
+        comando: ComandoAplicarExtracao,
+        conteudo: ConteudoSanitizado | None = None,
+        reaplicacao: bool = False,
+    ) -> ResultadoProcessamento:
+        """Resultado sem interpretacao, para os caminhos que nao chegam a reavaliar.
+
+        Usado pela reaplicacao (estado terminal) e pela rejeicao por qualidade. Nos dois casos o
+        chamador precisa de um objeto de resposta, e nos dois casos interpretar os campos seria
+        trabalho jogado fora — na reaplicacao porque ja foi feito, na rejeicao porque o
+        documento nao entra no parecer.
+        """
+        return ResultadoProcessamento(
+            analise=analise,
+            documento=documento,
+            ocr=comando.ocr,
+            conteudo=conteudo,
+            paginas_ignoradas=comando.paginas_ignoradas,
+            reaplicacao=reaplicacao,
+        )
 
     async def _reavaliar(self, analise: AnaliseCredito, resultado: ResultadoProcessamento) -> None:
         """Recalcula o score com a renda comprovada e conclui a analise.
@@ -247,15 +325,6 @@ class ProcessarDocumento:
             parecer = replace(parecer, decisao=Decisao.ANALISE_MANUAL)
 
         analise.concluir(parecer)
-
-    async def _obter_texto(self, carregado: leitor.DocumentoCarregado) -> ResultadoOCR:
-        """Delega para a funcao compartilhada com o fluxo assincrono.
-
-        A implementacao saiu daqui na Camada 8: a extracao que roda como Lambda precisa da
-        mesma decisao — camada de texto quando existe, OCR quando nao — e duas copias
-        divergiriam no primeiro ajuste de confianca.
-        """
-        return await obter_texto(carregado, self._motor)
 
     def _interpretar(
         self, tipo: TipoDocumento, ocr: ResultadoOCR

@@ -19,9 +19,23 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from credit_analysis.application.use_cases.processar_documento import ResultadoProcessamento
 from credit_analysis.domain.agente import PassoAgente, TrilhaAgente
+from credit_analysis.domain.armazenamento import EstadoDocumento
 from credit_analysis.domain.documento import CampoExtraido, QualidadeExtracao
-from credit_analysis.domain.entities import AnaliseCredito, Parecer, PropostaCredito, Solicitante
-from credit_analysis.domain.enums import Decisao, NivelRisco, StatusAnalise, TipoDocumento
+from credit_analysis.domain.entities import (
+    AnaliseCredito,
+    DadoExtraido,
+    DocumentoSubmetido,
+    Parecer,
+    PropostaCredito,
+    Solicitante,
+)
+from credit_analysis.domain.enums import (
+    Decisao,
+    NivelRisco,
+    OrigemDado,
+    StatusAnalise,
+    TipoDocumento,
+)
 from credit_analysis.domain.exceptions import ValorInvalido
 from credit_analysis.domain.extrato import ResumoExtrato
 from credit_analysis.domain.politica import Citacao, Fundamentacao, TrechoRecuperado
@@ -491,3 +505,145 @@ class HealthResponse(BaseModel):
     servico: str
     versao: str
     ambiente: str
+
+
+class DadoExtraidoResponse(BaseModel):
+    """Um dado com procedencia, como o dominio o guarda.
+
+    `origem` e `confianca` viajam junto do valor de proposito: e o que permite o parecer dizer
+    "renda de R$ 8.000 lida do holerite com 92% de confianca" em vez de apenas o numero. Sem
+    isso nao ha auditoria possivel.
+    """
+
+    campo: str
+    valor: str
+    origem: OrigemDado
+    confianca_pct: Decimal
+
+    @classmethod
+    def de_dominio(cls, dado: DadoExtraido) -> DadoExtraidoResponse:
+        return cls(
+            campo=dado.campo,
+            valor=dado.valor,
+            origem=dado.origem,
+            confianca_pct=dado.confianca.valor,
+        )
+
+
+class DocumentoAceitoResponse(BaseModel):
+    """Corpo do 202 devolvido ao receber um documento.
+
+    ## Por que ha `Location` no cabecalho **e** `consultar_em` no corpo
+
+    Redundancia deliberada. O cabecalho `Location` e o que a RFC 7231 secao 6.3.2 preve para
+    202, e clientes HTTP genericos o seguem; o campo no corpo existe porque cliente escrito a
+    mao raramente le cabecalho de resposta, e um 202 cujo caminho de consulta esta apenas no
+    cabecalho e um 202 que muita integracao trata como "deu certo, fim".
+
+    O custo e uma string duplicada. O beneficio e nao depender de o integrador ler a
+    documentacao para descobrir que precisa acompanhar.
+    """
+
+    documento_id: UUID
+    analise_id: UUID
+    estado: EstadoDocumento
+    consultar_em: str = Field(description="Caminho para acompanhar o processamento deste documento")
+
+
+class DocumentoEstadoResponse(BaseModel):
+    """Estado de um documento em processamento.
+
+    Devolve `estado` e nao um booleano `pronto`: o cliente precisa distinguir "ainda na fila" de
+    "falhou por erro tecnico" de "reprovado no piso de qualidade" — sao tres acoes diferentes
+    (esperar, acionar suporte, reenviar com mais resolucao).
+
+    `terminal` vem calculado do servidor. O cliente poderia derivar do `estado`, e derivaria
+    errado no dia em que um estado novo aparecesse: um cliente que testa
+    `estado in ("extraido", "falhou")` continuaria fazendo polling para sempre num estado que
+    ele nao conhece.
+    """
+
+    documento_id: UUID
+    analise_id: UUID
+    tipo: TipoDocumento
+    nome_arquivo: str
+    estado: EstadoDocumento
+    terminal: bool
+
+    confianca_ocr_pct: Decimal | None = None
+    motor_ocr: str | None = None
+    exige_revisao_humana: bool = False
+
+    # Gravada no documento e nao derivada de `dados_extraidos`: derivar exigiria este schema
+    # conhecer o nome do campo de renda por tipo de documento (`salario_liquido`,
+    # `renda_mediana_extrato`), regra que mora no dominio.
+    renda_comprovada: Decimal | None = None
+
+    # ## Os campos de auditoria voltaram para ca
+    #
+    # No fluxo sincrono eles vinham em `DocumentoProcessadoResponse`, na mesma requisicao. Com
+    # 202 aquela resposta deixou de existir, e por um momento eles ficaram **inalcancaveis por
+    # qualquer cliente** — o `GET` devolvia so estado e confianca.
+    #
+    # Isso era uma regressao, nao uma simplificacao. `injecao_suspeita` decide se o caso vai para
+    # revisao humana, e um flag que existe apenas no log nao responde "este documento tinha
+    # injecao?" duas semanas depois.
+    injecao_suspeita: bool = Field(
+        default=False,
+        description=(
+            "True quando o documento contem padrao de tentativa de injecao de prompt. O valor "
+            "usado no score vem da extracao estrutural, nao do LLM, entao a tentativa nao altera "
+            "o calculo — mas o caso vai para revisao humana."
+        ),
+    )
+    categorias_injecao: list[str] = Field(default_factory=list)
+
+    # Os dados que a extracao produziu, filtrados por este documento.
+    #
+    # Vem de `analise.dados_extraidos`, que e **persistido** — diferente da versao sincrona, onde
+    # `campos_extraidos` era montado na hora e existia apenas naquela resposta. Sobreviver ao
+    # restart importa: "de onde veio a renda que sustenta este parecer?" e pergunta de auditoria,
+    # e nao de quem esta fazendo polling.
+    #
+    # O que **nao** volta e o objeto `resumo_extrato` inteiro (saldo medio, meses analisados,
+    # recorrentes). Ele era derivado e nao persistido; o que sobrou dele sao os `DadoExtraido` que
+    # alimentaram o score. Reconstitui-lo exigiria guardar o resumo, e isso e trabalho para o dia
+    # em que alguem precisar — nao agora, por simetria com a resposta antiga.
+    dados_extraidos: list[DadoExtraidoResponse] = Field(default_factory=list)
+
+    erro: str | None = Field(
+        default=None,
+        description=(
+            "Motivo da rejeicao ou da falha, com a instrucao de correcao quando ha uma. "
+            "Presente em `rejeitado` e `falhou`."
+        ),
+    )
+
+    @classmethod
+    def de_dominio(
+        cls, analise: AnaliseCredito, documento: DocumentoSubmetido
+    ) -> DocumentoEstadoResponse:
+        return cls(
+            documento_id=documento.id,
+            analise_id=analise.id,
+            tipo=documento.tipo,
+            nome_arquivo=documento.nome_arquivo,
+            estado=documento.estado,
+            terminal=documento.estado.terminal,
+            confianca_ocr_pct=(
+                documento.confianca_ocr.valor if documento.confianca_ocr is not None else None
+            ),
+            motor_ocr=documento.motor_ocr,
+            renda_comprovada=(
+                documento.renda_comprovada.valor if documento.renda_comprovada is not None else None
+            ),
+            exige_revisao_humana=documento.exige_revisao_humana,
+            injecao_suspeita=documento.injecao_suspeita,
+            categorias_injecao=list(documento.categorias_injecao),
+            dados_extraidos=[
+                DadoExtraidoResponse.de_dominio(d)
+                for d in analise.dados_extraidos
+                if d.documento_id == documento.id
+            ],
+            erro=documento.erro,
+        )

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import structlog
 
+from credit_analysis.application.use_cases.extracao_assincrona import DocumentoAceito
 from credit_analysis.application.use_cases.processar_documento import ResultadoProcessamento
 from credit_analysis.domain.documento import QualidadeExtracao
 from credit_analysis.domain.entities import AnaliseCredito
@@ -115,3 +116,18 @@ def _motivo_da_revisao(resultado: ResultadoProcessamento) -> str:
     if resultado.renda_comprovada is None:
         return "renda_nao_apurada"
     return "outro"
+
+
+def registrar_recepcao(aceito: DocumentoAceito) -> None:
+    """Conta a recepcao de um documento, antes de qualquer extracao.
+
+    Metrica separada de `registrar_processamento` de proposito: a diferenca entre as duas e
+    exatamente o que ficou pendente na fila. Um unico contador no fim mediria vazao e nao
+    diria nada sobre acumulo — e acumulo silencioso e o modo de falha proprio de fila.
+
+    A subtracao (`recebidos - processados`) e o sinal que o alerta usa.
+    """
+    try:
+        metricas.documentos_recebidos.labels(tipo=aceito.estado.value).inc()
+    except Exception:
+        logger.warning("metricas.falha_ao_registrar", origem="recepcao", exc_info=True)

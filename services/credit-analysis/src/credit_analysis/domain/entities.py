@@ -115,6 +115,39 @@ class DocumentoSubmetido:
     estado: EstadoDocumento = EstadoDocumento.RECEBIDO
     referencia: Referencia | None = None
     erro: str | None = None
+
+    # Tentativa de injecao detectada no texto extraido.
+    #
+    # **Persistido, e nao apenas logado**, e isso mudou com a Camada 8. No fluxo sincrono o sinal
+    # ia direto para a resposta HTTP, que o cliente recebia na mesma requisicao. Com 202, aquela
+    # resposta nao existe mais — e sem gravar, o unico registro seria a linha de log.
+    #
+    # Isso nao serviria: o flag e material de revisao humana e de auditoria, e "estava no log de
+    # duas semanas atras" nao e uma resposta aceitavel para "este documento tinha injecao?".
+    injecao_suspeita: bool = False
+    categorias_injecao: tuple[str, ...] = ()
+
+    # Qual motor leu o documento, e se o caso exige um analista.
+    #
+    # Persistidos pela mesma razao do flag de injecao: no fluxo sincrono iam direto para a
+    # resposta HTTP. Com 202 essa resposta nao existe, e sem gravar eles ficariam so no log.
+    #
+    # `exige_revisao_humana` e decisao de politica (POL-002 secao 3.2) e nao detalhe tecnico:
+    # deixa-lo de fora tornaria impossivel responder "por que este caso foi para a fila do
+    # analista?" sem reprocessar o documento.
+    motor_ocr: str | None = None
+    exige_revisao_humana: bool = False
+
+    # A renda que este documento apurou, ou None quando nao apurou nenhuma.
+    #
+    # Gravada e nao derivada dos `DadoExtraido`, apesar de o numero estar la. Derivar exigiria a
+    # API conhecer o **nome** do campo — `salario_liquido` para holerite, `renda_mediana_extrato`
+    # para extrato —, e um terceiro tipo de documento amanha acrescentaria um terceiro nome numa
+    # regra que mora longe de quem a define.
+    #
+    # E este e o numero que alimentou o score: guarda-lo aqui e o que permite responder "de onde
+    # veio a renda deste parecer?" sem reexecutar a interpretacao.
+    renda_comprovada: Dinheiro | None = None
     id: UUID = field(default_factory=uuid4)
     submetido_em: datetime = field(default_factory=_agora)
 
@@ -138,11 +171,25 @@ class DocumentoSubmetido:
         if self.estado is EstadoDocumento.RECEBIDO:
             self.estado = EstadoDocumento.EXTRAINDO
 
-    def concluir_extracao(self, texto: str, confianca: Percentual) -> None:
+    def concluir_extracao(
+        self,
+        texto: str,
+        confianca: Percentual,
+        injecao_suspeita: bool = False,
+        categorias_injecao: tuple[str, ...] = (),
+        motor_ocr: str | None = None,
+        exige_revisao_humana: bool = False,
+        renda_comprovada: Dinheiro | None = None,
+    ) -> None:
         self.texto_extraido = texto
         self.confianca_ocr = confianca
         self.estado = EstadoDocumento.EXTRAIDO
         self.erro = None
+        self.injecao_suspeita = injecao_suspeita
+        self.categorias_injecao = categorias_injecao
+        self.motor_ocr = motor_ocr
+        self.exige_revisao_humana = exige_revisao_humana
+        self.renda_comprovada = renda_comprovada
 
     def rejeitar_por_qualidade(self, motivo: str, confianca: Percentual) -> None:
         """Reprovado no piso da POL-002. O texto extraido **e preservado**.

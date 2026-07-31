@@ -380,3 +380,33 @@ def valor(metrica: Counter | Gauge | Histogram, **labels: str) -> float:
             if amostra.name in (f"{nome_base}_total", f"{nome_base}_count"):
                 total += amostra.value
     return total
+
+
+# --------------------------------------------- Fluxo assincrono (Camada 8)
+
+documentos_recebidos = Counter(
+    f"{PREFIXO}_documentos_recebidos_total",
+    "Documentos aceitos para extracao, por estado inicial.",
+    labelnames=("tipo",),
+    registry=REGISTRO,
+)
+
+extracoes = Counter(
+    f"{PREFIXO}_extracoes_total",
+    "Extracoes concluidas pelo trabalhador, por desfecho.",
+    # `desfecho` e dominio fechado: aplicada, rejeitada, falhou, ja_aplicada. O ultimo importa
+    # tanto quanto os outros — ele mede reentrega, e reentrega crescente indica trabalhador
+    # morrendo antes de confirmar, nao problema de OCR.
+    labelnames=("desfecho",),
+    registry=REGISTRO,
+)
+
+fila_espera = Histogram(
+    f"{PREFIXO}_fila_espera_segundos",
+    "Tempo entre a recepcao do documento e o inicio da extracao.",
+    # Buckets ate 320s, os mesmos da inferencia: a fila herda a latencia do OCR, e um documento
+    # atras de tres outros espera o tempo dos tres. Com os buckets de HTTP (teto de 10s), tudo
+    # cairia em `+Inf` e o p95 seria ficcao — o mesmo erro que a Camada 5 corrigiu.
+    buckets=BUCKETS_INFERENCIA,
+    registry=REGISTRO,
+)

@@ -13,7 +13,7 @@ aplicacao, o que seria a propria dependencia que estamos tentando inverter.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol, runtime_checkable
+from typing import IO, Protocol, runtime_checkable
 from uuid import UUID
 
 from credit_analysis.domain.agente import TrilhaAgente
@@ -236,12 +236,22 @@ class ArmazenamentoDocumentos(Protocol):
     dominio de credito, e com ele o repositorio — e deixaria de caber numa funcao.
     """
 
-    async def guardar(self, chave: str, conteudo: bytes, tipo_mime: str) -> Referencia:
+    async def guardar(self, chave: str, conteudo: IO[bytes], tipo_mime: str) -> Referencia:
         """Guarda e devolve a referencia **com versao**.
 
         A versao vem do bucket versionado. Um armazenamento sem versionamento nao serve aqui: a
         referencia deixaria de ser imutavel e a deduplicacao por versao (ver
         `domain/armazenamento.py`) nao funcionaria.
+
+        ## Por que `IO[bytes]` e nao `bytes`
+
+        O teto de upload e 32MB. Com `bytes`, N requisicoes concorrentes seguram N x 32MB de
+        memoria — e o endpoint fazia streaming para disco exatamente para nao pagar isso.
+        Trocar para `bytes` teria desfeito uma decisao anterior sem perceber.
+
+        Stream tambem e o que as APIs de object storage esperam: o `upload_fileobj` do boto3
+        divide em partes e envia sem carregar o objeto inteiro. Passar `bytes` obrigaria a
+        materializar tudo antes de começar a subir.
         """
         ...
 

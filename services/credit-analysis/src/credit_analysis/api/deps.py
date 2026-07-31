@@ -17,8 +17,10 @@ from fastapi import Depends, Request
 
 from credit_analysis.application.ports import (
     AgenteCredito,
+    ArmazenamentoDocumentos,
     ConsultaBureau,
     ConsultaKYC,
+    FilaDeTrabalho,
     ModeloLinguagem,
     MotorOCR,
     RepositorioAnalises,
@@ -28,15 +30,31 @@ from credit_analysis.application.use_cases.analisar_credito import (
     ConsultarAnalise,
     ListarAnalises,
 )
+from credit_analysis.application.use_cases.extracao_assincrona import (
+    ExtrairDocumento,
+    ReceberDocumento,
+)
 from credit_analysis.application.use_cases.fundamentar_parecer import FundamentarParecer
-from credit_analysis.application.use_cases.processar_documento import ProcessarDocumento
+from credit_analysis.application.use_cases.processar_documento import AplicarExtracao
 from credit_analysis.config import Settings, get_settings
 from credit_analysis.domain.exceptions import RecursoIndisponivel
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 
 
-def obter_settings() -> Settings:
-    return get_settings()
+def obter_settings(request: Request) -> Settings:
+    """Configuracao **do app**, com o ambiente como reserva.
+
+    Lia `get_settings()` direto, e isso ignorava o que `criar_app(settings=...)` recebeu: um teste
+    ou um segundo app no mesmo processo usariam a configuracao do ambiente, nao a injetada.
+
+    Passou a incomodar quando a rota de documento comecou a montar o `Location` do 202 a partir de
+    `prefixo_api`: com os dois divergindo, o cabecalho apontaria para um caminho que aquele app nao
+    serve — e o sintoma seria 404 no polling, longe da causa.
+
+    A reserva existe para o caminho em que nao ha app (script, `ingestao`, `__main__`).
+    """
+    settings: Settings | None = getattr(request.app.state, "settings", None)
+    return settings or get_settings()
 
 
 def obter_repositorio(request: Request) -> RepositorioAnalises:
@@ -133,10 +151,34 @@ def obter_agente(request: Request) -> AgenteCredito:
 
 def obter_caso_processar_documento(
     repositorio: Annotated[RepositorioAnalises, Depends(obter_repositorio)],
-    motor: Annotated[MotorOCR, Depends(obter_motor_ocr)],
     bureau: Annotated[ConsultaBureau, Depends(obter_bureau)],
-) -> ProcessarDocumento:
-    return ProcessarDocumento(repositorio=repositorio, motor_ocr=motor, bureau=bureau)
+) -> AplicarExtracao:
+    return AplicarExtracao(repositorio=repositorio, bureau=bureau)
+
+
+def obter_armazenamento(request: Request) -> ArmazenamentoDocumentos:
+    armazenamento: ArmazenamentoDocumentos = request.app.state.armazenamento
+    return armazenamento
+
+
+def obter_fila(request: Request) -> FilaDeTrabalho:
+    fila: FilaDeTrabalho = request.app.state.fila
+    return fila
+
+
+def obter_caso_receber_documento(
+    repositorio: Annotated[RepositorioAnalises, Depends(obter_repositorio)],
+    armazenamento: Annotated[ArmazenamentoDocumentos, Depends(obter_armazenamento)],
+    fila: Annotated[FilaDeTrabalho, Depends(obter_fila)],
+) -> ReceberDocumento:
+    return ReceberDocumento(repositorio=repositorio, armazenamento=armazenamento, fila=fila)
+
+
+def obter_caso_extrair(
+    armazenamento: Annotated[ArmazenamentoDocumentos, Depends(obter_armazenamento)],
+    motor: Annotated[MotorOCR, Depends(obter_motor_ocr)],
+) -> ExtrairDocumento:
+    return ExtrairDocumento(armazenamento=armazenamento, motor_ocr=motor)
 
 
 def obter_caso_fundamentar(
@@ -148,10 +190,13 @@ def obter_caso_fundamentar(
 
 # Aliases para deixar as assinaturas das rotas curtas e legiveis.
 SettingsDep = Annotated[Settings, Depends(obter_settings)]
+RepositorioDep = Annotated[RepositorioAnalises, Depends(obter_repositorio)]
 RetrieverDep = Annotated[RetrieverHibrido, Depends(obter_retriever)]
 FundamentarDep = Annotated[FundamentarParecer, Depends(obter_caso_fundamentar)]
 MotorOCRDep = Annotated[MotorOCR, Depends(obter_motor_ocr)]
-ProcessarDocumentoDep = Annotated[ProcessarDocumento, Depends(obter_caso_processar_documento)]
+AplicarExtracaoDep = Annotated[AplicarExtracao, Depends(obter_caso_processar_documento)]
+ReceberDocumentoDep = Annotated[ReceberDocumento, Depends(obter_caso_receber_documento)]
+ExtrairDocumentoDep = Annotated[ExtrairDocumento, Depends(obter_caso_extrair)]
 AnalisarDep = Annotated[AnalisarCredito, Depends(obter_caso_analisar)]
 ConsultarDep = Annotated[ConsultarAnalise, Depends(obter_caso_consultar)]
 ListarDep = Annotated[ListarAnalises, Depends(obter_caso_listar)]

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
+from typing import IO
 from uuid import uuid4
 
 import structlog
@@ -45,10 +46,13 @@ class ArmazenamentoEmMemoria:
         # a referencia versionada existe para impedir.
         self._objetos: dict[tuple[str, str], bytes] = {}
 
-    async def guardar(self, chave: str, conteudo: bytes, tipo_mime: str) -> Referencia:
+    async def guardar(self, chave: str, conteudo: IO[bytes], tipo_mime: str) -> Referencia:
+        # `read()` inteiro aqui e aceitavel: este adapter guarda em dicionario, entao o objeto ja
+        # vai residir em memoria de qualquer forma. O ganho do stream esta no adapter de S3.
+        dados = conteudo.read()
         versao = uuid4().hex
-        self._objetos[(chave, versao)] = conteudo
-        logger.debug("armazenamento.guardado", chave=chave, versao=versao, bytes=len(conteudo))
+        self._objetos[(chave, versao)] = dados
+        logger.debug("armazenamento.guardado", chave=chave, versao=versao, bytes=len(dados))
         return Referencia(chave=chave, versao=versao)
 
     async def obter(self, referencia: Referencia) -> bytes:
