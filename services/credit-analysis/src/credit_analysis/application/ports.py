@@ -17,8 +17,10 @@ from typing import Protocol, runtime_checkable
 from uuid import UUID
 
 from credit_analysis.domain.agente import TrilhaAgente
+from credit_analysis.domain.armazenamento import Referencia
 from credit_analysis.domain.documento import ImagemDocumento, ResultadoOCR
 from credit_analysis.domain.entities import AnaliseCredito
+from credit_analysis.domain.extracao_assincrona import Entrega, PedidoDeExtracao
 from credit_analysis.domain.kyc import ResultadoKYC
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
 
@@ -216,3 +218,91 @@ class RelogioDominio(Protocol):
     """
 
     def agora(self) -> object: ...
+
+
+@runtime_checkable
+class ArmazenamentoDocumentos(Protocol):
+    """Onde o original do documento fica guardado.
+
+    ## Por que este port existe, e por que ele e tao pequeno
+
+    Ele e a **fronteira que decide o que pode rodar como Lambda**. A extracao precisa de duas
+    coisas: ler bytes e rodar OCR. Nada mais — nao precisa de repositorio de analise, nem de
+    banco, nem de LLM. E o que permite ao mesmo codigo rodar como funcao serverless e como
+    trabalhador local, e e por isso que este protocolo tem tres metodos e nenhuma nocao de
+    analise de credito.
+
+    Se ele tivesse um `guardar_para_analise(analise_id, ...)`, a Lambda passaria a conhecer o
+    dominio de credito, e com ele o repositorio — e deixaria de caber numa funcao.
+    """
+
+    async def guardar(self, chave: str, conteudo: bytes, tipo_mime: str) -> Referencia:
+        """Guarda e devolve a referencia **com versao**.
+
+        A versao vem do bucket versionado. Um armazenamento sem versionamento nao serve aqui: a
+        referencia deixaria de ser imutavel e a deduplicacao por versao (ver
+        `domain/armazenamento.py`) nao funcionaria.
+        """
+        ...
+
+    async def obter(self, referencia: Referencia) -> bytes:
+        """Le o conteudo daquela versao especifica.
+
+        Ler "a versao atual da chave" seria o comportamento errado: entre o upload e a extracao,
+        um reenvio poderia ter trocado o conteudo, e o parecer citaria um documento que nao foi
+        o extraido.
+        """
+        ...
+
+    @property
+    def identificacao(self) -> str:
+        """Para o log de boot dizer onde os documentos estao indo."""
+        ...
+
+
+@runtime_checkable
+class FilaDeTrabalho(Protocol):
+    """Fila de pedidos de extracao.
+
+    ## Por que `publicar` e `consumir` estao no mesmo protocolo
+
+    Poderiam ser dois. Ficam juntos porque **quem publica e quem consome sao o mesmo servico**
+    aqui — a API publica, o trabalhador consome, e os dois compartilham o wiring. Separar
+    produziria dois protocolos com um adapter cada, sempre configurados aos pares.
+
+    A Lambda em producao nao usa `consumir`: o proprio runtime da AWS entrega a mensagem ao
+    handler. O metodo existe para o trabalhador local, que e o que permite exercitar o fluxo
+    inteiro sem conta em nuvem.
+    """
+
+    async def publicar(self, pedido: PedidoDeExtracao) -> None:
+        """Enfileira. Falha aqui e erro do cliente da API, nao degradacao silenciosa."""
+        ...
+
+    async def consumir(self, quantidade: int = 1, espera_segundos: int = 20) -> list[Entrega]:
+        """Retira mensagens para processar.
+
+        `espera_segundos` e *long polling*: sem ele, o trabalhador faz uma chamada por
+        milissegundo contra a fila vazia — no SQS isso e custo por requisicao, e localmente e
+        CPU queimada.
+        """
+        ...
+
+    async def confirmar(self, entrega: Entrega) -> None:
+        """Remove a mensagem definitivamente.
+
+        Confirmar **depois** de aplicar, nunca antes: com a ordem invertida, uma falha no meio
+        da aplicacao perderia o trabalho sem deixar rastro na fila. O preco de confirmar depois
+        e a possibilidade de reprocessar a mesma mensagem — que e exatamente o que a
+        deduplicacao por versao resolve.
+        """
+        ...
+
+    async def devolver(self, entrega: Entrega, motivo: str) -> None:
+        """Devolve para nova tentativa, ou manda para a fila de descarte no limite.
+
+        O limite existe porque nem toda falha e transitoria: um PDF corrompido falha igual nas
+        cinquenta tentativas, e sem teto ele ocuparia o trabalhador para sempre. Documento que
+        estoura o limite vai para revisao humana com o motivo registrado.
+        """
+        ...

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+from credit_analysis.domain.armazenamento import EstadoDocumento, Referencia
 from credit_analysis.domain.enums import (
     Decisao,
     NivelRisco,
@@ -89,19 +90,73 @@ class PropostaCredito:
 
 @dataclass(slots=True)
 class DocumentoSubmetido:
-    """Um arquivo enviado pelo cliente, antes ou depois do OCR."""
+    """Um arquivo enviado pelo cliente, em qualquer ponto do fluxo de extracao.
+
+    ## O que a Camada 8 mudou aqui
+
+    O OCR deixou de rodar dentro da requisicao, entao esta entidade passou a existir tambem
+    **antes** de haver texto. Isso trouxe dois campos e tirou uma suposicao.
+
+    `estado` substitui o `processado: bool` como fonte de verdade. O booleano colapsava tres
+    situacoes distintas em "false" — ainda na fila, falhou por erro tecnico, e reprovado no piso
+    de qualidade da POL-002 — e o canal de atendimento nao tinha o que dizer a quem enviou o
+    documento. Ele continua existindo por compatibilidade, derivado do estado.
+
+    `referencia` aponta para o objeto guardado, com versao. E o que sustenta a retencao de 5
+    anos exigida pela POL-006 secao 5: sem ela, "o documento que embasou este parecer" seria
+    apenas um hash, e o conteudo original nao seria recuperavel.
+    """
 
     tipo: TipoDocumento
     nome_arquivo: str
     conteudo_hash: str
     texto_extraido: str | None = None
     confianca_ocr: Percentual | None = None
+    estado: EstadoDocumento = EstadoDocumento.RECEBIDO
+    referencia: Referencia | None = None
+    erro: str | None = None
     id: UUID = field(default_factory=uuid4)
     submetido_em: datetime = field(default_factory=_agora)
 
     @property
     def processado(self) -> bool:
-        return self.texto_extraido is not None
+        """Mantido, e agora derivado de `estado`.
+
+        Havia codigo lendo isto antes da Camada 8. Deriva-lo em vez de manter dois campos
+        independentes evita o modo de falha classico: um atualizado e o outro nao, com o
+        booleano dizendo "processado" para um documento em estado `falhou`.
+        """
+        return self.estado is EstadoDocumento.EXTRAIDO
+
+    def marcar_extraindo(self) -> None:
+        """Transicao para `extraindo`, idempotente.
+
+        Idempotente porque entrega de mensagem e *at-least-once*: a mesma extracao pode ser
+        iniciada duas vezes, e a segunda nao deve levantar. O que impede trabalho duplicado e a
+        checagem de estado terminal em `aplicar_extracao`, nao esta transicao.
+        """
+        if self.estado is EstadoDocumento.RECEBIDO:
+            self.estado = EstadoDocumento.EXTRAINDO
+
+    def concluir_extracao(self, texto: str, confianca: Percentual) -> None:
+        self.texto_extraido = texto
+        self.confianca_ocr = confianca
+        self.estado = EstadoDocumento.EXTRAIDO
+        self.erro = None
+
+    def rejeitar_por_qualidade(self, motivo: str, confianca: Percentual) -> None:
+        """Reprovado no piso da POL-002. O texto extraido **e preservado**.
+
+        Descarta-lo pareceria mais limpo e destruiria a evidencia: sem ele nao ha como auditar
+        por que a rejeicao aconteceu, nem comparar com o reenvio.
+        """
+        self.confianca_ocr = confianca
+        self.estado = EstadoDocumento.REJEITADO
+        self.erro = motivo
+
+    def falhar(self, motivo: str) -> None:
+        self.estado = EstadoDocumento.FALHOU
+        self.erro = motivo
 
 
 @dataclass(slots=True)

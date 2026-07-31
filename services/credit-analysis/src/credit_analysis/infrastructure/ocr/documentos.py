@@ -89,16 +89,41 @@ class DocumentoCarregado:
 
 
 def carregar(caminho: Path) -> DocumentoCarregado:
-    """Le um arquivo de documento, escolhendo entre camada de texto e OCR."""
+    """Le um arquivo de documento do disco, escolhendo entre camada de texto e OCR."""
     if not caminho.is_file():
         raise ErroLeituraDocumento(f"Arquivo nao encontrado: {caminho}")
 
-    sufixo = caminho.suffix.lower()
+    return carregar_de_bytes(caminho.read_bytes(), caminho.name)
+
+
+def carregar_de_bytes(dados: bytes, nome_arquivo: str) -> DocumentoCarregado:
+    """Mesma leitura, a partir de bytes em memoria.
+
+    ## Por que esta e a variante primaria, e `carregar` delega para ela
+
+    A extracao assincrona (Camada 8) le o documento do armazenamento de objetos, e nao do
+    disco. Escrever aqueles bytes num arquivo temporario para depois le-los seria I/O sem
+    proposito — e numa funcao serverless o disco e efemero, limitado e compartilhado entre
+    invocacoes.
+
+    A inversao (bytes como primaria, caminho delegando) evita duas implementacoes do mesmo
+    despacho por extensao. A alternativa seria `carregar_de_bytes` gravar um temporario e
+    chamar `carregar`, ou seja exatamente o I/O que se quer evitar.
+
+    O nome do arquivo continua necessario: e dele que sai a extensao, e a extensao e o que
+    escolhe entre PDF e imagem. Inferir do conteudo (*magic bytes*) seria mais robusto e nao
+    resolveria o caso que importa — um `.png` que na verdade e PDF ja falha na borda HTTP, que
+    valida a extensao contra uma lista fechada.
+    """
+    if not dados:
+        raise ErroLeituraDocumento("Conteudo vazio")
+
+    sufixo = Path(nome_arquivo).suffix.lower()
 
     if sufixo == ".pdf":
-        return _carregar_pdf(caminho)
+        return _carregar_pdf(dados)
     if sufixo in EXTENSOES_IMAGEM:
-        return _carregar_imagem(caminho)
+        return _carregar_imagem(dados, nome_arquivo)
 
     raise ErroLeituraDocumento(
         f"Tipo nao suportado: {sufixo or '(sem extensao)'}. "
@@ -106,9 +131,11 @@ def carregar(caminho: Path) -> DocumentoCarregado:
     )
 
 
-def _carregar_pdf(caminho: Path) -> DocumentoCarregado:
+def _carregar_pdf(dados: bytes) -> DocumentoCarregado:
     try:
-        documento = fitz.open(caminho)
+        # `stream=` em vez de caminho: o PyMuPDF le de memoria, e isso e o que permite a
+        # extracao rodar sem tocar o disco.
+        documento = fitz.open(stream=dados, filetype="pdf")
     except Exception as exc:  # PyMuPDF levanta varios tipos
         raise ErroLeituraDocumento(f"PDF ilegivel: {exc}") from exc
 
@@ -156,15 +183,16 @@ def _rasterizar(pagina: fitz.Page) -> Imagem:
     return cast(Imagem, matriz_np.reshape(pixmap.height, pixmap.width).copy())
 
 
-def _carregar_imagem(caminho: Path) -> DocumentoCarregado:
-    # `imdecode` sobre bytes em vez de `imread` com o caminho: o imread do
-    # OpenCV falha silenciosamente (devolve None) com caminho contendo
-    # caractere nao-ASCII, que e comum em "Documentos/Projetos Pessoais".
-    dados = np.frombuffer(caminho.read_bytes(), dtype=np.uint8)
-    imagem = cast("Imagem | None", cv2.imdecode(dados, cv2.IMREAD_GRAYSCALE))
+def _carregar_imagem(dados: bytes, nome_arquivo: str) -> DocumentoCarregado:
+    # `imdecode` sobre bytes, e nao `imread` com caminho. O motivo original continua valendo: o
+    # `imread` do OpenCV falha em silencio (devolve None) com caminho contendo caractere
+    # nao-ASCII, comum em "Documentos/Projetos Pessoais". Agora ha um segundo motivo — os bytes
+    # podem nunca ter estado em disco.
+    buffer = np.frombuffer(dados, dtype=np.uint8)
+    imagem = cast("Imagem | None", cv2.imdecode(buffer, cv2.IMREAD_GRAYSCALE))
 
     if imagem is None:
-        raise ErroLeituraDocumento(f"Imagem ilegivel ou corrompida: {caminho.name}")
+        raise ErroLeituraDocumento(f"Imagem ilegivel ou corrompida: {nome_arquivo}")
 
     pagina = PaginaDocumento(numero=1, imagem=imagem, texto_embutido=None)
     return DocumentoCarregado((pagina,), OrigemTexto.OCR, 1)

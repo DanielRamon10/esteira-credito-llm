@@ -7,6 +7,7 @@ from decimal import Decimal
 
 import pytest
 
+from credit_analysis.domain.armazenamento import EstadoDocumento
 from credit_analysis.domain.entities import (
     AnaliseCredito,
     DocumentoSubmetido,
@@ -246,6 +247,73 @@ class TestDocumentoSubmetido:
             conteudo_hash="hash",
         )
         assert not doc.processado
+        assert doc.estado is EstadoDocumento.RECEBIDO
+
+        doc.concluir_extracao("SALDO ANTERIOR ...", Percentual.de("95"))
+
+        assert doc.processado
+        assert doc.estado is EstadoDocumento.EXTRAIDO
+
+    def test_atribuir_o_texto_direto_nao_marca_como_processado(self) -> None:
+        """Mudanca de contrato da Camada 8, e ela e o ponto do estado existir.
+
+        Antes, `processado` era `texto_extraido is not None` — logo atribuir o campo bastava.
+        Agora `estado` e a fonte de verdade, porque o booleano colapsava tres situacoes: na
+        fila, falhou por erro tecnico, e reprovado no piso de qualidade da POL-002. Com um
+        `bool`, o canal de atendimento nao tinha o que dizer a quem enviou o documento.
+
+        O efeito colateral e este: atribuir o texto sozinho **nao** conclui a extracao. E
+        desejado — aquele estado (texto presente, ainda `recebido`) nao existe no fluxo, e
+        deixa-lo passar em silencio traria de volta o problema de dois campos que divergem.
+        """
+        doc = DocumentoSubmetido(
+            tipo=TipoDocumento.EXTRATO_BANCARIO,
+            nome_arquivo="extrato.pdf",
+            conteudo_hash="hash",
+        )
 
         doc.texto_extraido = "SALDO ANTERIOR ..."
-        assert doc.processado
+
+        assert not doc.processado
+
+    def test_rejeicao_por_qualidade_preserva_o_texto(self) -> None:
+        """Descartar o texto pareceria mais limpo e destruiria a evidencia.
+
+        Sem ele nao ha como auditar por que a rejeicao aconteceu, nem comparar com o reenvio.
+        """
+        doc = DocumentoSubmetido(
+            tipo=TipoDocumento.HOLERITE, nome_arquivo="h.png", conteudo_hash="hash"
+        )
+        doc.texto_extraido = "texto ilegivel"
+
+        doc.rejeitar_por_qualidade("confianca abaixo do piso", Percentual.de("41"))
+
+        assert doc.estado is EstadoDocumento.REJEITADO
+        assert doc.texto_extraido == "texto ilegivel"
+        assert not doc.processado
+
+    def test_marcar_extraindo_e_idempotente(self) -> None:
+        """Entrega de mensagem e *at-least-once*: a mesma extracao pode comecar duas vezes."""
+        doc = DocumentoSubmetido(
+            tipo=TipoDocumento.HOLERITE, nome_arquivo="h.png", conteudo_hash="hash"
+        )
+
+        doc.marcar_extraindo()
+        doc.marcar_extraindo()
+
+        assert doc.estado is EstadoDocumento.EXTRAINDO
+
+    def test_marcar_extraindo_nao_desfaz_estado_terminal(self) -> None:
+        """Uma mensagem reentregue depois da conclusao nao pode reabrir o documento.
+
+        Sem esta guarda, o reprocessamento de uma mensagem duplicada devolveria um documento
+        `extraido` para `extraindo`, e o `GET` diria "processando" sobre algo ja concluido.
+        """
+        doc = DocumentoSubmetido(
+            tipo=TipoDocumento.HOLERITE, nome_arquivo="h.png", conteudo_hash="hash"
+        )
+        doc.concluir_extracao("texto", Percentual.de("95"))
+
+        doc.marcar_extraindo()
+
+        assert doc.estado is EstadoDocumento.EXTRAIDO

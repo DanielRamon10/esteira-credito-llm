@@ -29,6 +29,7 @@ from plataforma.seguranca import (
 )
 
 from credit_analysis.application.ports import ConsultaBureau, MotorOCR, RepositorioAnalises
+from credit_analysis.application.use_cases.extracao_assincrona import obter_texto
 from credit_analysis.domain import scoring
 from credit_analysis.domain.documento import (
     ExtracaoHolerite,
@@ -42,7 +43,7 @@ from credit_analysis.domain.exceptions import (
     DadosInsuficientes,
 )
 from credit_analysis.domain.extrato import ResumoExtrato, Transacao, analisar_extrato
-from credit_analysis.domain.value_objects import Dinheiro, Percentual
+from credit_analysis.domain.value_objects import Dinheiro
 from credit_analysis.infrastructure.ocr import documentos as leitor
 from credit_analysis.infrastructure.ocr.extracao import extrair_holerite, extrair_transacoes
 
@@ -135,9 +136,13 @@ class ProcessarDocumento:
             tipo=comando.tipo,
             nome_arquivo=comando.caminho.name,
             conteudo_hash=_hash_arquivo(comando.caminho),
-            texto_extraido=ocr.texto,
-            confianca_ocr=ocr.confianca,
         )
+        # Transicao explicita em vez de `texto_extraido=` no construtor.
+        #
+        # Desde a Camada 8, `estado` e a fonte de verdade de `processado`, e atribuir o texto
+        # sozinho deixaria o documento como `recebido` com texto dentro — um estado que nao
+        # existe no fluxo. Chamar a transicao mantem os tres campos coerentes num lugar so.
+        documento.concluir_extracao(ocr.texto, ocr.confianca)
 
         if ocr.qualidade is QualidadeExtracao.REJEITADA:
             log.warning(
@@ -244,44 +249,13 @@ class ProcessarDocumento:
         analise.concluir(parecer)
 
     async def _obter_texto(self, carregado: leitor.DocumentoCarregado) -> ResultadoOCR:
-        """Usa a camada de texto do PDF quando existe; OCR so quando necessario."""
-        if carregado.origem_sugerida is leitor.OrigemTexto.CAMADA_PDF:
-            # Texto embutido e exato — nao ha reconhecimento envolvido, entao a
-            # confianca e total. Rodar OCR aqui trocaria certeza por estimativa.
-            return ResultadoOCR(
-                texto=carregado.texto_embutido,
-                confianca=Percentual.de(100),
-                motor="pdf:camada_texto",
-                palavras_reconhecidas=len(carregado.texto_embutido.split()),
-                correcoes_aplicadas=("texto extraido da camada do PDF, sem OCR",),
-            )
+        """Delega para a funcao compartilhada com o fluxo assincrono.
 
-        # Multipagina: concatena o texto e usa a menor confianca das paginas. A
-        # media esconderia uma pagina ilegivel no meio de um lote bom.
-        textos: list[str] = []
-        piores: list[Percentual] = []
-        motores: set[str] = set()
-        correcoes: set[str] = set()
-
-        for pagina in carregado.paginas:
-            if pagina.imagem is None:
-                continue
-            resultado = await self._motor.extrair(pagina.imagem)
-            textos.append(resultado.texto)
-            piores.append(resultado.confianca)
-            motores.add(resultado.motor)
-            correcoes.update(resultado.correcoes_aplicadas)
-
-        if not textos:
-            raise DadosInsuficientes("Documento sem pagina processavel")
-
-        return ResultadoOCR(
-            texto="\n\n".join(textos),
-            confianca=min(piores),
-            motor="+".join(sorted(motores)),
-            palavras_reconhecidas=sum(len(t.split()) for t in textos),
-            correcoes_aplicadas=tuple(sorted(correcoes)),
-        )
+        A implementacao saiu daqui na Camada 8: a extracao que roda como Lambda precisa da
+        mesma decisao — camada de texto quando existe, OCR quando nao — e duas copias
+        divergiriam no primeiro ajuste de confianca.
+        """
+        return await obter_texto(carregado, self._motor)
 
     def _interpretar(
         self, tipo: TipoDocumento, ocr: ResultadoOCR
