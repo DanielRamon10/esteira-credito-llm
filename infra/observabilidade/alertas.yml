@@ -184,6 +184,76 @@ groups:
             `correspondencias: []`. Verificar a origem do CSV e o log
             `listas.carregadas`.
 
+  - name: extracao-assincrona
+    interval: 30s
+    rules:
+      # Documento parado em estado nao-terminal.
+      #
+      # E o alerta que pega o modo de falha em aberto da recepcao: se o `publicar` falhar com o
+      # documento ja gravado, ele fica `recebido` para sempre. Nada mais no sistema o corrigiria, e
+      # o cliente veria "processando" indefinidamente.
+      #
+      # A expressao compara recebidos com concluidos: a diferenca **e** o que ficou pendente. Um
+      # unico contador no fim mediria vazao e nao diria nada sobre acumulo — e acumulo silencioso e
+      # o modo de falha proprio de fila.
+      - alert: DocumentosPresosNaExtracao
+        expr: |
+          sum(increase(credito_documentos_recebidos_total[30m]))
+            -
+          sum(increase(credito_extracoes_total[30m]))
+            > 5
+        for: 15m
+        labels:
+          severidade: aviso
+          dominio: operacao
+        annotations:
+          resumo: "Mais de 5 documentos recebidos sem extracao concluida em 30min"
+          acao: >-
+            Conferir se o trabalhador esta consumindo (`credito_extracoes_total`
+            parado) e se a fila tem mensagem. Com o trabalhador em processo, ele
+            morre junto da API; com Lambda, ver o alarme de DLQ no CloudWatch.
+
+      - alert: ExtracoesFalhandoMuito
+        expr: |
+          sum(rate(credito_extracoes_total{desfecho="falhou"}[15m]))
+            /
+          clamp_min(sum(rate(credito_extracoes_total[15m])), 0.001)
+            > 0.2
+        for: 10m
+        labels:
+          severidade: aviso
+          dominio: operacao
+        annotations:
+          resumo: "Mais de 20% das extracoes terminando em falha permanente"
+          acao: >-
+            Falha permanente e arquivo ilegivel ou referencia invalida — nao e
+            problema de capacidade. Um salto costuma indicar mudanca no que o
+            canal esta enviando, nao no servico. Ver `documento.falhou` no log.
+
+      # Reentrega, e por que ela tem alerta proprio.
+      #
+      # `ja_aplicada` subindo significa que o trabalhador esta morrendo **entre aplicar e
+      # confirmar**: o trabalho e feito, a mensagem volta, e a idempotencia impede o dano. O
+      # sistema parece saudavel — os documentos ficam `extraido` — e esta pagando OCR duas vezes.
+      #
+      # Sem esta metrica isso seria invisivel ate a conta chegar.
+      - alert: ReentregaAlta
+        expr: |
+          sum(rate(credito_extracoes_total{desfecho="ja_aplicada"}[30m]))
+            /
+          clamp_min(sum(rate(credito_extracoes_total[30m])), 0.001)
+            > 0.1
+        for: 15m
+        labels:
+          severidade: aviso
+          dominio: operacao
+        annotations:
+          resumo: "Mais de 10% das extracoes sao reaplicacao de trabalho ja feito"
+          acao: >-
+            O trabalhador esta morrendo entre aplicar e confirmar, ou a
+            visibilidade da fila (300s) e menor que a extracao mais lenta. O
+            sistema nao perde dado, e paga OCR duas vezes.
+
   - name: disponibilidade
     interval: 30s
     rules:

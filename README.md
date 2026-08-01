@@ -27,6 +27,7 @@ esteira-credito-llm/
 ├── infra/
 │   ├── postgres/            # Schema e init do pgvector
 │   ├── observabilidade/     # Prometheus, Tempo, Grafana provisionados
+│   ├── elasticmq/           # Filas locais (SQS), com DLQ declarada
 │   ├── k8s/                 # Um componente por serviço + overlay de produção
 │   └── terraform/           # Módulo `servico` instanciado 3x + recursos compartilhados
 ├── .github/workflows/       # CI, evals de IA e deploy
@@ -57,6 +58,7 @@ banco, e trocar SQLite por Postgres sem tocar em caso de uso.
 | 5 | Observabilidade: métricas, tracing, dashboard e alertas | ✅ Concluída |
 | 6 | Dockerfile, Kubernetes, Terraform e CI/CD | ✅ Concluída |
 | 7 | Autenticação OAuth2/JWT com escopos por endpoint | ✅ Concluída |
+| 8 | Extração assíncrona: S3, fila, 202 + polling, Lambda | ✅ Concluída |
 
 ## Rodando
 
@@ -656,6 +658,99 @@ POST /v1/triagens      token triagens:executar      201
 GET  /v1/triagens      mesmo token                  403
 POST /v1/triagens      token aud=customer-support   401
 ```
+
+## Extração assíncrona de documento
+
+```
+POST /v1/analises/{id}/documentos  → 202 + Location
+GET  /v1/documentos/{id}           → estado, motivo, dados extraídos
+```
+
+O OCR saiu da requisição. Com escalonamento ele leva segundos e pode chamar modelo
+de visão — mantê-lo na requisição significa cliente esperando com conexão aberta,
+gateway decidindo timeout, e nenhuma forma de retentar sem reenviar o arquivo.
+
+### A fronteira que decide o que pode ser Lambda
+
+```
+ReceberDocumento    valida → guarda → registra → enfileira → 202
+ExtrairDocumento    lê bytes → OCR                        ← Lambda
+AplicarExtracao     injeção → piso de qualidade → anexa → reavalia
+```
+
+`ExtrairDocumento` é a única que **não toca no repositório**: precisa de
+armazenamento e motor de OCR, nada mais. Se ela também anexasse o documento à
+análise, precisaria de repositório, bureau e motor de score — e carregaria o
+domínio de crédito inteiro para dentro da função.
+
+O piso da POL-002 ficou fora dela de propósito: é regra de negócio, e mudar o
+limite não deve exigir implantar a Lambda.
+
+### `Referencia(chave, versao)` resolve três problemas com um campo
+
+Idempotência (evento de fila é *at-least-once*), auditoria (POL-006 §5 exige o
+original por 5 anos) e corrida entre reenvios. Por isso `obter` lê a **versão
+específica**, não "a atual da chave" — entre o upload e a extração, um reenvio pode
+ter trocado o conteúdo, e o parecer citaria um documento que não foi o extraído.
+
+Sem versionamento no bucket o S3 não devolve `VersionId`, e o `put_object`
+**funciona mesmo assim**. Nada falharia; o sistema só perderia documento de vez em
+quando. O adapter recusa gravar sem ele.
+
+### As três garantias, cada uma com teste
+
+| | |
+|---|---|
+| trabalho não se perde | falha transitória devolve, e é reprocessada |
+| não se duplica | reentrega depois da conclusão não tem efeito |
+| não fica preso | falha permanente termina em `falhou` com motivo |
+
+A terceira é a mais fácil de quebrar sem perceber: um `except Exception` que
+devolve tudo satisfaz as duas primeiras e transforma um PDF corrompido em laço
+infinito.
+
+### O que rodar contra MinIO e ElasticMQ reais encontrou
+
+Coisas que um fake escrito a partir da minha leitura da documentação nunca pegaria:
+
+- **`ServerSideEncryption` por objeto quebra no MinIO** (`KMS is not configured`).
+  E o erro estava certo: criptografia em repouso é **política do bucket**, não
+  decisão de cada gravação — no bucket vale para todo objeto, inclusive os escritos
+  por outra ferramenta. Virou verificação de boot, exigida em produção.
+- **`InvalidArgument` e não `NoSuchVersion`** para version id malformado. São casos
+  opostos: objeto ausente é transitório (consistência eventual), referência
+  corrompida é permanente. Sem a distinção, três tentativas de OCR para chegar a uma
+  conclusão certa na primeira.
+- **`VersionId` não vem no `upload_fileobj`**, só no `put_object`.
+- Meu healthcheck do ElasticMQ usava `GET /`, que não é operação válida numa API de
+  SQS. O serviço respondia 200 a chamadas reais e o compose o marcava `unhealthy` —
+  apontando para o lugar errado.
+
+### Verificado pela stack do compose, com Tesseract de verdade
+
+```
+upload  → HTTP 202, Location=/v1/documentos/c9ec8e09…
+4s      → extraido, motor=tesseract:por, confiança=94.27
+renda apurada: 7262.14   campos: cpf, nome, empregador, competencia, salario_liquido
+score: 592 → 630
+```
+
+O objeto ficou no MinIO em `documentos/{analise}/{documento}/holerite.png`, com
+version id.
+
+### Duas limitações, e nenhuma delas é de configuração
+
+**O trabalhador roda dentro do processo da API, e isso limita a uma réplica.** Como
+processo separado ele exigiria um repositório de análise **compartilhado**, e ele não
+existe: a única implementação de `RepositorioAnalises` é em memória, e o schema do
+Postgres tem apenas a tabela do RAG. Cada processo veria o próprio repositório, e
+toda extração falharia com "documento não está na análise".
+
+`trabalhador_main.py` existe versionado e **recusa subir**, explicando isso. Apagá-lo
+esconderia o desenho; deixá-lo subir em silêncio seria pior.
+
+**A Lambda nunca foi aplicada.** O handler é exercitado (é o mesmo código do
+trabalhador); o runtime, o empacotamento em container image e o gatilho da fila, não.
 
 ## Segredos
 

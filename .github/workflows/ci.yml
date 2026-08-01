@@ -78,6 +78,31 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "${{ env.SERVICO }}/pyproject.toml"
 
+      - name: Subir MinIO e ElasticMQ
+        # `docker run` num passo, e **nao** service container, por duas razoes concretas:
+        #
+        # - service container nao aceita `command`, e o `minio/minio` nao sobe o servidor sem
+        #   `server /data` — o container ficaria de pe sem servir nada;
+        # - o ElasticMQ precisa do `elasticmq.conf` montado (e dele que vem a fila e a DLQ), e
+        #   service container inicia **antes** do checkout, quando o arquivo ainda nao existe.
+        #
+        # Sem eles, os 9 testes dos adapters pulam — e o passo de skip abaixo falha o job, porque
+        # pipeline verde escondendo teste pulado e pior que um vermelho.
+        run: |
+          docker run -d --name minio -p 9000:9000             -e MINIO_ROOT_USER=credito -e MINIO_ROOT_PASSWORD=credito_local_minio             minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+
+          docker run -d --name elasticmq -p 9324:9324             -v "$PWD/infra/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro"             softwaremill/elasticmq-native:1.6.14
+
+          # Espera ativa em vez de `sleep` fixo: o tempo de subida varia com a carga do runner, e
+          # um sleep generoso o bastante para o pior caso desperdicia minutos em toda execucao.
+          for _ in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live >/dev/null 2>&1               && curl -sf "http://localhost:9324/?Action=ListQueues" >/dev/null 2>&1               && echo "MinIO e ElasticMQ prontos" && exit 0
+            sleep 2
+          done
+          echo "::error::MinIO ou ElasticMQ nao subiram"
+          docker logs minio; docker logs elasticmq
+          exit 1
+
       - name: Preparar o banco de teste
         # Os testes de integracao derivam `<banco>_test` do DSN e dao TRUNCATE na
         # tabela. Criar o banco separado aqui reproduz o que o
@@ -122,6 +147,12 @@ jobs:
           # Fake explicito: sem isto o modo `auto` tentaria alcancar um Ollama que
           # nao existe no runner, e o resultado dependeria de timeout de rede.
           CREDIT_PROVEDOR_LLM: fake
+          # Sem estes, os 9 testes dos adapters pulam. Ver o comentario nos service containers.
+          CREDIT_S3_ENDPOINT_TEST: http://localhost:9000
+          CREDIT_SQS_ENDPOINT_TEST: http://localhost:9324
+          AWS_ACCESS_KEY_ID: credito
+          AWS_SECRET_ACCESS_KEY: credito_local_minio
+          AWS_DEFAULT_REGION: sa-east-1
         run: uv run pytest -q --cov=credit_analysis --cov-report=term-missing
 
       - name: Conferir que nenhum teste foi pulado em silencio
@@ -129,15 +160,22 @@ jobs:
         env:
           CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@localhost:5432/credito
           CREDIT_PROVEDOR_LLM: fake
+          CREDIT_S3_ENDPOINT_TEST: http://localhost:9000
+          CREDIT_SQS_ENDPOINT_TEST: http://localhost:9324
+          AWS_ACCESS_KEY_ID: credito
+          AWS_SECRET_ACCESS_KEY: credito_local_minio
+          AWS_DEFAULT_REGION: sa-east-1
         # `-rs` lista o motivo de cada skip. O grep falha o job se houver skip por
         # falta de Postgres — que e exatamente o cenario em que o pipeline pareceria
         # verde tendo exercitado 15 testes menos.
         run: |
           uv run pytest -q -rs 2>&1 | tee resultado.txt
-          if grep -q "CREDIT_POSTGRES_DSN nao definido" resultado.txt; then
-            echo "::error::Testes de integracao pulados — o service container nao foi alcancado"
-            exit 1
-          fi
+          for motivo in "CREDIT_POSTGRES_DSN nao definido"                         "CREDIT_S3_ENDPOINT_TEST nao definido"                         "CREDIT_SQS_ENDPOINT_TEST nao definido"; do
+            if grep -q "$motivo" resultado.txt; then
+              echo "::error::Testes de integracao pulados — $motivo"
+              exit 1
+            fi
+          done
 
   plataforma:
     name: Lint, tipagem e testes (plataforma)

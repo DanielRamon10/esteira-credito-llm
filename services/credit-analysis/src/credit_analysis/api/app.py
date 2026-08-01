@@ -7,6 +7,8 @@ repositorio limpo, sem monkeypatch e sem variavel global.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -47,6 +49,8 @@ from credit_analysis.infrastructure.armazenamento.memoria import (
     ArmazenamentoEmMemoria,
     FilaEmMemoria,
 )
+from credit_analysis.infrastructure.armazenamento.s3 import ArmazenamentoS3
+from credit_analysis.infrastructure.armazenamento.sqs import FilaSQS
 from credit_analysis.infrastructure.bureau import BureauStub
 from credit_analysis.infrastructure.kyc import ClienteKYCHttp
 from credit_analysis.infrastructure.llm.anthropic_adapter import LLMAnthropic, LLMFake
@@ -151,7 +155,27 @@ def criar_app(
             agente=(app_.state.agente.identificacao if app_.state.agente else "indisponivel"),
         )
 
+        tarefa_trabalhador: asyncio.Task[None] | None = None
+        if settings.trabalhador_em_processo:
+            tarefa_trabalhador = asyncio.create_task(
+                _laco_do_trabalhador(app_), name="trabalhador-extracao"
+            )
+            logger.info("trabalhador.em_processo_iniciado")
+
         yield
+
+        if tarefa_trabalhador is not None:
+            # Cancela e **espera** o cancelamento.
+            #
+            # Sem o `await`, o `lifespan` retorna com a tarefa ainda em voo: o event loop fecha
+            # embaixo dela e o asyncio reclama de "task was destroyed but it is pending". Pior,
+            # uma extracao no meio da aplicacao perderia o `salvar` — o documento ficaria
+            # `extraindo` e a mensagem voltaria para a fila, o que se recupera, mas com uma
+            # extracao inteira jogada fora a cada deploy.
+            tarefa_trabalhador.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await tarefa_trabalhador
+            logger.info("trabalhador.em_processo_encerrado")
 
         # Fecha o pool de conexoes HTTP do cliente de KYC junto com o resto: sem
         # isso o httpx reclama de cliente nao fechado no encerramento, e conexoes
@@ -193,8 +217,8 @@ def criar_app(
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)
     app.state.llm = llm or _montar_llm(settings)
     app.state.agente = agente  # montado no lifespan quando nao injetado
-    app.state.armazenamento = armazenamento or ArmazenamentoEmMemoria()
-    app.state.fila = fila or FilaEmMemoria()
+    app.state.armazenamento = armazenamento or _montar_armazenamento(settings)
+    app.state.fila = fila or _montar_fila(settings)
     app.state.kyc = kyc or _montar_kyc(settings)
 
     @app.middleware("http")
@@ -304,6 +328,86 @@ def _medir_llm(
     for direcao, quantidade in (("entrada", entrada), ("saida", saida)):
         if quantidade is not None:
             metricas.llm_tokens.labels(modelo=modelo, direcao=direcao).inc(quantidade)
+
+
+async def _laco_do_trabalhador(app_: FastAPI) -> None:
+    """Laco do trabalhador em processo.
+
+    Le os adapters de `app_.state` e nao os monta de novo: o armazenamento e a fila precisam ser
+    **os mesmos** que a API usa. Montando outros, o trabalhador em memoria consumiria uma fila
+    vazia — e com S3/SQS funcionaria por acidente, ate alguem trocar um endpoint num lugar so.
+
+    Excecao aqui **nao** derruba a API: um trabalhador que morre deixa a fila crescendo, o que o
+    alerta pega, enquanto uma API derrubada por falha de extracao para de aceitar analise. A
+    ordem de gravidade e clara.
+    """
+    from credit_analysis.application.use_cases.extracao_assincrona import ExtrairDocumento
+    from credit_analysis.application.use_cases.processar_documento import AplicarExtracao
+    from credit_analysis.application.use_cases.trabalhador import Trabalhador, laco
+
+    trabalhador = Trabalhador(
+        fila=app_.state.fila,
+        extrair=ExtrairDocumento(
+            armazenamento=app_.state.armazenamento, motor_ocr=app_.state.motor_ocr
+        ),
+        aplicar=AplicarExtracao(repositorio=app_.state.repositorio, bureau=app_.state.bureau),
+        repositorio=app_.state.repositorio,
+    )
+
+    try:
+        await laco(trabalhador)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.error("trabalhador.em_processo_morreu", exc_info=True)
+
+
+def _montar_armazenamento(settings: Settings) -> ArmazenamentoDocumentos:
+    """S3 quando configurado, memoria fora de producao, erro em producao.
+
+    A mesma assimetria de `_montar_kyc`, e pela mesma razao: documento de cliente num dicionario
+    de processo desaparece no primeiro restart. A POL-006 secao 5 exige guardar o original por 5
+    anos, e um servico que cumpre isso em memoria nao cumpre — ele apenas nao reclama.
+
+    Fora de producao o adapter em memoria e legitimo: e o que permite rodar a suite e o compose
+    sem MinIO no ar.
+    """
+    if not settings.usar_armazenamento_real:
+        if settings.producao:
+            raise RuntimeError(
+                "CREDIT_BUCKET_DOCUMENTOS e CREDIT_FILA_EXTRACAO_URL sao obrigatorias em "
+                "producao: em memoria, o documento que embasou um parecer desaparece no "
+                "primeiro restart, descumprindo a POL-006 secao 5."
+            )
+        logger.warning(
+            "armazenamento.em_memoria",
+            motivo="CREDIT_BUCKET_DOCUMENTOS ou CREDIT_FILA_EXTRACAO_URL vazia",
+            efeito="documentos nao sobrevivem ao restart",
+        )
+        return ArmazenamentoEmMemoria()
+
+    return ArmazenamentoS3(
+        bucket=settings.bucket_documentos,
+        regiao=settings.regiao_aws,
+        endpoint_url=settings.s3_endpoint or None,
+    )
+
+
+def _montar_fila(settings: Settings) -> FilaDeTrabalho:
+    """SQS quando configurada, memoria fora de producao.
+
+    A fila em memoria tem uma propriedade que a de verdade nao tem: ela morre com o processo. Isso
+    e aceitavel em desenvolvimento e seria perda de trabalho em producao — um deploy no meio de
+    uma extracao apagaria o pedido, e o documento ficaria `recebido` sem nada para retoma-lo.
+    """
+    if not settings.usar_armazenamento_real:
+        return FilaEmMemoria()
+
+    return FilaSQS(
+        url_da_fila=settings.fila_extracao_url,
+        regiao=settings.regiao_aws,
+        endpoint_url=settings.sqs_endpoint or None,
+    )
 
 
 def _montar_kyc(settings: Settings) -> ConsultaKYC | None:

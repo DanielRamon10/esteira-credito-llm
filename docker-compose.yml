@@ -68,6 +68,93 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ------------------------------------------------- Armazenamento (Camada 8)
+  #
+  # MinIO e ElasticMQ falam S3 e SQS, e sao livres e sem conta — o que preserva a restricao do
+  # projeto. O LocalStack faria os dois com o protocolo da AWS de verdade e passou a exigir auth
+  # token, que quebraria "roda sem conta em provedor nenhum".
+  #
+  # O que **nao** e exercitado por esta escolha: o runtime da Lambda, o empacotamento em container
+  # image e o gatilho de evento do S3. O handler da extracao roda (e o mesmo do trabalhador); o
+  # adapter da Lambda, nao. Fica na lista de "validado, nunca aplicado".
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: credito-minio
+    command: server /data --console-address ":9001"
+    environment:
+      # Credencial de desenvolvimento, e o valor esta aqui de proposito: e um servico local sem
+      # dado real. Chave de verdade nao entra em compose — o `.githooks/pre-commit` varre por
+      # formato de chave, e este par nao casa com nenhum dos padroes reais.
+      MINIO_ROOT_USER: credito
+      MINIO_ROOT_PASSWORD: credito_local_minio
+    ports:
+      # 9000 API, 9001 console. Console publicado porque inspecionar objeto durante depuracao e o
+      # que responde "o documento chegou?" mais rapido que qualquer log.
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_dados:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  # Cria o bucket **com versionamento** e sai.
+  #
+  # Um job e nao um passo na aplicacao: criar bucket exige `s3:CreateBucket`, e em producao o
+  # servico nao tem essa permissao — o bucket vem do Terraform. Fazer na aplicacao daria a ela um
+  # poder que ela nao deve ter, e o local deixaria de parecer com o remoto.
+  #
+  # O versionamento e o ponto: sem ele o S3 nao devolve `VersionId`, a `Referencia` perde a versao
+  # e a deduplicacao passa a descartar reenvio legitimo como duplicata. Nada falharia — o sistema
+  # so perderia documento de vez em quando. O `ArmazenamentoS3` recusa gravar sem `VersionId`, e
+  # este job e o que garante que ele nao precise recusar.
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: credito-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set local http://minio:9000 credito credito_local_minio &&
+      mc mb --ignore-existing local/credito-documentos &&
+      mc version enable local/credito-documentos &&
+      mc version info local/credito-documentos
+      "
+    restart: "no"
+
+  elasticmq:
+    image: softwaremill/elasticmq-native:1.6.14
+    container_name: credito-elasticmq
+    ports:
+      - "9324:9324"
+    volumes:
+      # As filas vem do arquivo, com a `RedrivePolicy` e a DLQ declaradas. Ver o comentario no
+      # proprio arquivo sobre por que nao sao criadas pela aplicacao.
+      - ./infra/elasticmq/elasticmq.conf:/opt/elasticmq.conf:ro
+    healthcheck:
+      # `?Action=ListQueues` e nao a raiz.
+      #
+      # Meu primeiro palpite foi `GET /`, e ele falha: o ElasticMQ e uma API de SQS, e requisicao
+      # sem `Action` nao e uma operacao valida. O compose ficou com o servico `unhealthy` enquanto
+      # ele respondia 200 a chamadas de verdade — e a API nao subia por `depends_on`, apontando
+      # para o lugar errado.
+      #
+      # `ListQueues` tambem e o check **certo** por outro motivo: ele exercita o gerenciador de
+      # filas, entao um servico que subiu mas nao carregou o `elasticmq.conf` reprovaria.
+      test:
+        - CMD-SHELL
+        - wget -q -O- "http://localhost:9324/?Action=ListQueues" >/dev/null || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
   kyc:
     build:
       # Contexto na raiz: o servico depende de `packages/plataforma`, que esta fora
@@ -167,6 +254,21 @@ services:
       # Gate de conformidade. Dentro da rede do compose o host e o nome do
       # servico; a porta e a interna (8100), nao a publicada.
       CREDIT_KYC_URL: http://kyc:8100
+      # Armazenamento e fila (Camada 8). Dentro da rede do compose os hosts sao os nomes dos
+      # servicos; as portas sao as internas.
+      CREDIT_BUCKET_DOCUMENTOS: credito-documentos
+      CREDIT_S3_ENDPOINT: http://minio:9000
+      CREDIT_FILA_EXTRACAO_URL: http://elasticmq:9324/000000000000/extracao-documentos
+      CREDIT_SQS_ENDPOINT: http://elasticmq:9324
+      # O boto3 exige credencial mesmo apontando para MinIO/ElasticMQ. Valores locais, iguais aos
+      # do MinIO acima; o ElasticMQ ignora a credencial e exige que ela exista.
+      AWS_ACCESS_KEY_ID: credito
+      AWS_SECRET_ACCESS_KEY: credito_local_minio
+      AWS_DEFAULT_REGION: sa-east-1
+      # Trabalhador junto da API. O processo separado exigiria repositorio compartilhado, que nao
+      # existe — ver `trabalhador_main.py`, que recusa subir explicando. Com isto, **uma replica**:
+      # com duas, a que publica pode nao ser a que consome.
+      CREDIT_TRABALHADOR_EM_PROCESSO: "true"
       CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO: /chaves/publica.pem
       CREDIT_AUTH_EMISSOR: https://local.esteira-credito.invalid
       # Credencial de servico para chamar o KYC. Vem do ambiente de quem sobe o compose:
@@ -205,6 +307,15 @@ services:
       # revisao manual desnecessaria.
       kyc:
         condition: service_healthy
+      minio:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+      # `service_completed_successfully` e nao `service_started`: sem o bucket criado **e** com
+      # versionamento, a primeira gravacao levantaria `VersionamentoDesabilitado`. Esperar o job
+      # terminar e o que transforma isso numa dependencia em vez de numa corrida.
+      minio-init:
+        condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -274,3 +385,4 @@ volumes:
   prometheus_dados:
   tempo_dados:
   grafana_dados:
+  minio_dados:

@@ -19,6 +19,10 @@ dependencies = [
     # dependencia direta, mas declarar o extra deixa a intencao explicita: sem ele um
     # `uv sync` futuro poderia resolver a plataforma sem o modulo e o import quebraria.
     "plataforma[llm,metricas,auth]",
+    # S3 e SQS. `boto3` sincrono chamado com `asyncio.to_thread`, e nao `aioboto3`: o padrao ja
+    # existe no projeto (escrita em disco no upload) e substituir o cliente oficial por um de
+    # terceiros para ganhar o que o `to_thread` resolve nao se paga.
+    "boto3>=1.35",
     # RAG: embeddings locais via ONNX (sem torch) e parsing do front-matter.
     "fastembed>=0.4",
     "pyyaml>=6.0",
@@ -56,6 +60,9 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "pandas-stubs>=2.2",
+    # Sem os stubs, `boto3` entra como `Any` e **toda** checagem a jusante do import deixa de
+    # valer — o mesmo modo de falha silencioso do `py.typed` ausente na plataforma.
+    "boto3-stubs[s3,sqs]>=1.35",
     "types-PyYAML>=6.0",
 ]
 

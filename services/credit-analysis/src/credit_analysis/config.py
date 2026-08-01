@@ -142,6 +142,43 @@ class Settings(BaseSettings):
     kyc_timeout_segundos: float = Field(default=3.0, gt=0)
     kyc_tentativas: int = Field(default=2, ge=1, le=5)
 
+    # --- Armazenamento e fila (Camada 8) ---
+    #
+    # Vazios = adapters em memoria. Em `prod` isso e ERRO de subida, pela mesma razao do gate de
+    # KYC: documento de cliente em dicionario de processo desaparece no primeiro restart, e a
+    # POL-006 secao 5 exige guardar o original por 5 anos. Ver `_montar_armazenamento`.
+    # Regiao para os clientes de S3 e SQS. `sa-east-1` por residencia de dado: documento de
+    # credito de cliente brasileiro sob LGPD nao deve sair do pais sem necessidade — a mesma
+    # razao do default no Terraform.
+    regiao_aws: str = "sa-east-1"
+    bucket_documentos: str = ""
+    fila_extracao_url: str = ""
+
+    # Endpoint alternativo, para o MinIO e o ElasticMQ locais. Vazio = a AWS resolve o endereco
+    # regional. Passar o endereco da AWS a mao funcionaria e quebraria em outra regiao.
+    s3_endpoint: str = ""
+    sqs_endpoint: str = ""
+
+    # Roda o trabalhador de extracao **dentro** do processo da API.
+    #
+    # ## Por que isto existe, e a limitacao que ele carrega
+    #
+    # O trabalhador como processo separado exigiria um repositorio de analise compartilhado, e ele
+    # nao existe: a unica implementacao e em memoria (ver `trabalhador_main.py`, que recusa subir
+    # explicando isso).
+    #
+    # Em processo, o trabalhador compartilha o repositorio por estar no mesmo espaco de memoria, e
+    # o fluxo assincrono funciona de ponta a ponta — com S3 e SQS de verdade guardando documento e
+    # pedido.
+    #
+    # **A limitacao e uma replica.** Com duas, a replica A publica na fila e a B pode consumir; a B
+    # nao tem a analise no repositorio dela, e a extracao falha como permanente. O manifest do
+    # Kubernetes fixa `replicas: 1` quando isto esta ligado, e o comentario la diz por que.
+    #
+    # Default `false`: um trabalhador subindo por acidente numa replica de API que nao deveria
+    # consumir e pior que nao ter trabalhador — ele competiria por mensagens com quem deveria.
+    trabalhador_em_processo: bool = False
+
     # --- Autenticacao (Camada 7) ---
     #
     # **Nao existe `auth_habilitado`.** Autenticacao que se desliga por variavel de
@@ -239,6 +276,15 @@ class Settings(BaseSettings):
             # para configuracao ausente.
             raise ValueError("CREDIT_AUTH_EMISSOR e obrigatorio")
         return self
+
+    @property
+    def usar_armazenamento_real(self) -> bool:
+        """Se ha S3 e fila configurados. Os dois juntos, nao um ou outro.
+
+        Meio configurado e pior que nada: com bucket e sem fila, o documento seria guardado e
+        nunca extraido — e o estado ficaria `recebido` para sempre, sem nada indicando por que.
+        """
+        return bool(self.bucket_documentos.strip() and self.fila_extracao_url.strip())
 
     @property
     def usar_pgvector(self) -> bool:

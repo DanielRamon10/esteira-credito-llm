@@ -48,6 +48,7 @@ from credit_analysis.domain.extracao_assincrona import (
     Entrega,
     PedidoDeExtracao,
 )
+from credit_analysis.infrastructure.armazenamento.s3 import ReferenciaInvalida
 from credit_analysis.infrastructure.observabilidade import metricas
 from credit_analysis.infrastructure.ocr.documentos import ErroLeituraDocumento
 
@@ -68,6 +69,10 @@ ERROS_PERMANENTES: tuple[type[Exception], ...] = (
     AnaliseNaoEncontrada,
     # Documento sem pagina processavel. E o mesmo arquivo em toda tentativa.
     DadosInsuficientes,
+    # Referencia malformada no pedido. Descoberto testando contra o MinIO: version id invalido
+    # devolve `InvalidArgument`, e nao `NoSuchVersion`. Sem esta entrada, cairia no default
+    # transitorio e gastaria tres tentativas de OCR para descobrir algo certo na primeira.
+    ReferenciaInvalida,
 )
 
 
