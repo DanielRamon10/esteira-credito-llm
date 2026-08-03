@@ -169,6 +169,66 @@ DATA HISTORICO VALOR SALDO
         transacoes, _ = extrair_transacoes(ocr(texto))
         assert transacoes[0].data == date(2025, 1, 5)
 
+    def test_data_colada_na_descricao(self) -> None:
+        """A linha exata que o Tesseract produziu no CI, e que fazia o extrato inteiro sumir.
+
+        O texto vem de uma execucao real dentro do container Debian — nao foi construido a mao:
+
+            05/01/2025CREDITO SALARIO EMPRESA 8.032,14 € 11.232,14
+
+        Duas corrupcoes ao mesmo tempo, e cada uma tem um destino diferente:
+
+        - **data colada na descricao.** O padrao antigo exigia espaco depois do ano, entao nenhuma
+          linha casava. O sintoma era o pior possivel: 0 lancamentos e **0 rejeitados**, ou seja
+          renda apurada zero sem uma linha para investigar;
+        - **`C` lido como `€`.** Sem sufixo legivel e sendo a primeira linha (nao ha saldo anterior
+          para comparar), o dominio **rejeita** — assumir credito na duvida inflaria a renda. Aqui
+          isso e o comportamento certo, e nao um efeito colateral da correcao.
+
+        A diferenca que este teste prende, entao, e de 0 lancamentos e 0 rejeitados (perda total,
+        silenciosa) para 2 lancamentos e 1 rejeitado (o que nao deu para ler, aparecendo como tal).
+
+        O teste esta aqui e nao na avaliacao de OCR porque a avaliacao depende da fonte instalada
+        (Arial no Windows, DejaVu no Linux) e por isso le numeros diferentes por maquina. Este texto
+        e fixo.
+        """
+        texto = (
+            "DATA HISTORICO VALOR SALDO\n"
+            "05/01/2025CREDITO SALARIO EMPRESA 8.032,14 € 11.232,14\n"
+            "10/01/2025PAGAMENTO CARTÃO CREDITO 2.311,54 D 8.920,60\n"
+            "15/01/2025ALUGUEL IMOVEL RESIDENCIAL 2.100,00 D 6.820,60\n"
+        )
+        transacoes, rejeitadas = extrair_transacoes(ocr(texto))
+
+        assert [t.valor.valor for t in transacoes] == [
+            Decimal("-2311.54"),
+            Decimal("-2100.00"),
+        ]
+        # A linha do salario aparece como rejeitada, e nao desaparece.
+        assert len(rejeitadas) == 1
+        assert "8.032,14" in rejeitadas[0]
+
+        # A descricao nao pode carregar a data: ela vai para o parecer e para a auditoria.
+        assert transacoes[0].descricao.startswith("PAGAMENTO")
+        assert transacoes[0].data == date(2025, 1, 10)
+
+    def test_ano_de_dois_digitos_colado_no_valor(self) -> None:
+        """O defeito que a correcao poderia ter introduzido, e o motivo da alternancia no ano.
+
+        Trocar `\\s+` por `\\s*` mantendo `\\d{2,4}` no ano faria o guloso engolir a coluna
+        seguinte: em `05/01/2512,50 D`, o ano viraria `2512` e o resto `,50 D` — valor perdido, e
+        de novo em silencio.
+
+        A alternancia `(?:19|20)\\d{2}|\\d{2}` decide pela forma do ano: `25` nao comeca com 19 nem
+        20, entao o ramo de quatro digitos falha e sobra o de dois.
+        """
+        texto = "DATA HIST VALOR SALDO\n05/01/2512,50 D 987,50\n"
+        transacoes, rejeitadas = extrair_transacoes(ocr(texto))
+
+        assert rejeitadas == []
+        assert transacoes[0].data == date(2025, 1, 5)
+        assert transacoes[0].valor.valor == Decimal("-12.50")
+
     def test_texto_sem_lancamento_devolve_vazio(self) -> None:
         transacoes, rejeitadas = extrair_transacoes(ocr("EXTRATO\nnenhum lancamento aqui"))
         assert transacoes == []

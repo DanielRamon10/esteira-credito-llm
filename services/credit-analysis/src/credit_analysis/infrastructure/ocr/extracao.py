@@ -202,8 +202,37 @@ def _extrair_empregador(texto: str) -> CampoExtraido | None:
 # regex casava a coluna de SALDO como se fosse o valor. Sem sufixo D, um
 # debito de R$ 2.100 virava um credito de R$ 6.820 — erro que **infla a renda
 # aparente**, exatamente a direcao que uma esteira de credito nao pode errar.
+#
+# ## O espaco depois da data e opcional, e isso foi encontrado por medicao
+#
+# A versao anterior exigia `\s+` entre o ano e o resto da linha, e ela funcionava — na maquina de
+# quem a escreveu. No CI, a mesma avaliacao leu 0 lancamentos de 24, com `linhas_rejeitadas=0`:
+# nenhuma linha casava o padrao, e o extrato inteiro sumia sem nada ser rejeitado.
+#
+# A causa esta no texto que o Tesseract produziu:
+#
+#     05/01/2025CREDITO SALARIO EMPRESA 8.032,14 € 11.232,14
+#
+# A data cola na descricao. O gerador de documento sintetico resolve a fonte pelo que existe no
+# sistema (Arial no Windows, DejaVu no Linux), as metricas das duas diferem, e com DejaVu as
+# colunas ficam proximas o suficiente para o Tesseract nao emitir o espaco.
+#
+# **Nao e artefato de teste.** Extrato escaneado de verdade cola coluna assim — e um parser que
+# exige espaco depois da data descarta a linha inteira em silencio, que e o pior desfecho possivel:
+# renda apurada zero em vez de renda apurada errada, e nenhuma linha rejeitada para investigar.
+#
+# ## Por que o ano nao e `\d{2,4}` com `\s*`
+#
+# Trocar so o `\s+` por `\s*` cria um defeito novo. Com `\d{2,4}` guloso e ano de dois digitos
+# colado na coluna seguinte, `05/01/2512,50 D` faria o ano virar `2512` e o resto `,50 D` — o valor
+# do lancamento seria perdido.
+#
+# A alternancia resolve pela forma do ano e nao pelo espaco: quatro digitos **somente** se
+# comecarem com 19 ou 20, senao dois. No exemplo acima o ramo de quatro falha (`25` nao e 19 nem
+# 20), cai para dois digitos, e o resto fica `12,50 D`.
 _INICIO_LANCAMENTO = re.compile(
-    r"^\s*(?P<dia>\d{2})\s*/\s*(?P<mes>\d{2})\s*/\s*(?P<ano>\d{2,4})\s+(?P<resto>.+)$",
+    r"^\s*(?P<dia>\d{2})\s*/\s*(?P<mes>\d{2})\s*/\s*"
+    r"(?P<ano>(?:19|20)\d{2}|\d{2})\s*(?P<resto>.+)$",
     re.MULTILINE,
 )
 
