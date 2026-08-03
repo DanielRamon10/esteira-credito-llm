@@ -69,7 +69,25 @@ pytestmark = [
 # do Tesseract sem virar teste instavel.
 CONFIANCA_MINIMA_LIMPO = 85.0
 CAMPOS_MINIMOS_LIMPO = 5
-LANCAMENTOS_MINIMOS_LIMPO = 22  # de 24
+
+# 20 de 24, e a folga foi recalibrada por medicao em **dois** ambientes.
+#
+# Estava 22, valor com folga de 1 sobre os 23 lidos no Windows — onde o gerador resolve a fonte para
+# Arial. No Linux, com DejaVu, a mesma imagem produz texto diferente (166 palavras contra 188) e o
+# resultado correto e 22 lidos com 2 rejeitados:
+#
+# - a primeira linha de salario tem o sufixo `C` lido como `€` e, sendo a primeira, nao tem saldo
+#   anterior para resolver a direcao — rejeitar e o comportamento certo;
+# - uma linha teve o ano corrompido (`2025` lido como `202`) e cai fora do periodo declarado.
+#
+# Ou seja: 22 com folga zero, num piso cujo comentario prometia folga. Piso sem folga nao e piso, e
+# a origem do problema nao e o numero — e o **input variar por maquina**, que so se resolve
+# versionando uma fonte no repositorio (~700KB) para os dois ambientes renderizarem igual.
+#
+# Enquanto isso nao acontecer, o piso tem que tolerar a pior renderizacao conhecida. A afirmacao que
+# nao depende de fonte nenhuma esta em `test_nenhuma_linha_de_lancamento_desaparece`, e e ela que
+# pega perda silenciosa.
+LANCAMENTOS_MINIMOS_LIMPO = 20  # de 24
 
 PERFIS_POR_NOME = {p.nome: p for p in PERFIS}
 
@@ -192,6 +210,28 @@ class TestExtratoBancario:
         transacoes, _ = extrair_transacoes(ocr)
 
         assert len(transacoes) >= LANCAMENTOS_MINIMOS_LIMPO
+
+    async def test_nenhuma_linha_de_lancamento_desaparece(
+        self, motor: OCRTesseract, extrato: ExtratoBancario
+    ) -> None:
+        """A assercao que **nao** depende da qualidade do OCR, e a que faltava.
+
+        `len(transacoes) >= 22` mede acuracia, e acuracia varia com o ambiente: a fonte do gerador
+        e resolvida pelo que existe no sistema (Arial no Windows, DejaVu no Linux), e as duas
+        renderizacoes produzem texto diferente — 188 contra 166 palavras, medido.
+
+        Esta mede outra coisa: **conservacao**. Cada linha de lancamento termina lida ou rejeitada,
+        e as duas listas somadas tem que dar o total. Vale com qualquer fonte, qualquer versao de
+        Tesseract e qualquer qualidade de imagem, porque nao e uma afirmacao sobre ler bem — e sobre
+        nao perder em silencio.
+
+        E era exatamente esta a falha original: 0 lidos e 0 rejeitados de 24, com `0 + 0 = 0`. O
+        piso de acuracia pegou o sintoma; esta assercao nomeia a causa.
+        """
+        ocr = await motor.extrair(np.asarray(extrato.renderizar()))
+        transacoes, rejeitadas = extrair_transacoes(ocr)
+
+        assert len(transacoes) + len(rejeitadas) == len(extrato.lancamentos)
 
     async def test_renda_mediana_bate_com_o_salario(
         self, motor: OCRTesseract, extrato: ExtratoBancario

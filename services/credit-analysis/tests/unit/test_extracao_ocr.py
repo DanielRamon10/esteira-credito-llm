@@ -213,14 +213,13 @@ DATA HISTORICO VALOR SALDO
         assert transacoes[0].data == date(2025, 1, 10)
 
     def test_ano_de_dois_digitos_colado_no_valor(self) -> None:
-        """O defeito que a correcao poderia ter introduzido, e o motivo da alternancia no ano.
+        """Por que o ano nao pode ser `\\d{2,4}` guloso, agora que o espaco e opcional.
 
-        Trocar `\\s+` por `\\s*` mantendo `\\d{2,4}` no ano faria o guloso engolir a coluna
-        seguinte: em `05/01/2512,50 D`, o ano viraria `2512` e o resto `,50 D` — valor perdido, e
-        de novo em silencio.
+        Com `\\d{2,4}` e `\\s*`, em `05/01/2512,50 D` o ano viraria `2512` e o resto `,50 D` — o
+        valor do lancamento perdido, em silencio.
 
-        A alternancia `(?:19|20)\\d{2}|\\d{2}` decide pela forma do ano: `25` nao comeca com 19 nem
-        20, entao o ramo de quatro digitos falha e sobra o de dois.
+        A alternancia `(?:19|20)\\d{2}|\\d{2}` decide pela forma: `25` nao comeca com 19 nem 20,
+        entao o ramo de quatro digitos falha e sobra o de dois, com o resto `12,50 D 987,50`.
         """
         texto = "DATA HIST VALOR SALDO\n05/01/2512,50 D 987,50\n"
         transacoes, rejeitadas = extrair_transacoes(ocr(texto))
@@ -228,6 +227,78 @@ DATA HISTORICO VALOR SALDO
         assert rejeitadas == []
         assert transacoes[0].data == date(2025, 1, 5)
         assert transacoes[0].valor.valor == Decimal("-12.50")
+
+    def test_data_fora_do_periodo_declarado_e_rejeitada(self) -> None:
+        """A linha exata do runner, e o mecanismo que a pega.
+
+            10/05/202PAGAMENTO CARTAO CREDITO 2.137,54 D ...
+
+        O Tesseract comeu o `5` de `2025`. O ramo de quatro digitos falha, sobra o de dois (`20`), e
+        a data vira **10/05/2020** — plausivel em forma e impossivel em contexto. Aceita-la inflou
+        `meses_analisados` de 6 para 7 no CI, e extrato que parece cobrir mais periodo do que cobre
+        passa por politica de minimo de meses que deveria reprovar.
+
+        Recusar pela **forma** nao funciona, e isso foi medido: `(?!\\d)` depois do ano derruba
+        `20/01/20255UPERMERCADO`, onde o `5` e o S de SUPERMERCADO e o ano esta correto. As duas
+        linhas sao indistinguiveis pela forma.
+
+        O que distingue esta no documento — `Periodo: 01/01/2025 a 20/06/2025` — e e a conferencia
+        que um analista faz na mao.
+        """
+        texto = (
+            "Periodo: 01/01/2025 a 20/06/2025\n"
+            "DATA HISTORICO VALOR SALDO\n"
+            "05/05/2025 CREDITO SALARIO 8.000,00 C 11.000,00\n"
+            "10/05/202PAGAMENTO CARTAO CREDITO 2.137,54 D 8.862,46\n"
+        )
+        transacoes, rejeitadas = extrair_transacoes(ocr(texto))
+
+        assert {t.data.year for t in transacoes} == {2025}
+        # A linha nao desaparece: ela aparece como rejeitada, para o parecer poder dizer isso.
+        assert len(rejeitadas) == 1
+        assert "202PAGAMENTO" in rejeitadas[0]
+
+    def test_sem_cabecalho_de_periodo_nao_ha_filtro(self) -> None:
+        """Sem periodo legivel, o parser nao inventa um.
+
+        Inferir o periodo das proprias datas seria circular: as datas sao o que esta sob suspeita.
+        Entao a mesma linha do teste acima, sem cabecalho, e aceita — e essa e a escolha certa,
+        porque a alternativa e rejeitar lancamento bom por um periodo adivinhado.
+        """
+        texto = (
+            "DATA HISTORICO VALOR SALDO\n"
+            "05/05/2025 CREDITO SALARIO 8.000,00 C 11.000,00\n"
+            "10/05/202PAGAMENTO CARTAO CREDITO 2.137,54 D 8.862,46\n"
+        )
+        transacoes, _ = extrair_transacoes(ocr(texto))
+
+        assert {t.data.year for t in transacoes} == {2020, 2025}
+
+    def test_rejeicao_por_periodo_nao_quebra_a_cadeia_de_saldo(self) -> None:
+        """A cascata que uma correcao anterior causou, e que a ordem das operacoes evita.
+
+        Quando a linha era recusada antes de chegar ao decompositor, o **saldo dela saia da cadeia**
+        — e os creditos de salario seguintes, cujo sufixo `C` o OCR leu como `€`, perdiam a unica
+        forma de resolver a direcao. No CI isso levou de 23 transacoes para 11, com zero creditos, e
+        o dominio recusou o extrato inteiro por falta de renda comprovada.
+
+        Aqui a linha do meio e rejeitada por periodo e a seguinte, sem sufixo legivel, ainda resolve
+        pela variacao de saldo — porque `saldo_anterior` e atualizado antes da rejeicao.
+        """
+        texto = (
+            "Periodo: 01/05/2025 a 31/05/2025\n"
+            "DATA HISTORICO VALOR SALDO\n"
+            "05/05/2025 CREDITO SALARIO 8.000,00 C 11.000,00\n"
+            "10/05/202PAGAMENTO CARTAO 2.000,00 D 9.000,00\n"
+            "15/05/2025CREDITO BONUS 1.500,00 € 10.500,00\n"
+        )
+        transacoes, rejeitadas = extrair_transacoes(ocr(texto))
+
+        valores = {t.descricao: t.valor.valor for t in transacoes}
+        assert len(rejeitadas) == 1
+        # O bonus resolve pela variacao 9.000,00 -> 10.500,00, que so existe porque o saldo da
+        # linha rejeitada continuou na cadeia.
+        assert valores["CREDITO BONUS"] == Decimal("1500.00")
 
     def test_texto_sem_lancamento_devolve_vazio(self) -> None:
         transacoes, rejeitadas = extrair_transacoes(ocr("EXTRATO\nnenhum lancamento aqui"))

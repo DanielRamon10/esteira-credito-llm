@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import structlog
@@ -230,11 +230,68 @@ def _extrair_empregador(texto: str) -> CampoExtraido | None:
 # A alternancia resolve pela forma do ano e nao pelo espaco: quatro digitos **somente** se
 # comecarem com 19 ou 20, senao dois. No exemplo acima o ramo de quatro falha (`25` nao e 19 nem
 # 20), cai para dois digitos, e o resto fica `12,50 D`.
+#
+# ## O que **nao** funciona: exigir que o ano nao seja seguido de digito
+#
+# Com a alternancia sozinha, o CI passou de 0 para 23 lancamentos e falhou noutro ponto:
+# `meses_analisados == 7` num extrato de 6 meses, por causa desta linha do mesmo runner:
+#
+#     10/05/202PAGAMENTO CARTAO CREDITO 2.137,54 D ...
+#
+# Tres digitos no campo do ano: o Tesseract comeu o `5` de `2025`. O ramo de quatro digitos falha,
+# sobra `\d{2}` = `20`, o resto fica `2PAGAMENTO...` e a data vira **10/05/2020**.
+#
+# A correcao obvia seria `(?!\d)` depois do ano, recusando ano seguido de digito. Foi medida no
+# mesmo ambiente e **derrubou 12 lancamentos legitimos**, porque estas linhas tem forma identica:
+#
+#     20/01/20255UPERMERCADO COMPRA 612,51 D ...
+#
+# Aqui o ano e 2025 e o `5` e o **S de SUPERMERCADO** — digito depois do ano, e o ano esta correto.
+# Nada na forma da linha distingue "digito sobrando no ano" de "descricao comecando com digito", e a
+# mesma regra que salva um caso destroi o outro.
+#
+# E o efeito foi pior que perder as 12: linha recusada no estagio da regex nunca chega ao
+# `_decompor_linhas`, entao o **saldo dela sai da cadeia** — e sem cadeia de saldo os 6 creditos de
+# salario (cujo sufixo `C` o OCR leu como `€`) perderam a unica forma de resolver a direcao. De 23
+# transacoes para 11, com zero creditos, e o dominio recusando o extrato inteiro por falta de renda.
+#
+# A licao: a forma da linha nao carrega a informacao necessaria. O **documento** carrega, e e de la
+# que a validacao vem — ver `_PERIODO` logo abaixo.
 _INICIO_LANCAMENTO = re.compile(
-    r"^\s*(?P<dia>\d{2})\s*/\s*(?P<mes>\d{2})\s*/\s*"
+    r"^[^\S\n]*(?P<dia>\d{2})\s*/\s*(?P<mes>\d{2})\s*/\s*"
     r"(?P<ano>(?:19|20)\d{2}|\d{2})\s*(?P<resto>.+)$",
     re.MULTILINE,
 )
+
+# O periodo declarado no cabecalho do extrato.
+#
+# `Periodo: 01/01/2025 a 20/06/2025` — presente em extrato de qualquer banco, porque e o que define
+# o que o documento cobre. E a fonte que distingue as duas linhas de forma identica acima: uma data
+# de 2020 contradiz o proprio documento e uma de 2025 nao, e essa e a conferencia que um analista
+# faz na mao.
+#
+# Tolerante na acentuacao (`per[ií]?odo`) porque o OCR erra o `í`, e no separador porque ele varia
+# por banco. Quando o cabecalho nao existe ou nao e legivel, nao ha filtro — a alternativa seria
+# inventar um periodo, que e o erro que este bloco todo existe para nao cometer.
+_PERIODO = re.compile(
+    r"per[ií]?odo[:\s]+(\d{2})\s*/\s*(\d{2})\s*/\s*(\d{4})\s*(?:a|-|ate|até)\s*"
+    r"(\d{2})\s*/\s*(\d{2})\s*/\s*(\d{4})",
+    re.IGNORECASE,
+)
+
+# ## Uma tentativa que foi removida, e por que ela nao servia
+#
+# Houve aqui um `_LINHA_COM_DATA_ILEGIVEL = r"^\s*\d{2}/\d{2}/\d{2,}"`, para rejeitar linha com cara
+# de lancamento que nao casasse o padrao — a ideia era o defeito da data colada nao poder voltar em
+# silencio.
+#
+# Com a alternancia no ano ela ficou **inalcancavel**: se dois digitos aparecem depois da segunda
+# barra, o ramo `\d{2}` casa sempre. O unico caso que sobrava era linha que termina na data, e essa
+# nao tem valor monetario — ou seja, nao e lancamento perdido.
+#
+# Ficou registrado em vez de apagado porque a propriedade que ela buscava e legitima e passou a ser
+# garantida em outro lugar: data que contradiz o periodo do documento entra em `rejeitadas`, e nao
+# no vazio. Guarda de seguranca inalcancavel com um comentario confiante e pior que nenhuma.
 
 # Valor monetario com sufixo C/D opcional, em qualquer posicao da linha.
 _VALOR_COM_TIPO = re.compile(rf"(?P<valor>-?{_VALOR})\s*(?P<tipo>[CD])?(?![\d,\.])")
@@ -280,12 +337,27 @@ def extrair_transacoes(ocr: ResultadoOCR) -> tuple[list[Transacao], list[str]]:
     transacoes: list[Transacao] = []
     rejeitadas: list[str] = []
     saldo_anterior: Decimal | None = None
+    periodo = _periodo_declarado(ocr.texto)
 
     for decomposta in _decompor_linhas(ocr.texto, rejeitadas):
         direcao = _resolver_direcao(decomposta, saldo_anterior)
 
+        # O saldo entra na cadeia **antes** de qualquer rejeicao, e essa ordem e o que impede o
+        # efeito em cascata: uma linha descartada ainda serve de digito verificador para a
+        # seguinte. Medido pelo avesso — quando uma correcao fez linhas serem recusadas antes deste
+        # ponto, os 6 creditos de salario seguintes perderam a referencia e o extrato inteiro caiu.
         if decomposta.saldo is not None:
             saldo_anterior = decomposta.saldo
+
+        # Data que contradiz o periodo do proprio documento nao e lancamento: e leitura errada.
+        #
+        # Um digito a mais no ano (`2025` lido como `20202`) produz uma data de 2020 plausivel em
+        # forma e impossivel em contexto. Aceita-la infla `meses_analisados`, e extrato que parece
+        # cobrir mais periodo do que cobre passa por politica de minimo de meses que deveria
+        # reprovar.
+        if periodo is not None and not (periodo[0] <= decomposta.data <= periodo[1]):
+            rejeitadas.append(decomposta.linha)
+            continue
 
         if direcao is None:
             rejeitadas.append(decomposta.linha)
@@ -308,6 +380,28 @@ def extrair_transacoes(ocr: ResultadoOCR) -> tuple[list[Transacao], list[str]]:
     return transacoes, rejeitadas
 
 
+def _periodo_declarado(texto: str) -> tuple[date, date] | None:
+    """O intervalo que o cabecalho do extrato declara, ou None quando nao da para ler.
+
+    Uma folga de um dia em cada ponta: extrato costuma listar lancamento com data de efetivacao um
+    dia fora do periodo pedido, e rejeitar por causa disso descartaria linha boa. A folga e pequena
+    de proposito — ela cobre arredondamento de fronteira, nao erro de ano.
+
+    Devolver None quando o cabecalho falta e deliberado: sem periodo, nao ha filtro. Inferir o
+    periodo das proprias datas seria circular — as datas sao justamente o que esta sob suspeita.
+    """
+    achado = _PERIODO.search(texto)
+    if achado is None:
+        return None
+
+    inicio = _parsear_data(achado.group(1), achado.group(2), achado.group(3))
+    fim = _parsear_data(achado.group(4), achado.group(5), achado.group(6))
+    if inicio is None or fim is None or fim < inicio:
+        return None
+
+    return inicio - timedelta(days=1), fim + timedelta(days=1)
+
+
 def _decompor_linhas(texto: str, rejeitadas: list[str]) -> list[_LinhaExtrato]:
     """Separa cada linha de lancamento em data, historico, valor e saldo.
 
@@ -317,7 +411,14 @@ def _decompor_linhas(texto: str, rejeitadas: list[str]) -> list[_LinhaExtrato]:
     """
     resultado: list[_LinhaExtrato] = []
 
-    for match in _INICIO_LANCAMENTO.finditer(texto):
+    # Varredura por linha e nao `finditer` no texto inteiro. O resultado e o mesmo — o padrao e
+    # ancorado em `^...$` com MULTILINE, portanto nunca cruza linha — e por linha a leitura fica
+    # obvia: uma linha, uma tentativa de casar.
+    for bruta in texto.splitlines():
+        match = _INICIO_LANCAMENTO.match(bruta)
+        if match is None:
+            continue
+
         linha = match.group(0).strip()
         resto = match.group("resto")
 
