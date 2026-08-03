@@ -265,10 +265,15 @@ services:
       AWS_ACCESS_KEY_ID: credito
       AWS_SECRET_ACCESS_KEY: credito_local_minio
       AWS_DEFAULT_REGION: sa-east-1
-      # Trabalhador junto da API. O processo separado exigiria repositorio compartilhado, que nao
-      # existe — ver `trabalhador_main.py`, que recusa subir explicando. Com isto, **uma replica**:
-      # com duas, a que publica pode nao ser a que consome.
-      CREDIT_TRABALHADOR_EM_PROCESSO: "true"
+      # Trabalhador **fora** deste processo, no servico `trabalhador` abaixo.
+      #
+      # Ficou `true` durante a Camada 8 inteira por falta de repositorio compartilhado: sem ele,
+      # a replica que publica podia nao ser a que consome, e a API estava limitada a uma replica.
+      # Com o repositorio em Postgres (Camada 9) a limitacao caiu, e o valor volta ao default.
+      #
+      # A flag continua existindo porque ela e util em desenvolvimento — um processo em vez de
+      # dois. O que ela nao e mais e a unica forma de o fluxo funcionar.
+      CREDIT_TRABALHADOR_EM_PROCESSO: "false"
       CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO: /chaves/publica.pem
       CREDIT_AUTH_EMISSOR: https://local.esteira-credito.invalid
       # Credencial de servico para chamar o KYC. Vem do ambiente de quem sobe o compose:
@@ -318,6 +323,75 @@ services:
         condition: service_completed_successfully
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # Trabalhador de extracao: consumidor de fila, sem servidor HTTP.
+  #
+  # ## Mesma imagem, entrypoint diferente
+  #
+  # `image: credit-analysis:dev` sem `build`: a imagem e a que o servico `api` constroi, e
+  # duplicar o `build` faria o Compose construir duas vezes o mesmo Dockerfile. A dependencia de
+  # ordem esta no `depends_on` da propria API.
+  #
+  # ## O que ele **nao** tem, e por que isso e o ponto
+  #
+  # - **sem porta publicada e sem probe HTTP.** Processo vivo nao significa consumindo, e um 200
+  #   num trabalhador travado seria pior que nada. O sinal de saude e a profundidade da fila —
+  #   `DocumentosPresosNaExtracao` nos alertas;
+  # - **sem chave de auth montada.** Ele nao verifica token nenhum. Isto exigiu mover a exigencia
+  #   de fonte de chave do validador de `Settings` para `montar_chaveiro` (Camada 9): antes,
+  #   compartilhar `Settings` obrigava a montar aqui material de auth que nunca seria usado;
+  # - **sem `CREDIT_KYC_URL` e sem credencial de servico.** O gate de conformidade roda na
+  #   reavaliacao dentro da API; a extracao le documento e produz texto;
+  # - **sem cache de modelo de embedding.** Os 2,24GB sao do RAG de politicas, que e da API.
+  #
+  # A soma disso e um processo com superficie menor lidando com a entrada mais exposta do sistema
+  # — arquivo enviado por terceiro. E o mesmo raciocinio da politica IAM da Lambda em
+  # `infra/terraform/extracao.tf`, que da a ela `GetObject` e nao `PutObject`.
+  trabalhador:
+    image: credit-analysis:dev
+    container_name: credito-trabalhador
+    profiles: ["api"]
+    command: ["python", "-m", "credit_analysis.trabalhador_main"]
+    environment:
+      CREDIT_POSTGRES_DSN: postgresql://credito:credito_local@postgres:5432/credito
+      CREDIT_AMBIENTE: local
+      CREDIT_LOG_JSON: "true"
+      CREDIT_BUCKET_DOCUMENTOS: credito-documentos
+      CREDIT_S3_ENDPOINT: http://minio:9000
+      CREDIT_FILA_EXTRACAO_URL: http://elasticmq:9324/000000000000/extracao-documentos
+      CREDIT_SQS_ENDPOINT: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: credito
+      AWS_SECRET_ACCESS_KEY: credito_local_minio
+      AWS_DEFAULT_REGION: sa-east-1
+      # `fake` e nao `ollama`: o trabalhador nao gera parecer. Sem isto, `Settings` aceitaria o
+      # default e o valor ficaria como uma pista falsa de que este processo fala com LLM.
+      CREDIT_PROVEDOR_LLM: fake
+    # Healthcheck **desligado**, e nao herdado.
+    #
+    # A imagem declara `HEALTHCHECK curl http://localhost:8000/health`, que existe para a API. Neste
+    # container nao ha servidor HTTP nenhum, e o resultado foi medido: `Up 1 minute (unhealthy)` com
+    # o trabalhador consumindo a fila normalmente.
+    #
+    # Um container marcado unhealthy sem nada errado e pior que nenhum healthcheck: e o sinal que
+    # ensina quem opera a ignorar a coluna de status. O sinal certo para consumidor de fila e a
+    # profundidade dela — `DocumentosPresosNaExtracao` em `infra/observabilidade/alertas.yml`.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      elasticmq:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      # A API tambem, e por um motivo de build e nao de execucao: e ela que constroi
+      # `credit-analysis:dev`. Sem isto, um `up` limpo com este servico sozinho falharia com
+      # "imagem nao encontrada".
+      api:
+        condition: service_started
     restart: unless-stopped
 
   prometheus:

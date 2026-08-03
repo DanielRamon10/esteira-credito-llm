@@ -210,8 +210,39 @@ groups:
           resumo: "Mais de 5 documentos recebidos sem extracao concluida em 30min"
           acao: >-
             Conferir se o trabalhador esta consumindo (`credito_extracoes_total`
-            parado) e se a fila tem mensagem. Com o trabalhador em processo, ele
-            morre junto da API; com Lambda, ver o alarme de DLQ no CloudWatch.
+            parado) e se a fila tem mensagem. O trabalhador e um processo/pod
+            separado a partir da Camada 9: `up{servico="credit-analysis-trabalhador"}`
+            diz se ele esta no ar, e `ServicoForaDoAr` alerta se cair. Com Lambda,
+            ver o alarme de DLQ no CloudWatch.
+
+      # Contrapartida do alerta acima, e ela existe por causa de um defeito medido.
+      #
+      # Ao separar o trabalhador da API, `credito_extracoes_total` deixou de ser raspado — o
+      # trabalhador nao tinha `/metrics`. E `DocumentosPresosNaExtracao` faz `recebidos -
+      # extracoes`, uma operacao entre vetor e vetor **vazio**, cujo resultado em PromQL e vazio.
+      #
+      # Ou seja: o alerta que detecta trabalhador parado ficou permanentemente silencioso no exato
+      # momento em que o trabalhador virou um processo que pode parar sozinho. Nada indicava isso —
+      # a regra continuava valida, a query nao dava erro, o painel so ficava vazio.
+      #
+      # `absent()` e a unica forma de alertar sobre **ausencia** de serie: qualquer expressao que
+      # tente comparar uma serie ausente herda o vazio dela.
+      - alert: MetricaDeExtracaoAusente
+        expr: absent(credito_extracoes_total)
+        # 30m e nao 5m: a serie so aparece depois da primeira extracao concluida, e um ambiente
+        # recem-subido legitimamente nao tem nenhuma. Menos que isso alertaria em todo `up`.
+        for: 30m
+        labels:
+          severidade: aviso
+          dominio: observabilidade
+        annotations:
+          resumo: "`credito_extracoes_total` nao existe no Prometheus"
+          acao: >-
+            Enquanto esta serie nao existe, `DocumentosPresosNaExtracao` **nao
+            pode disparar** — comparar com vetor ausente da vetor vazio. Conferir
+            o alvo `credit-analysis-trabalhador` em /targets: provavel trabalhador
+            fora do ar desde o boot, endpoint de metricas nao subindo, ou o job
+            removido do `prometheus.yml`.
 
       - alert: ExtracoesFalhandoMuito
         expr: |

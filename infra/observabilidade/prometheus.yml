@@ -39,6 +39,60 @@ scrape_configs:
           servico: credit-analysis
           execucao: host
 
+  # Trabalhador de extracao, a partir da Camada 9.
+  #
+  # ## Por que este alvo precisou existir
+  #
+  # `credito_extracoes_total` e `credito_fila_espera_segundos` sao incrementados **somente** no
+  # processo do trabalhador. Enquanto ele rodava dentro da API (`CREDIT_TRABALHADOR_EM_PROCESSO`),
+  # o alvo `api:8000` os expunha de graca. Separado, eles sumiram — medido: tres documentos
+  # extraidos de ponta a ponta e `credito_extracoes_total` devolvendo vetor vazio.
+  #
+  # A consequencia nao era so um painel vazio. `DocumentosPresosNaExtracao` compara recebidos com
+  # extracoes, e operacao entre vetor e vetor **vazio** em PromQL da vazio: o alerta que detecta
+  # trabalhador parado deixou de poder disparar exatamente quando o trabalhador virou um processo
+  # que pode parar sozinho.
+  #
+  # ## Job proprio e nao um terceiro alvo do job `credit-analysis`
+  #
+  # Os dois processos compartilham imagem e configuracao, e nao a funcao. Com `job` separado, um
+  # `up == 0` diz **qual** dos dois caiu; no mesmo job, `up` por instancia diria isso e todo
+  # `sum by (job)` juntaria API e trabalhador num numero que nao descreve nem um nem outro.
+  #
+  # O rotulo `servico` distinto tambem e o que faz `ServicoForaDoAr` cobrir o trabalhador: aquele
+  # alerta agrupa por `servico`, e reaproveitar `credit-analysis` faria a API no ar mascarar um
+  # trabalhador morto.
+  #
+  # ## Um alvo, nao dois
+  #
+  # Os outros jobs tem o par container/host porque a API roda nos dois modos durante o
+  # desenvolvimento. O trabalhador nao: rodar no host significa `python -m
+  # credit_analysis.trabalhador_main`, que ninguem faz para desenvolver — o ciclo de reload e da
+  # API. Um segundo alvo aqui ficaria `down` para sempre sem nunca dizer nada.
+  #
+  # ## O custo conhecido: 95 series, e a maioria e zero
+  #
+  # O trabalhador importa o modulo de metricas inteiro (via `_montar_ocr`), e o prometheus_client
+  # registra toda familia declarada em tempo de import. Resultado medido: 95 series `credito_*` no
+  # `/metrics` dele, incluindo histograma de retrieval de politica — algo que este processo nao faz.
+  #
+  # Contador e histograma **com rotulo** nao exportam nada antes do primeiro `.labels()`, entao o
+  # que sobra sao os sem rotulo, todos em zero. Isso foi conferido contra os alertas: os que
+  # comparam com zero (`== 0`, `< 10`) sao de `suporte_` e `kyc_`, prefixos que este processo nao
+  # possui, e somar zero nao muda `sum()` nem `histogram_quantile`.
+  #
+  # Nao esta filtrado de proposito. Filtrar exigiria uma lista de quais familias pertencem a qual
+  # processo — uma segunda fonte de verdade sobre metricas, que erra em silencio quando alguem
+  # adiciona uma metrica nova e esquece a lista. O custo real hoje e ruido num painel agrupado por
+  # `servico`; o custo da alternativa e uma metrica ausente sem ninguem notar.
+  - job_name: credit-analysis-trabalhador
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["trabalhador:8001"]
+        labels:
+          servico: credit-analysis-trabalhador
+          execucao: container
+
   # Os dois servicos novos seguem o mesmo par de alvos, e a escolha de porta segue a
   # mesma regra: a porta interna (8100, 8200) difere da publicada (8101, 8201), o que
   # torna os dois alvos mutuamente exclusivos por construcao. Foi essa colisao que

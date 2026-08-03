@@ -335,22 +335,53 @@ class TestObservabilidade:
 
 
 class TestConfiguracao:
-    def test_sem_chave_configurada_o_servico_nao_sobe(self) -> None:
+    def test_sem_chave_configurada_a_api_nao_sobe(self) -> None:
         """Nao ha modo desligado, e este teste e o que garante isso.
 
-        As tres saidas possiveis para um servico sem chave de verificacao: recusar tudo
+        As tres saidas possiveis para uma API sem chave de verificacao: recusar tudo
         (indisponivel), aceitar tudo (aberto), ou nao subir. Somente a terceira nao esconde o
         problema — e e a que o Kubernetes trata bem, mantendo os pods antigos no ar.
+
+        **A garantia mudou de lugar na Camada 9, e nao de forca.** Antes era o validador de
+        `Settings`; agora e `montar_chaveiro`, que `criar_app` chama no boot. O motivo esta na
+        docstring de `_conferir_fonte_de_chave`: com a exigencia em `Settings`, o trabalhador de
+        extracao — que consome fila e nao verifica token — tambem precisava de chave.
+
+        Por isso o teste exercita `criar_app` e nao o construtor de `Settings`: e o boot da API que
+        precisa falhar, e e ele que este teste mede.
         """
-        with pytest.raises(ValueError, match="CREDIT_AUTH_CHAVE_PUBLICA"):
-            Settings(
-                ambiente=Ambiente.LOCAL,
-                provedor_llm=ProvedorLLM.FAKE,
-                auth_chave_publica="",
-                auth_jwks_url="",
-                auth_emissor="x",
-                _env_file=None,  # type: ignore[call-arg]
-            )
+        settings = Settings(
+            ambiente=Ambiente.LOCAL,
+            provedor_llm=ProvedorLLM.FAKE,
+            auth_chave_publica="",
+            auth_jwks_url="",
+            auth_emissor="https://local.invalid",
+            _env_file=None,  # type: ignore[call-arg]
+        )
+
+        with pytest.raises(RuntimeError, match="CREDIT_AUTH_CHAVE_PUBLICA"):
+            criar_app(settings=settings)
+
+    def test_settings_sem_chave_e_valido_para_quem_nao_verifica_token(self) -> None:
+        """A outra metade da mudanca, e a que faz o trabalhador poder subir.
+
+        Sem este teste, alguem devolveria a exigencia para o validador de `Settings` — a mudanca
+        parece uma frouxidao de seguranca quando lida isolada — e o unico sintoma seria o
+        trabalhador recusando subir com uma mensagem sobre chave de auth que ele nunca usa.
+
+        O par com `test_sem_chave_configurada_a_api_nao_sobe` e o que documenta a fronteira: a
+        configuracao e valida, e servir HTTP com ela nao e.
+        """
+        settings = Settings(
+            ambiente=Ambiente.LOCAL,
+            provedor_llm=ProvedorLLM.FAKE,
+            auth_chave_publica="",
+            auth_jwks_url="",
+            _env_file=None,  # type: ignore[call-arg]
+        )
+
+        assert settings.auth_chave_publica == ""
+        assert settings.auth_jwks_url == ""
 
     def test_duas_fontes_de_chave_sao_recusadas(self, chave_publica_de_teste: str) -> None:
         """Ambiguidade sobre qual chave manda e como se aceita token que devia ser negado.

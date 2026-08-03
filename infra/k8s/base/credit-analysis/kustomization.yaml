@@ -14,3 +14,7 @@ resources:
   - deployment.yaml
   - configuracao.yaml
   - resiliencia.yaml
+  # Consumidor da fila de extracao, Deployment proprio a partir da Camada 9. Compartilha o
+  # ConfigMap e o Secret da API porque a configuracao **e** a mesma (mesmo banco, mesmo bucket,
+  # mesma fila); o que difere e o comando e o que o pod monta.
+  - trabalhador.yaml

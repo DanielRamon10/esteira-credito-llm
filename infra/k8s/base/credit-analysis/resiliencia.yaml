@@ -125,6 +125,26 @@ spec:
               app.kubernetes.io/name: kyc-compliance
       ports:
         - port: 8100
+    # S3 e SQS. **Esta regra faltava**, e a falta era invisivel enquanto o ConfigMap tambem nao
+    # tinha `CREDIT_BUCKET_DOCUMENTOS` — sem bucket configurado, a API usava adapter em memoria e
+    # nunca abria conexao para fora. Preenchido um, o outro passa a ser necessario.
+    #
+    # O sintoma, se ficasse faltando: `ArmazenamentoS3.guardar` bloquearia ate o timeout do boto3
+    # e o upload responderia 500. O cliente veria "erro ao enviar documento" e o log falaria de
+    # timeout de rede, com a policy longe da lista de suspeitos.
+    #
+    # `except` das faixas privadas pelo mesmo motivo do manifest do trabalhador: sem ele, isto e
+    # egress aberto para o cluster inteiro.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
     - to:
         - namespaceSelector:
             matchLabels:

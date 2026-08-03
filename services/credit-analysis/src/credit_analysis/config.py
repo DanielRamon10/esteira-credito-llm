@@ -161,19 +161,29 @@ class Settings(BaseSettings):
 
     # Roda o trabalhador de extracao **dentro** do processo da API.
     #
-    # ## Por que isto existe, e a limitacao que ele carrega
+    # ## O que isto era na Camada 8, e o que e agora
     #
-    # O trabalhador como processo separado exigiria um repositorio de analise compartilhado, e ele
-    # nao existe: a unica implementacao e em memoria (ver `trabalhador_main.py`, que recusa subir
-    # explicando isso).
+    # Era a **unica** forma de o fluxo assincrono funcionar: o trabalhador separado exigia um
+    # repositorio de analise compartilhado, e a unica implementacao era em memoria. Em processo,
+    # os dois compartilham o repositorio por estarem no mesmo espaco de memoria.
     #
-    # Em processo, o trabalhador compartilha o repositorio por estar no mesmo espaco de memoria, e
-    # o fluxo assincrono funciona de ponta a ponta — com S3 e SQS de verdade guardando documento e
-    # pedido.
+    # O preco era uma replica de API. Com duas, a replica A publica na fila e a B pode consumir; a
+    # B nao tem a analise no repositorio dela, e a extracao falha como permanente — todo documento
+    # iria para `falhou`, com um sintoma que parece problema de OCR.
     #
-    # **A limitacao e uma replica.** Com duas, a replica A publica na fila e a B pode consumir; a B
-    # nao tem a analise no repositorio dela, e a extracao falha como permanente. O manifest do
-    # Kubernetes fixa `replicas: 1` quando isto esta ligado, e o comentario la diz por que.
+    # Com `RepositorioAnalisesPostgres` (Camada 9) isso caiu. O compose sobe o servico
+    # `trabalhador` separado, o Kubernetes tem um Deployment proprio, e a API escala livremente.
+    #
+    # ## Por que a flag continua existindo
+    #
+    # Um processo em vez de dois, em desenvolvimento: `uvicorn --reload` e um `docker compose up`
+    # mais curto. O que ela deixou de ser e requisito.
+    #
+    # **A limitacao de uma replica continua valendo quando isto esta `true`** — nao por causa do
+    # repositorio, que agora e compartilhado, mas porque N replicas de API sao N consumidores
+    # competindo pela mesma fila sem que ninguem tenha pedido isso. E por isso que o manifest do
+    # Kubernetes nao liga esta flag em lugar nenhum: la o trabalhador e Deployment separado, com o
+    # numero de replicas dele proprio.
     #
     # Default `false`: um trabalhador subindo por acidente numa replica de API que nao deveria
     # consumir e pior que nao ter trabalhador — ele competiria por mensagens com quem deveria.
@@ -229,17 +239,25 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _conferir_fonte_de_chave(self) -> Settings:
-        """Exige **exatamente uma** fonte de chave de verificacao.
+        """Exige que a configuracao de auth seja **coerente**, e nao que ela exista.
 
-        Tres estados possiveis, e dois deles sao erro:
+        A diferenca importa, e ela apareceu na Camada 9 com o trabalhador virando processo
+        separado. Antes, este validador exigia uma fonte de chave sempre — e como `Settings` e
+        compartilhado pelos dois processos, o trabalhador passava a exigir tambem. Ele consome
+        fila e **nao verifica token nenhum**; a consequencia pratica seria montar nele a chave de
+        verificacao para satisfazer um validador, e um leitor futuro perguntaria, com razao, por
+        que o consumidor de fila carrega material de auth.
 
-        - nenhuma: o servico nao sabe verificar token. Falhar aqui e melhor que as duas
-          alternativas — recusar tudo (indisponivel) ou aceitar tudo (aberto);
-        - as duas: ambiguidade sobre qual chave manda. Uma configuracao antiga esquecida
-          numa delas aceitaria token que deveria ser rejeitado, e o `/health` diria "ok".
+        Ficou assim:
 
-        Em `local` o erro traz o comando exato. `FileNotFoundError` num PEM vazio mandaria
-        quem esta configurando procurar no codigo o que gera aquele arquivo.
+        - **aqui**, o que e errado em qualquer processo: mais de uma fonte (ambiguidade sobre qual
+          chave manda — uma configuracao antiga esquecida numa delas aceitaria token que deveria
+          ser rejeitado, e o `/health` diria "ok"), e fonte configurada sem emissor;
+        - **em `montar_chaveiro`**, o que e errado so para quem verifica token: nenhuma fonte. E o
+          boot da API que falha, com a mesma forca de antes, porque `criar_app` chama aquilo.
+
+        O que **nao** mudou: nao existe modo desligado, e nenhuma variavel afrouxa verificacao. O
+        que mudou e onde a exigencia mora — no processo que a tem.
         """
         tem_pem = bool(self.auth_chave_publica.strip())
         tem_jwks = bool(self.auth_jwks_url.strip())
@@ -256,21 +274,9 @@ class Settings(BaseSettings):
                 "esquecida numa aceitaria token que deveria ser rejeitado."
             )
 
-        if fontes == 0:
-            # Mensagem com os comandos exatos. Um `ValidationError` seco mandaria quem esta
-            # configurando procurar no codigo o que preenche estas variaveis — e a resposta
-            # esta em outro pacote (`plataforma.emissor_local`), o que torna a busca pior.
-            raise ValueError(
-                "autenticacao exige uma fonte de chave: "
-                "CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO, CREDIT_AUTH_CHAVE_PUBLICA "
-                "ou CREDIT_AUTH_JWKS_URL.\n"
-                "Para desenvolvimento, sem conta em provedor nenhum:\n"
-                "  python -m plataforma.emissor_local gerar-chaves\n"
-                "  export CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO=.chaves/publica.pem\n"
-                "  export CREDIT_AUTH_EMISSOR=https://local.esteira-credito.invalid\n"
-                "Nao ha modo desligado, e a ausencia e deliberada: ver api/seguranca.py."
-            )
-        if not self.auth_emissor.strip():
+        # Fonte configurada sem emissor e configuracao pela **metade**, e nao configuracao ausente
+        # — por isso continua aqui, enquanto a ausencia de fonte foi para `montar_chaveiro`.
+        if fontes == 1 and not self.auth_emissor.strip():
             # Sem emissor, `verificar` receberia string vazia e o PyJWT compararia `iss`
             # contra "" — nenhum token passaria, e o sintoma (403/401 universal) nao aponta
             # para configuracao ausente.

@@ -40,7 +40,8 @@ application/
   ports.py           Interfaces (Protocol) que a aplicação exige
   use_cases/         Orquestração. Não calcula nada.
 infrastructure/
-  repositories/      Adapter em memória (Postgres vem na Camada 6)
+  repositories/      Postgres (bloqueio otimista) e em memória
+  armazenamento/     S3/MinIO e SQS/ElasticMQ, e os equivalentes em memória
   bureau.py          Stub determinístico do bureau de crédito
   seguranca.py       Envelope e detecção de prompt injection
   rag/               BM25 + denso + RRF, embeddings ONNX, pgvector
@@ -251,6 +252,25 @@ programaticamente:
 Mensagem de exceção nunca vai para o cliente — vaza caminho de arquivo e às
 vezes credencial. O stack completo fica no log.
 
+## O trabalhador de extração
+
+`python -m credit_analysis.trabalhador_main` — consumidor de fila, processo separado da
+API a partir da Camada 9. No compose é o serviço `trabalhador`; em Kubernetes é o
+Deployment `credit-analysis-trabalhador`.
+
+Ele **recusa subir** sem armazenamento real, sem Postgres ou sem motor de OCR, e as três
+recusas existem porque as três falhas são silenciosas de formas diferentes: sem fila real
+ele consumiria uma fila em memória do próprio processo (vazia por construção, já que quem
+publica é a API); sem Postgres não veria o documento que a API anexou e mandaria **todo**
+documento para `falhou`, o que parece problema de OCR; sem OCR falharia em toda mensagem.
+
+Não tem sonda de saúde e tem `/metrics` na 8001 — a distinção é deliberada, e está
+explicada no cabeçalho de `trabalhador_main.py`.
+
+Para rodar tudo num processo só durante o desenvolvimento,
+`CREDIT_TRABALHADOR_EM_PROCESSO=true` põe o consumidor dentro da API. O preço é uma
+réplica: N réplicas de API viram N consumidores disputando a mesma fila.
+
 ## Testes
 
 ```bash
@@ -258,6 +278,12 @@ vezes credencial. O stack completo fica no log.
 .venv/Scripts/python -m pytest tests/unit   # só unitários
 .venv/Scripts/python -m pytest -m integration
 ```
+
+Os testes de armazenamento, fila e repositório precisam de infra de verdade e **pulam com
+instrução** quando ela não está no ar (`docker compose up -d minio elasticmq postgres`).
+Pular explicando é a única forma honesta: um fake de S3 não teria encontrado que
+`upload_fileobj` não devolve `VersionId`, nem que MinIO recusa `ServerSideEncryption` por
+objeto.
 
 Os unitários testam **comportamento de negócio**, não a fórmula do score.
 "Restrição cadastral nega independentemente do score" continua verdade depois

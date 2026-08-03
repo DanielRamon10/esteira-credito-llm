@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from typing import Any
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -27,6 +28,7 @@ from plataforma.llm import (
 )
 from plataforma.logging import configurar_logging
 from plataforma.metricas import rotulo_de_rota
+from psycopg_pool import AsyncConnectionPool
 
 from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
@@ -66,6 +68,7 @@ from credit_analysis.infrastructure.rag.embeddings import EmbedderFastEmbed
 from credit_analysis.infrastructure.rag.pgvector_store import VectorStorePgVector, criar_pool
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
 from credit_analysis.infrastructure.repositories.memoria import RepositorioAnalisesMemoria
+from credit_analysis.infrastructure.repositories.postgres import RepositorioAnalisesPostgres
 from credit_analysis.infrastructure.tokens import (
     ProvedorDeToken,
     TokenDeClientCredentials,
@@ -109,11 +112,16 @@ def criar_app(
     )
     _ligar_observadores_da_plataforma()
 
-    # O pool so existe quando o RAG e montado a partir da configuracao; quando
-    # o retriever vem injetado (teste), quem injetou cuida do ciclo de vida.
-    pool = (
-        criar_pool(settings.postgres_dsn) if retriever is None and settings.usar_pgvector else None
-    )
+    # ## O pool deixou de ser do RAG e passou a ser da aplicacao
+    #
+    # A condicao era `retriever is None and usar_pgvector`: o pool existia so quando o RAG era
+    # montado da configuracao. Na Camada 9 o **repositorio de analise** passou a precisar dele
+    # tambem, e com a condicao antiga um teste que injetasse o retriever ficaria sem pool — e sem
+    # repositorio Postgres, silenciosamente de volta ao dicionario em memoria.
+    #
+    # Agora ele existe sempre que ha DSN. O bloco do RAG no lifespan continua condicionado a
+    # `retriever is None`, porque quem injeta o retriever cuida do ciclo de vida dele.
+    pool = criar_pool(settings.postgres_dsn) if settings.usar_pgvector else None
 
     @asynccontextmanager
     async def lifespan(app_: FastAPI) -> AsyncGenerator[None]:
@@ -211,7 +219,7 @@ def criar_app(
     app.state.chaveiro = montar_chaveiro(settings)
 
     app.state.settings = settings
-    app.state.repositorio = repositorio or RepositorioAnalisesMemoria()
+    app.state.repositorio = repositorio or _montar_repositorio(settings, pool)
     app.state.bureau = bureau or BureauStub()
     app.state.retriever = retriever  # pode virar pgvector no lifespan
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)
@@ -360,6 +368,36 @@ async def _laco_do_trabalhador(app_: FastAPI) -> None:
         raise
     except Exception:
         logger.error("trabalhador.em_processo_morreu", exc_info=True)
+
+
+def _montar_repositorio(
+    settings: Settings, pool: AsyncConnectionPool[Any] | None
+) -> RepositorioAnalises:
+    """Postgres quando ha DSN, memoria fora de producao, erro em producao.
+
+    A mesma assimetria de `_montar_kyc` e `_montar_armazenamento`, e aqui ela e a mais forte das
+    tres: em memoria, **a analise inteira** desaparece no restart — parecer, documento, trilha. Um
+    servico de credito que perde o parecer que emitiu nao tem como responder auditoria, e a
+    Resolucao CMN 4.658 exige que ele tenha.
+
+    Fora de producao o dicionario continua legitimo: e o que permite a suite rodar sem banco e o
+    `docker compose up` funcionar antes de alguem aplicar o schema.
+    """
+    if pool is None:
+        if settings.producao:
+            raise RuntimeError(
+                "CREDIT_POSTGRES_DSN e obrigatoria em producao: em memoria, a analise e o parecer "
+                "que ela emitiu desaparecem no restart, e nao ha como responder auditoria "
+                "(Resolucao CMN 4.658)."
+            )
+        logger.warning(
+            "repositorio.em_memoria",
+            motivo="CREDIT_POSTGRES_DSN vazia",
+            efeito="analises nao sobrevivem ao restart",
+        )
+        return RepositorioAnalisesMemoria()
+
+    return RepositorioAnalisesPostgres(pool)
 
 
 def _montar_armazenamento(settings: Settings) -> ArmazenamentoDocumentos:

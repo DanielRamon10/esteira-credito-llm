@@ -738,19 +738,103 @@ score: 592 → 630
 O objeto ficou no MinIO em `documentos/{analise}/{documento}/holerite.png`, com
 version id.
 
-### Duas limitações, e nenhuma delas é de configuração
-
-**O trabalhador roda dentro do processo da API, e isso limita a uma réplica.** Como
-processo separado ele exigiria um repositório de análise **compartilhado**, e ele não
-existe: a única implementação de `RepositorioAnalises` é em memória, e o schema do
-Postgres tem apenas a tabela do RAG. Cada processo veria o próprio repositório, e
-toda extração falharia com "documento não está na análise".
-
-`trabalhador_main.py` existe versionado e **recusa subir**, explicando isso. Apagá-lo
-esconderia o desenho; deixá-lo subir em silêncio seria pior.
+### A limitação que sobrou
 
 **A Lambda nunca foi aplicada.** O handler é exercitado (é o mesmo código do
 trabalhador); o runtime, o empacotamento em container image e o gatilho da fila, não.
+
+A outra limitação desta camada — o trabalhador preso dentro do processo da API, o que
+limitava a uma réplica — caiu na camada seguinte, e é o que ela existe para fazer.
+
+## Persistência em Postgres, e o trabalhador como processo
+
+`RepositorioAnalisesPostgres` fecha o buraco que a camada anterior deixou aberto: até
+aqui a análise vivia num dicionário e sumia no restart, e `trabalhador_main.py` estava
+versionado **recusando subir** porque sem repositório compartilhado cada processo veria o
+próprio estado — a API anexaria o documento no dela, o trabalhador não o acharia, e toda
+extração falharia como erro permanente.
+
+Três coisas destravaram juntas: durabilidade da análise, trabalhador como processo
+separado, e a API podendo passar de uma réplica.
+
+### A corrida que o repositório compartilhado cria
+
+Dois processos escrevendo o mesmo agregado é uma atualização perdida esperando acontecer:
+a API lê a análise para responder um `GET` enquanto o trabalhador lê a mesma linha para
+aplicar a extração; quem gravar por último apaga o trabalho do outro.
+
+A defesa é bloqueio otimista — `UPDATE ... WHERE versao = %s` — e o teste que a sustenta
+é `test_gravacao_concorrente_nao_apaga_trabalho_alheio`, que **reproduz** a corrida contra
+Postgres real e exige `ConflitoDeVersao`. São 21 testes de integração no total, todos
+contra banco de verdade e não contra fake.
+
+### Medido entre dois containers, não na suíte
+
+Na suíte de integração a API e o trabalhador compartilham o mesmo objeto Python — o que
+significa que ela passaria **mesmo se o repositório em Postgres não funcionasse**. A prova
+que importa é a stack do compose, com dois processos de verdade:
+
+```
+upload         → HTTP 202, Location=/v1/documentos/6738e0a7…
+t+2s           → extraido, motor=tesseract:por, confiança=94.12%
+                 renda comprovada 7600.00, score 637 → 654
+
+trabalhador parado, novo upload:
+t+120s         → ainda "recebido"        ← a API não consome
+trabalhador de volta:
+t+25s          → "extraido"              ← a mensagem esperou na fila
+```
+
+O segundo bloco é o experimento que discrimina: sem ele, "funcionou" seria compatível com
+a API estar processando tudo sozinha.
+
+### O que a separação quebrou, e só apareceu porque foi medido
+
+`credito_extracoes_total` é incrementado **somente** no processo do trabalhador. Enquanto
+ele rodava dentro da API, o alvo `api:8000` o expunha de graça; separado, a série
+desapareceu — três documentos extraídos e a consulta devolvendo vetor vazio.
+
+O efeito não era um painel vazio. `DocumentosPresosNaExtracao` compara
+`recebidos - extracoes`, e operação entre vetor e vetor **ausente** em PromQL dá vazio:
+o alerta que existe para detectar trabalhador parado ficou permanentemente silencioso no
+exato momento em que o trabalhador virou um processo capaz de parar sozinho. Nada indicava
+isso — a regra continuava válida, a query não dava erro.
+
+A correção foi distinguir duas coisas que o manifest tratava como uma: `/metrics` **expõe
+contador**, sonda **afirma saúde**. A objeção a sonda em consumidor de fila (um 200 num
+trabalhador travado é pior que nada) não se aplica a um endpoint que não afirma nada. O
+trabalhador ganhou `/metrics` na 8001, continua sem sonda nenhuma, e ganhou um alerta de
+contrapartida: `MetricaDeExtracaoAusente`, com `absent()` — a única forma de alertar sobre
+série que não existe.
+
+### Quatro vazios silenciosos nos manifests
+
+O mesmo tipo de defeito do `CREDIT_KYC_URL` na Camada 7, e nenhum deles quebra teste:
+
+| Vazio | Sintoma se ficasse |
+|---|---|
+| `CREDIT_BUCKET_DOCUMENTOS` e `CREDIT_FILA_EXTRACAO_URL` ausentes do ConfigMap | 202 no upload, documento numa fila em memória que nenhum pod consome, polling infinito em "recebido" |
+| Sem egress 443 na NetworkPolicy da API | upload responde 500 depois do timeout do boto3; o log fala de rede, a policy não é suspeita |
+| `HEALTHCHECK` da imagem herdado pelo trabalhador | `unhealthy` num processo consumindo normalmente — medido, e é o sinal que ensina a ignorar a coluna de status |
+| Sonda apontando para porta nomeada inexistente | pod que nunca fica Ready; `kubeconform --strict` não pega, porque o schema aceita a string sem ligá-la ao bloco `ports` |
+
+O último apareceu por acidente: ao testar se a isenção de sondas do trabalhador era frouxa,
+removi o bloco `ports` da API — a isenção resistiu, e o verificador aceitou um manifest com
+três sondas apontando para `port: http` inexistente. Virou checagem.
+
+### O caminho rápido que estava morto
+
+`buscar_por_documento` existia no repositório Postgres e o router nunca chamava: o
+`GET /v1/documentos/{id}` varria até mil análises. A ligação é por **capacidade** e não por
+configuração — um `Protocol` opcional (`BuscaPorDocumento`) verificado com `isinstance`, o
+que significa que não existe variável de ambiente capaz de pôr o Postgres na varredura por
+engano.
+
+O teste que importa aqui não afirma `200`: os dois caminhos produzem a mesma resposta, então
+um teste de rota passaria com a otimização morta. Ele conta chamadas —
+`chamadas_listar == 0` — e três mutantes confirmam que ele mede o que promete: caminho
+rápido desativado, `runtime_checkable` removido do Protocol, e limite da varredura divergente
+do teto do aviso.
 
 ## Segredos
 

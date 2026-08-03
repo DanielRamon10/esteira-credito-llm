@@ -29,6 +29,17 @@ images:
 # As contagens diferem porque as cargas nao tem relacao entre si: uma analise de credito
 # nao gera um atendimento, e um atendimento nao gera uma triagem. Dimensionar os tres
 # igual seria tratar como acoplado o que foi separado justamente por nao ser.
+# `credit-analysis-trabalhador` **nao esta nesta lista**, e a omissao e deliberada.
+#
+# Os tres abaixo escalam com trafego. O trabalhador nao: quem entrega trabalho para ele e a fila, e
+# o limite dele nao e vazao de requisicao e sim contencao no agregado — cada extracao termina
+# reavaliando o parecer com bloqueio otimista, e consumidores demais na mesma analise viram
+# `ConflitoDeVersao` em serie. Duas replicas e o mesmo teto do `maximum_concurrency` da Lambda, e
+# esta la pelo mesmo motivo.
+#
+# O que escalaria o trabalhador de verdade e profundidade de fila, que exige KEDA ou o Prometheus
+# Adapter — nenhum dos dois esta instalado, e por isso nao ha HPA para ele. Um HPA por CPU aqui
+# seria pior que nenhum: OCR usa CPU o tempo todo, entao ele estaria sempre no teto.
 replicas:
   - name: credit-analysis
     count: 3

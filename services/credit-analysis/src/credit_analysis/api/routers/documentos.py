@@ -25,7 +25,7 @@ from credit_analysis.api.schemas import (
     ErroResponse,
 )
 from credit_analysis.api.seguranca import ANALISES_LER, DOCUMENTOS_ENVIAR, Escopo
-from credit_analysis.application.ports import RepositorioAnalises
+from credit_analysis.application.ports import BuscaPorDocumento, RepositorioAnalises
 from credit_analysis.application.use_cases.extracao_assincrona import (
     ComandoReceberDocumento,
 )
@@ -182,9 +182,9 @@ async def consultar_documento(
     um upload. O `Location` que o 202 devolve seria mais longo sem ganho: o `documento_id` e um
     UUID e ja identifica sozinho.
 
-    O custo e uma busca por documento em vez de acesso direto — hoje uma varredura no repositorio
-    em memoria, e um `WHERE documento_id = ?` com indice no Postgres. Aceitavel para uma rota de
-    polling.
+    O custo e uma busca por documento em vez de acesso direto. No Postgres e um `JOIN` pelo
+    indice `idx_documento_id`; no repositorio em memoria e uma varredura, e o `_localizar` explica
+    por que a escolha entre os dois e por capacidade do adapter e nao por configuracao.
 
     ## O escopo e `analises:ler`, e nao `documentos:enviar`
 
@@ -197,24 +197,68 @@ async def consultar_documento(
     return DocumentoEstadoResponse.de_dominio(analise, documento)
 
 
+# Teto da varredura, quando o repositorio nao oferece busca por documento.
+#
+# **Nao e uma pagina**, e um limite de tolerancia: passando disto, a rota de polling responderia
+# 404 para um documento que existe — o cliente que recebeu 202 concluiria que o upload dele se
+# perdeu. Por isso o `_varrer` loga quando bate no teto, em vez de devolver 404 em silencio.
+TETO_DA_VARREDURA = 1000
+
+
 async def _localizar(
     repositorio: RepositorioAnalises, documento_id: UUID
 ) -> tuple[AnaliseCredito, DocumentoSubmetido]:
     """Encontra o documento e a analise que o contem.
 
-    Varre as analises porque o documento nao tem repositorio proprio: ele e parte do agregado
-    `AnaliseCredito`, e criar um repositorio separado para ele quebraria a fronteira do agregado
-    — dois pontos de escrita para o mesmo dado, com a consistencia entre eles a cargo de quem
-    chamar na ordem certa.
+    O documento nao tem repositorio proprio: ele e parte do agregado `AnaliseCredito`, e um
+    repositorio separado quebraria a fronteira do agregado — dois pontos de escrita para o mesmo
+    dado, com a consistencia entre eles a cargo de quem chamar na ordem certa.
 
-    O limite alto e uma concessao conhecida, anotada tambem no README: com volume real isto
-    precisa de um indice `documento_id -> analise_id`, que e uma linha de SQL e nao existe
-    enquanto o repositorio padrao e em memoria.
+    Sobram dois caminhos para ir do documento a analise, e qual deles roda depende do adapter:
+
+    - `BuscaPorDocumento`, um `JOIN` com indice em `documento(id)`. E o que o Postgres oferece;
+    - varredura, para quem nao oferece. Correto no volume do repositorio em memoria e **errado**
+      em producao, que e exatamente por que o Postgres implementa o primeiro.
+
+    A escolha e por capacidade e nao por configuracao: nao existe variavel que possa deixar o
+    Postgres na varredura por engano.
     """
-    for analise in await repositorio.listar(limite=1000):
-        for documento in analise.documentos:
-            if documento.id == documento_id:
-                return analise, documento
+    if isinstance(repositorio, BuscaPorDocumento):
+        analise = await repositorio.buscar_por_documento(documento_id)
+        if analise is None:
+            raise AnaliseNaoEncontrada(f"Documento {documento_id} nao encontrado")
+    else:
+        analise = await _varrer(repositorio, documento_id)
+
+    for documento in analise.documentos:
+        if documento.id == documento_id:
+            return analise, documento
+
+    # Alcancavel de um jeito so: a analise foi encontrada pelo `JOIN` e o documento nao esta na
+    # lista que o `_montar` carregou. Isso seria inconsistencia entre as tabelas `analise` e
+    # `documento`, e nao "nao encontrado" — mas o cliente da rota de polling nao tem o que fazer
+    # com a distincao, e o 404 e a resposta honesta.
+    raise AnaliseNaoEncontrada(f"Documento {documento_id} nao encontrado")
+
+
+async def _varrer(repositorio: RepositorioAnalises, documento_id: UUID) -> AnaliseCredito:
+    """Varredura, para o repositorio que nao oferece busca por documento."""
+    analises = await repositorio.listar(limite=TETO_DA_VARREDURA)
+
+    for analise in analises:
+        if any(d.id == documento_id for d in analise.documentos):
+            return analise
+
+    if len(analises) >= TETO_DA_VARREDURA:
+        # O 404 que vem depois pode ser mentira: o documento pode estar na analise 1001. Sem este
+        # log, o sintoma seria um cliente reclamando de upload perdido e um servidor sem registro
+        # de nada errado.
+        logger.warning(
+            "documento.varredura_no_teto",
+            documento_id=str(documento_id),
+            teto=TETO_DA_VARREDURA,
+            detalhe="404 pode ser falso; este repositorio nao oferece BuscaPorDocumento",
+        )
 
     raise AnaliseNaoEncontrada(f"Documento {documento_id} nao encontrado")
 

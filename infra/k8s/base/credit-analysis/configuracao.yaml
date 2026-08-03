@@ -71,6 +71,35 @@ data:
   CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO: "/chaves/publica.pem"
   CREDIT_AUTH_EMISSOR: "https://idp.interno.invalid"
 
+  # Armazenamento e fila de extracao (Camada 8). **Tambem estavam ausentes deste ConfigMap**, e a
+  # falta era do mesmo tipo da do `CREDIT_KYC_URL`: silenciosa e pior que um erro.
+  #
+  # `usar_armazenamento_real` exige as duas — bucket **e** fila. Sem elas, `criar_app` monta os
+  # adapters em memoria, e o efeito em Kubernetes seria este: o upload responde 202, o documento
+  # vai para um dicionario do processo, o pedido entra numa fila em memoria que **nenhum**
+  # consumidor le (o trabalhador e outro pod, com outro dicionario) e o cliente faz polling para
+  # sempre num documento parado em `recebido`. Nada falha, nada alerta.
+  #
+  # Os valores sao os do `infra/terraform/extracao.tf` com `local.prefixo = "credito-prod"`. Em
+  # producao de verdade eles vem dos outputs do Terraform, e a URL da fila carrega o account id —
+  # que e por que ela nao esta no Secret: account id nao e segredo, e por-lo la esconderia de
+  # `kubectl describe` justamente o que alguem quer conferir ao investigar fila parada.
+  CREDIT_BUCKET_DOCUMENTOS: "credito-prod-documentos"
+  CREDIT_FILA_EXTRACAO_URL: "https://sqs.sa-east-1.amazonaws.com/000000000000/credito-prod-extracao"
+  # Vazios de proposito, e nao ausentes: `""` faz o boto3 usar o endpoint real da AWS. Eles existem
+  # aqui para dizer que a sobrescrita e possivel (e o que o compose faz, apontando para MinIO e
+  # ElasticMQ) sem que alguem precise ler o `config.py` para descobrir.
+  CREDIT_S3_ENDPOINT: ""
+  CREDIT_SQS_ENDPOINT: ""
+  CREDIT_REGIAO_AWS: "sa-east-1"
+
+  # **Nao existe `CREDIT_TRABALHADOR_EM_PROCESSO` aqui**, e a ausencia e deliberada.
+  #
+  # O default e `false`, e em Kubernetes o consumidor e o Deployment
+  # `credit-analysis-trabalhador`. Ligar a flag aqui poria um consumidor em **cada** replica da API
+  # — 3 em producao — competindo com os 2 pods do trabalhador pelas mesmas mensagens, e o sintoma
+  # seria custo de OCR e conflito de versao, nao erro.
+
   CREDIT_OTLP_ENDPOINT: "http://tempo.observabilidade.svc.cluster.local:4318"
   CREDIT_TRACE_AMOSTRAGEM: "1.0"
 ---

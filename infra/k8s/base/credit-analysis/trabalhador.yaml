@@ -1,0 +1,248 @@
+# Trabalhador de extracao: Deployment proprio, sem Service.
+#
+# ## Por que ele existe separado da API
+#
+# Passou a Camada 8 inteira sem poder existir: o trabalhador exigia um repositorio de analise
+# compartilhado, e a unica implementacao era em memoria. A API rodava o consumidor dentro do
+# proprio processo (`CREDIT_TRABALHADOR_EM_PROCESSO`), o que a limitava a uma replica — com duas,
+# a que publica na fila pode nao ser a que consome.
+#
+# Com o repositorio em Postgres (Camada 9) a limitacao caiu, e separar passou a valer por tres
+# razoes que a versao em processo nao conseguia dar:
+#
+# 1. **escala independente.** A API atende requisicao de milissegundos; a extracao leva segundos.
+#    Juntos, o HPA escalaria a API inteira porque a fila cresceu — e pagaria 2,24GB de download de
+#    modelo de embedding por replica para processar OCR;
+# 2. **falha isolada.** Um OCR que estoura memoria mata o processo. No mesmo pod da API, leva as
+#    requisicoes em voo junto;
+# 3. **superficie menor.** Este pod nao monta chave de auth, nao alcanca o KYC, nao carrega o
+#    modelo de embedding. Ele processa arquivo enviado por terceiro, que e a entrada mais exposta
+#    do sistema — e o mesmo raciocinio da politica IAM da Lambda em `infra/terraform/extracao.tf`,
+#    que lhe da `GetObject` e nao `PutObject`.
+#
+# ## Estado honesto: isto nao foi aplicado num cluster
+#
+# O manifest passa em `kustomize build` e em `kubectl apply --dry-run=server`. O que roda de
+# verdade e o equivalente no compose — o servico `trabalhador`, medido de ponta a ponta: com ele
+# parado o documento fica em `recebido`; subindo, a mensagem que esperava na fila e drenada e o
+# documento chega a `extraido`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: credit-analysis-trabalhador
+  labels:
+    app.kubernetes.io/name: credit-analysis-trabalhador
+    app.kubernetes.io/component: worker
+    # Mesma parte de um todo, para consulta por servico funcionar nos dois pods.
+    app.kubernetes.io/part-of: credit-analysis
+spec:
+  # Duas replicas, e o numero e o mesmo teto da Lambda (`maximum_concurrency = 2`).
+  #
+  # Nao e para economizar: e porque a extracao termina gravando no Postgres e reavaliando o
+  # parecer. Sem teto, um acumulo de 500 mensagens vira 500 consumidores disputando as mesmas
+  # linhas de `analise`, e o bloqueio otimista transformaria isso em `ConflitoDeVersao` em serie —
+  # trabalho refeito, nao trabalho concluido mais rapido.
+  replicas: 2
+  strategy:
+    # `Recreate` e nao `RollingUpdate`, e a escolha e o oposto da da API.
+    #
+    # Na API, `maxUnavailable: 0` existe para nao mandar trafego a um pod frio. Aqui nao ha
+    # trafego: quem entrega trabalho e a fila, e ela guarda. Durante a troca as mensagens ficam
+    # visiveis esperando, e o pod novo pega de onde o antigo parou.
+    #
+    # O que `Recreate` evita e o velho e o novo consumindo juntos durante o rollout. Nao seria
+    # incorreto — a idempotencia cobre reentrega e o bloqueio otimista cobre a corrida — mas seria
+    # OCR pago duas vezes pela mesma mensagem, e OCR e a operacao mais caro deste sistema.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis-trabalhador
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: credit-analysis-trabalhador
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: credit-analysis
+      annotations:
+        # Scrape sim, sonda nao — e as duas coisas foram tratadas como uma na primeira versao
+        # deste manifest, que dizia "sem servidor HTTP" e nao expunha metrica.
+        #
+        # O defeito foi medido contra o Prometheus do compose: `credito_extracoes_total` e
+        # incrementado **somente** no processo do trabalhador, e sem alvo para raspar ele nao
+        # existia — tres documentos extraidos de ponta a ponta, consulta devolvendo vetor vazio. Pior
+        # que o painel vazio: `DocumentosPresosNaExtracao` compara `recebidos - extracoes`, e
+        # operacao com vetor ausente da vazio em PromQL. O alerta que detecta trabalhador parado
+        # ficou silencioso justamente ao separar o trabalhador.
+        #
+        # A distincao que faltava: `/metrics` **expoe contador**, e sonda **afirma saude**. A
+        # objecao a sonda (um 200 num trabalhador travado e pior que nada) nao se aplica a um
+        # endpoint que nao afirma nada. Ver `PORTA_DE_METRICAS` em `trabalhador_main.py`.
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "8001"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: trabalhador
+          # Mesma imagem da API, comando diferente. O `ExtrairDocumento` e o mesmo codigo nos tres
+          # caminhos — trabalhador em processo, trabalhador separado e handler de Lambda.
+          image: credit-analysis:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "credit_analysis.trabalhador_main"]
+          ports:
+            # **`metrics` e nao `http`**, e o nome carrega peso: e por ele que
+            # `infra/k8s/verificar_politica.py` sabe que este container nao serve trafego e por
+            # isso esta isento de sonda HTTP. Renomear para `http` traz a exigencia de sonda de
+            # volta — o que e o comportamento certo, porque um container que serve `http` deveria
+            # ter sonda.
+            #
+            # Nao ha Service apontando para ca. O Prometheus alcanca o pod direto pela anotacao de
+            # scrape, e um Service daria a este endpoint um nome estavel que alguem poderia
+            # confundir com uma API.
+            - name: metrics
+              containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: credit-analysis-config
+            - secretRef:
+                name: credit-analysis-secrets
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # Um lugar gravavel, e nao dois: o `/tmp` que o Tesseract e o PyMuPDF usam para
+          # rasterizacao. O `/cache` do modelo de embedding nao aparece aqui porque este processo
+          # nao faz busca em politica — se um dia aparecer, e sinal de que o trabalhador ganhou
+          # responsabilidade que nao e dele.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          # **Sem probe nenhuma**, e a ausencia e a parte pensada deste manifest.
+          #
+          # `livenessProbe` para consumidor de fila mediria a coisa errada: o processo estar vivo
+          # nao diz que ele esta consumindo, e um 200 num trabalhador travado e pior que nada —
+          # significa "saudavel" enquanto a fila cresce.
+          #
+          # `readinessProbe` nao tem sentido sem Service: readiness controla entrada em endpoint,
+          # e ninguem manda requisicao para ca.
+          #
+          # O que resta e `restartPolicy: Always` (default) para o caso de o processo morrer, e o
+          # alerta de fila para o caso de ele travar vivo. O segundo e o que a probe nao daria.
+          resources:
+            requests:
+              # 512Mi contra 1Gi da API: sem modelo de embedding, o residente e o interpretador
+              # mais a imagem rasterizada em processamento.
+              memory: 512Mi
+              cpu: 500m
+            limits:
+              # 2Gi porque o OCR carrega a pagina rasterizada inteira em memoria: um extrato de 20
+              # paginas a 200 DPI passa de 1GB so de pixels. E o mesmo motivo dos 3008MB da Lambda.
+              memory: 2Gi
+              # SEM limite de CPU, pelo mesmo motivo da API — e aqui o efeito seria maior. O
+              # Tesseract e ligado a CPU, e throttling do CFS no meio de uma pagina alonga a
+              # extracao ate o `VisibilityTimeout` de 300s, quando o SQS reentrega a mensagem que
+              # ainda esta sendo processada. O request garante a fatia sob contencao.
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+      # 300s, e nao os 30s da API.
+      #
+      # Precisa cobrir a extracao mais longa: com menos, um `kubectl rollout` no meio de um OCR
+      # mata o processo, a mensagem volta a ficar visivel depois do `VisibilityTimeout` e o OCR e
+      # pago de novo. O `laco` do trabalhador termina a mensagem em curso ao receber SIGTERM e nao
+      # busca outra.
+      terminationGracePeriodSeconds: 300
+---
+# PodDisruptionBudget: um consumidor sempre no ar durante disrupcao voluntaria.
+#
+# O argumento contra seria "a fila guarda" — e ela guarda, com 14 dias de retencao. Mas o que a
+# fila nao faz e avisar: um drain que evacua as duas replicas transforma a esteira em fila que
+# cresce, e o unico sinal seria o `ApproximateAgeOfOldestMessage` cruzando 15 minutos depois. O PDB
+# custa nada e evita a janela.
+#
+# `minAvailable: 1` absoluto e nao `50%`: com 2 replicas os dois dao o mesmo, e uma queda para 1
+# replica faria a porcentagem arredondar para zero — o mesmo raciocinio do PDB da API.
+#
+# PDB nao interfere no `strategy: Recreate` acima: ele governa disrupcao voluntaria (drain de no),
+# e nao rollout.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: credit-analysis-trabalhador
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis-trabalhador
+---
+# NetworkPolicy do trabalhador: **nenhum ingress**.
+#
+# A API precisa de duas regras de ingress (ingress-controller e Prometheus). Este pod nao precisa
+# de nenhuma: ninguem fala com ele. `policyTypes` com `Ingress` e uma lista `ingress` ausente e
+# como se declara isso — e e diferente de omitir `Ingress` do `policyTypes`, que deixaria o
+# ingress **liberado**.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credit-analysis-trabalhador
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis-trabalhador
+  policyTypes: ["Ingress", "Egress"]
+  # Sem `ingress:` — nega tudo que entra. Ver o comentario acima: a ausencia e a regra.
+  egress:
+    # DNS primeiro. Esquecer esta regra e o erro classico de NetworkPolicy: tudo passa a falhar
+    # com erro de resolucao de nome, e a policy raramente e a primeira suspeita.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Postgres: e por aqui que ele ve a analise que a API gravou.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dados
+      ports:
+        - port: 5432
+    # S3 e SQS, que sao endpoints da AWS fora do cluster.
+    #
+    # `0.0.0.0/0` com `except` das faixas privadas, e nao egress aberto: as faixas de IP do S3 e
+    # do SQS mudam, e fixa-las viraria uma extracao quebrada num dia em que a AWS reatribuir
+    # prefixo. O `except` e o que faz a regra valer alguma coisa — sem ele, um comprometimento
+    # deste pod alcancaria qualquer servico interno do cluster e da VPC.
+    #
+    # A forma correta em producao e VPC Endpoint para S3 e SQS, que mantem o trafego na VPC e
+    # permite politica por endpoint. Isso pertence ao Terraform e nao existe ainda; a regra aqui e
+    # o que da para garantir sem ele, e vale registrar a diferenca.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - port: 443
+    # Tracing. Sem metrica raspavel, o trace e a principal fonte de observabilidade deste pod.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observabilidade
+      ports:
+        - port: 4318

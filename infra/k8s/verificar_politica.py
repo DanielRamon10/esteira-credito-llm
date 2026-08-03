@@ -77,12 +77,85 @@ def conferir_servico(nome: str, erros: list[str]) -> None:
         conferir_policy(nome, policy, erros)
 
 
+# Nomes de porta que **nao** servem trafego.
+#
+# `metrics` esta aqui porque um endpoint de metricas nao e uma API: ele expoe contador para o
+# Prometheus e nao atende cliente. Um container cuja unica porta e esta nao tem endpoint de trafego
+# para uma sonda medir.
+#
+# A lista e curta de proposito. Cada nome adicionado aqui e uma porta que deixa de exigir sonda, e
+# a pergunta para incluir um quarto nao e "esta porta e auxiliar?" e sim "existe cliente cuja
+# requisicao depende de este container estar Ready?".
+PORTAS_SEM_TRAFEGO = frozenset({"metrics"})
+
+
+def e_consumidor_de_fila(container: dict[str, Any], rotulos_do_pod: dict[str, str]) -> bool:
+    """Se este container e um consumidor de fila, para o qual sonda HTTP nao faz sentido.
+
+    ## Duas condicoes, e nao uma
+
+    - **nenhuma porta de trafego**: o sinal estrutural. Sem endpoint que atenda cliente, nao ha o
+      que sondar. Este e o que nao da para satisfazer por engano — no dia em que o processo ganhar
+      um servidor, quem escrever `name: http` traz a exigencia de sonda de volta junto;
+    - **`component: worker`**: o sinal declarado, e ele existe porque o primeiro sozinho seria
+      frouxo demais. Esquecer o bloco `ports` num container de API e um erro plausivel, e com uma
+      condicao so ele **removeria** a exigencia de sonda em vez de acusar — exatamente o tipo de
+      isencao silenciosa que este arquivo existe para nao ter.
+
+    Precisar dos dois significa que a isencao e uma decisao escrita em dois lugares, e nao um
+    efeito colateral de uma omissao.
+
+    ## Por que nao e simplesmente "sem `ports`"
+
+    Era, na primeira versao — e o trabalhador nao declarava porta nenhuma. Ele passou a declarar
+    `metrics: 8001` quando ficou medido que, sem endpoint de metricas, a serie
+    `credito_extracoes_total` desaparecia do Prometheus e levava consigo a capacidade de o alerta
+    `DocumentosPresosNaExtracao` disparar.
+
+    Endurecer a regra para "sem porta alguma" obrigaria a escolher entre a isencao e o alerta. O que
+    a regra precisa distinguir nao e ter porta, e sim **servir trafego**.
+    """
+    nomes = {porta.get("name") for porta in container.get("ports", [])}
+    sem_trafego = nomes <= PORTAS_SEM_TRAFEGO
+    declarado = rotulos_do_pod.get("app.kubernetes.io/component") == "worker"
+    return sem_trafego and declarado
+
+
+def conferir_porta_das_sondas(
+    rotulo: str, container: dict[str, Any], erros: list[str]
+) -> None:
+    """Sonda por nome de porta precisa apontar para uma porta que existe.
+
+    Esta checagem nasceu de um mutante, e vale registrar como: ao testar a isencao de sondas do
+    trabalhador, removi o bloco `ports` do container da API para conferir que a isencao nao era
+    frouxa. Ela nao era — a exigencia de sonda continuou valendo. Mas o verificador aceitou o
+    manifest **sem uma reclamacao**, e as tres sondas da API dizem `port: http`.
+
+    O resultado seria um pod que nunca fica Ready: o kubelet nao resolve `http`, a readiness falha
+    para sempre, e o rollout trava com uma mensagem sobre sonda — nao sobre porta ausente.
+    `kubeconform --strict` nao pega: o schema de `httpGet.port` aceita string, e nada no schema
+    liga a string ao bloco `ports` do mesmo container.
+    """
+    declaradas = {porta.get("name") for porta in container.get("ports", [])}
+
+    for sonda in ("readinessProbe", "livenessProbe", "startupProbe"):
+        alvo = container.get(sonda, {}).get("httpGet", {}).get("port")
+        # Numero e endereco absoluto e nao precisa existir no bloco `ports`; o kubelet conecta na
+        # porta do pod direto. Somente a forma por nome depende da declaracao.
+        if isinstance(alvo, str) and alvo not in declaradas:
+            erros.append(
+                f"{rotulo}: {sonda} aponta para a porta '{alvo}', que o container nao declara"
+            )
+
+
 def conferir_deployment(nome: str, deployment: dict[str, Any], erros: list[str]) -> None:
     spec = deployment["spec"]["template"]["spec"]
     contexto_pod = spec.get("securityContext", {})
 
     if not contexto_pod.get("runAsNonRoot"):
         erros.append(f"{nome}: pod nao declara runAsNonRoot")
+
+    rotulos_do_pod = deployment["spec"]["template"]["metadata"].get("labels", {})
 
     for container in spec["containers"]:
         rotulo = f"{nome}/{container['name']}"
@@ -92,9 +165,27 @@ def conferir_deployment(nome: str, deployment: dict[str, Any], erros: list[str])
         # sem readiness o pod recebe trafego antes de estar pronto; sem liveness um
         # processo travado fica no balanceador para sempre; sem startup, o liveness
         # precisa ser permissivo o tempo todo para tolerar o boot.
-        for sonda in ("readinessProbe", "livenessProbe", "startupProbe"):
-            if sonda not in container:
-                erros.append(f"{rotulo}: falta {sonda}")
+        #
+        # A excecao e consumidor de fila, e ela nao e uma frouxidao: as tres sondas medem
+        # disponibilidade **de endpoint**, e num processo sem servidor HTTP nao existe endpoint
+        # para medir. Um `livenessProbe` respondendo 200 num trabalhador travado seria pior que
+        # nenhum — significaria "saudavel" enquanto a fila cresce. O sinal certo e profundidade de
+        # fila (`DocumentosPresosNaExtracao`), e ele vive nos alertas, nao no manifest.
+        if e_consumidor_de_fila(container, rotulos_do_pod):
+            # Impresso e nao silencioso: uma isencao que nao aparece no log do CI e uma isencao
+            # que ninguem revisa. Se um dia isto imprimir o nome de um servico que **deveria**
+            # ter sonda, a linha e a pista.
+            print(f"::notice::{rotulo}: isento de sondas HTTP (consumidor de fila)")
+            for sonda in ("readinessProbe", "livenessProbe", "startupProbe"):
+                # E o inverso tambem e violacao: declarar sonda HTTP sem porta e configuracao que
+                # nunca pode passar, e o pod entraria em CrashLoop por falha de sonda.
+                if sonda in container:
+                    erros.append(f"{rotulo}: {sonda} num container que nao serve trafego")
+        else:
+            for sonda in ("readinessProbe", "livenessProbe", "startupProbe"):
+                if sonda not in container:
+                    erros.append(f"{rotulo}: falta {sonda}")
+            conferir_porta_das_sondas(rotulo, container, erros)
 
         if not contexto.get("readOnlyRootFilesystem"):
             erros.append(f"{rotulo}: rootfs nao e somente leitura")

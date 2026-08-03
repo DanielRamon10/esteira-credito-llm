@@ -139,7 +139,36 @@ def montar_chaveiro(settings: Settings) -> auth.Chaveiro:
     teria de escolher entre recusar tudo (indisponivel, mas seguro) ou aceitar tudo
     (disponivel, e aberto). A terceira opcao — nao subir — e a unica que nao esconde o
     problema, e e a que o Kubernetes trata bem, mantendo os pods antigos no ar.
+
+    **Esta funcao e onde "precisa haver uma fonte de chave" e exigido**, e nao o validador de
+    `Settings`. A razao esta na docstring de `_conferir_fonte_de_chave`: `Settings` e compartilhado
+    com o trabalhador de extracao, que consome fila e nao verifica token — exigir chave la
+    obrigaria a montar material de auth num processo que nao autentica ninguem.
+
+    Como `criar_app` chama isto no boot, a garantia para a API e a mesma de antes: sem fonte de
+    chave, o processo nao sobe.
     """
+    if not any(
+        (
+            settings.auth_jwks_url.strip(),
+            settings.auth_chave_publica_arquivo is not None,
+            settings.auth_chave_publica.strip(),
+        )
+    ):
+        # Mensagem com os comandos exatos. Um erro seco mandaria quem esta configurando procurar
+        # no codigo o que preenche estas variaveis — e a resposta esta em outro pacote
+        # (`plataforma.emissor_local`), o que torna a busca pior.
+        raise RuntimeError(
+            "autenticacao exige uma fonte de chave: "
+            "CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO, CREDIT_AUTH_CHAVE_PUBLICA "
+            "ou CREDIT_AUTH_JWKS_URL.\n"
+            "Para desenvolvimento, sem conta em provedor nenhum:\n"
+            "  python -m plataforma.emissor_local gerar-chaves\n"
+            "  export CREDIT_AUTH_CHAVE_PUBLICA_ARQUIVO=.chaves/publica.pem\n"
+            "  export CREDIT_AUTH_EMISSOR=https://local.esteira-credito.invalid\n"
+            "Nao ha modo desligado, e a ausencia e deliberada: ver o topo deste arquivo."
+        )
+
     if settings.auth_jwks_url:
         return auth.Chaveiro.de_jwks(settings.auth_jwks_url)
 

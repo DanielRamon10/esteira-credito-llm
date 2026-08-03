@@ -125,11 +125,41 @@ def armazenamento(bucket_versionado: str) -> ArmazenamentoS3:
 
 
 @pytest.fixture
-def fila() -> FilaSQS:
+def fila() -> Iterator[FilaSQS]:
+    """Fila **propria** por teste, criada e apagada.
+
+    A primeira versao usava a fila `extracao-documentos` do `elasticmq.conf`, e os testes passavam.
+    Depois falharam — porque a stack do compose estava no ar, com o trabalhador em processo
+    consumindo daquela mesma fila e roubando as mensagens.
+
+    O sintoma era enganoso: tres testes de fila falhando juntos parece bug no adapter, e o adapter
+    estava correto. A causa era o teste compartilhar recurso com um processo de verdade.
+
+    Nome com UUID, como no bucket. O `elasticmq.conf` continua declarando a fila de producao local
+    com a DLQ — o que estes testes nao verificam, porque `maxReceiveCount` e comportamento da fila
+    e nao do adapter.
+    """
     if not SQS_ENDPOINT:
         pytest.skip(MOTIVO_SQS)
-    url = f"{SQS_ENDPOINT}/000000000000/extracao-documentos"
-    return FilaSQS(url_da_fila=url, endpoint_url=SQS_ENDPOINT)
+
+    cliente = boto3.client(
+        "sqs", endpoint_url=SQS_ENDPOINT, region_name="sa-east-1", **_credenciais()
+    )
+    nome = f"teste-{uuid.uuid4().hex[:12]}"
+    try:
+        url = cliente.create_queue(QueueName=nome, Attributes={"VisibilityTimeout": "300"})[
+            "QueueUrl"
+        ]
+    except EndpointConnectionError:
+        pytest.skip(f"{MOTIVO_SQS} (endpoint {SQS_ENDPOINT} nao responde)")
+
+    # O ElasticMQ devolve a URL com o host que **ele** conhece, que dentro do container e outro.
+    # Reescrever pelo endpoint do teste evita um erro de conexao que pareceria falha do adapter.
+    url = f"{SQS_ENDPOINT}/000000000000/{nome}"
+
+    yield FilaSQS(url_da_fila=url, endpoint_url=SQS_ENDPOINT)
+
+    cliente.delete_queue(QueueUrl=url)
 
 
 def pedido(documento_id: uuid.UUID | None = None) -> PedidoDeExtracao:

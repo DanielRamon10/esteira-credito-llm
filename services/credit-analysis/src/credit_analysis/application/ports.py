@@ -47,6 +47,37 @@ class RepositorioAnalises(Protocol):
 
 
 @runtime_checkable
+class BuscaPorDocumento(Protocol):
+    """Capacidade **opcional**: achar a analise a partir do documento.
+
+    ## Por que um port separado, e nao um metodo em `RepositorioAnalises`
+
+    Uma rota de polling (`GET /v1/documentos/{id}`) precisa ir do documento para a analise, e o
+    agregado so oferece o caminho contrario. As duas saidas seriam:
+
+    - poe no `RepositorioAnalises`, e **todo** adapter passa a ser obrigado a implementar — o de
+      memoria, o de teste, qualquer fake numa suite — para servir uma otimizacao que so o Postgres
+      tem, e cada um deles teria que escrever a varredura na mao;
+    - port separado, verificado em tempo de execucao. Quem oferece, e usado; quem nao, cai na
+      varredura, que e o comportamento correto no volume de um repositorio em memoria.
+
+    A segunda tambem e mais honesta sobre o que esta acontecendo: nao e uma operacao do agregado, e
+    uma consulta de leitura que existe por causa do formato de uma URL.
+
+    ## O `runtime_checkable` aqui e o ponto, e ele tem um limite
+
+    `isinstance` com Protocol confere **presenca do metodo**, nao assinatura. Um adapter com
+    `buscar_por_documento(self, x, y)` passaria no isinstance e estouraria na chamada. E aceitavel
+    porque existe um unico implementador e ele tem teste; se aparecer um segundo, o teste de
+    contrato e o lugar de prender isso.
+    """
+
+    async def buscar_por_documento(self, documento_id: UUID) -> AnaliseCredito | None:
+        """Devolve a analise que contem o documento, ou None."""
+        ...
+
+
+@runtime_checkable
 class ConsultaBureau(Protocol):
     """Consulta a bureau de credito (Serasa, SPC, ...).
 
