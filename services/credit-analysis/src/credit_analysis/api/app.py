@@ -67,6 +67,12 @@ from credit_analysis.infrastructure.ocr.vision import OCRClaudeVision
 from credit_analysis.infrastructure.rag.embeddings import EmbedderFastEmbed
 from credit_analysis.infrastructure.rag.pgvector_store import VectorStorePgVector, criar_pool
 from credit_analysis.infrastructure.rag.retriever import RetrieverHibrido
+from credit_analysis.infrastructure.repositories.idempotencia import (
+    RegistroIdempotenciaPostgres,
+)
+from credit_analysis.infrastructure.repositories.idempotencia_memoria import (
+    RegistroIdempotenciaMemoria,
+)
 from credit_analysis.infrastructure.repositories.memoria import RepositorioAnalisesMemoria
 from credit_analysis.infrastructure.repositories.postgres import RepositorioAnalisesPostgres
 from credit_analysis.infrastructure.tokens import (
@@ -220,6 +226,17 @@ def criar_app(
 
     app.state.settings = settings
     app.state.repositorio = repositorio or _montar_repositorio(settings, pool)
+    # Registro de idempotencia, Postgres quando ha pool e memoria fora dele.
+    #
+    # Amarrado ao pool e nao ao repositorio de proposito: idempotencia nao e capacidade do agregado
+    # de analise, e um repositorio injetado num teste nao deveria arrastar o registro de chaves.
+    #
+    # Em memoria a garantia vale **por processo** — com duas replicas, a repeticao que cair na outra
+    # cria a segunda analise. O que impede isso em producao e a mesma guarda do repositorio, logo
+    # abaixo: `prod` sem `CREDIT_POSTGRES_DSN` nao sobe.
+    app.state.idempotencia = (
+        RegistroIdempotenciaPostgres(pool) if pool is not None else RegistroIdempotenciaMemoria()
+    )
     app.state.bureau = bureau or BureauStub()
     app.state.retriever = retriever  # pode virar pgvector no lifespan
     app.state.motor_ocr = motor_ocr or _montar_ocr(settings)

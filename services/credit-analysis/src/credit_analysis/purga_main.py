@@ -31,6 +31,9 @@ from credit_analysis.application.use_cases.ciclo_de_vida import PurgarDadoVencid
 from credit_analysis.config import Settings, get_settings
 from credit_analysis.infrastructure.event_loop import executar
 from credit_analysis.infrastructure.rag.pgvector_store import criar_pool
+from credit_analysis.infrastructure.repositories.idempotencia import (
+    RegistroIdempotenciaPostgres,
+)
 from credit_analysis.infrastructure.repositories.postgres import RepositorioAnalisesPostgres
 
 logger = structlog.get_logger(__name__)
@@ -62,10 +65,13 @@ def main() -> None:
     async def rodar() -> None:
         await pool.open(wait=True, timeout=30)
         try:
-            resultado = await PurgarDadoVencido(RepositorioAnalisesPostgres(pool)).executar()
+            resultado = await PurgarDadoVencido(
+                RepositorioAnalisesPostgres(pool), RegistroIdempotenciaPostgres(pool)
+            ).executar()
             logger.info(
                 "purga.finalizada",
                 textos_purgados=resultado.textos_purgados,
+                chaves_purgadas=resultado.chaves_purgadas,
                 limite=resultado.limite_aplicado.isoformat(),
             )
         finally:

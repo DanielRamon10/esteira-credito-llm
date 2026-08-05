@@ -24,6 +24,7 @@ from credit_analysis.application.ports import (
     FilaDeTrabalho,
     ModeloLinguagem,
     MotorOCR,
+    RegistroDeChaves,
     RepositorioAnalises,
 )
 from credit_analysis.application.use_cases.analisar_credito import (
@@ -224,7 +225,29 @@ def obter_ciclo_de_vida(request: Request) -> CicloDeVidaDoDado:
 
 
 RepositorioDep = Annotated[RepositorioAnalises, Depends(obter_repositorio)]
+
+
+def obter_idempotencia(request: Request) -> RegistroDeChaves:
+    """Registro de idempotencia, quando o ambiente conserva dado de forma duravel.
+
+    Sempre existe: `criar_app` monta o de Postgres quando ha pool e o de memoria fora dele. O 503
+    aqui cobre um `app.state` montado a mao — em teste, tipicamente — e nao um ambiente normal.
+
+    A garantia de que o de memoria nao chega a producao nao esta aqui: esta na recusa de `criar_app`
+    a subir em `prod` sem `CREDIT_POSTGRES_DSN`. Em memoria o registro vale por processo, e com duas
+    replicas a repeticao que cair na outra cria a segunda analise.
+    """
+    registro: RegistroDeChaves | None = getattr(request.app.state, "idempotencia", None)
+    if registro is None:
+        raise RecursoIndisponivel(
+            "Registro de idempotencia ausente no estado da aplicacao. Em uso normal `criar_app` "
+            "sempre monta um; se voce chegou aqui, o `app.state` foi montado a mao."
+        )
+    return registro
+
+
 CicloDeVidaDep = Annotated[CicloDeVidaDoDado, Depends(obter_ciclo_de_vida)]
+IdempotenciaDep = Annotated[RegistroDeChaves, Depends(obter_idempotencia)]
 RetrieverDep = Annotated[RetrieverHibrido, Depends(obter_retriever)]
 FundamentarDep = Annotated[FundamentarParecer, Depends(obter_caso_fundamentar)]
 MotorOCRDep = Annotated[MotorOCR, Depends(obter_motor_ocr)]

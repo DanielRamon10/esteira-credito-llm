@@ -14,7 +14,9 @@ from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -191,13 +193,38 @@ def emitir_token(
 
 
 def montar_cliente(app: FastAPI, token: str) -> TestClient:
-    """`TestClient` com o cabecalho `Authorization` em todas as requisicoes.
+    """`TestClient` que se comporta como um cliente bem-educado: token e chave de idempotencia.
 
-    O cabecalho vai no construtor e nao em cada chamada: com 9 clientes e centenas de
+    O `Authorization` vai no construtor e nao em cada chamada: com 9 clientes e centenas de
     requisicoes na suite, passar por chamada garantiria que alguma ficasse sem — e o teste
     falharia com 401 por esquecimento, o que treina a ler 401 como ruido.
+
+    ## `Idempotency-Key` por gancho, e nao no construtor
+
+    A Camada 11 tornou a chave obrigatoria em `POST /v1/analises`. Poe-la no construtor seria o
+    caminho curto e estaria **errado**: o cabecalho ficaria fixo, e duas criacoes no mesmo teste
+    compartilhariam a chave — a segunda receberia a analise da primeira, e o teste mediria
+    idempotencia onde queria medir outra coisa.
+
+    O gancho gera uma chave nova por requisicao, que e o que um cliente correto faz. Ele
+    **respeita** a chave ja presente: os testes de idempotencia mandam a delas e precisam que ela
+    chegue.
+
+    ## O que este gancho esconde, e o teste que cobre o buraco
+
+    Com ele, nenhuma chamada da suite chega sem chave — inclusive as que deveriam. A exigencia em si
+    e verificada por `test_sem_chave_de_idempotencia_e_400`, que usa um cliente sem o gancho.
     """
-    return TestClient(app, headers={"Authorization": f"Bearer {token}"})
+
+    def por_requisicao(request: httpx.Request) -> None:
+        if "Idempotency-Key" not in request.headers:
+            request.headers["Idempotency-Key"] = str(uuid4())
+
+    cliente = TestClient(app, headers={"Authorization": f"Bearer {token}"})
+    # Pendurado depois da construcao: `TestClient.__init__` nao aceita `event_hooks`, mas ele
+    # **herda** de `httpx.Client`, e o atributo existe no objeto pronto.
+    cliente.event_hooks["request"].append(por_requisicao)
+    return cliente
 
 
 @pytest.fixture

@@ -51,3 +51,36 @@ class RecursoIndisponivel(ErroDominio):
     """
 
     codigo = "recurso_indisponivel"
+
+
+class ChaveDeIdempotenciaAusente(ErroDominio):
+    """`Idempotency-Key` obrigatorio e nao enviado.
+
+    400 e nao 428: o `draft-ietf-httpapi-idempotency-key-header` especifica 400 para chave ausente,
+    e 428 Precondition Required (RFC 6585) fala de requisicao **condicional** — outra coisa.
+    """
+
+    codigo = "chave_de_idempotencia_ausente"
+
+
+class ChaveDeIdempotenciaReusada(ErroDominio):
+    """Mesma chave, pedido diferente.
+
+    422 e nao 409: o conflito nao e de estado do recurso, e do **pedido** — o cliente mandou dois
+    corpos distintos sob a mesma chave, e o que esta errado e o que ele enviou.
+
+    Devolver a resposta do primeiro seria pior que qualquer erro: o cliente concluiria que submeteu
+    uma analise que nao existe.
+    """
+
+    codigo = "chave_de_idempotencia_reusada"
+
+
+class PedidoEmAndamento(ErroDominio):
+    """A mesma chave esta sendo processada agora, por outra requisicao.
+
+    409 com `Retry-After`: e conflito de estado, e temporario. Bloquear esperando o outro terminar
+    seria a alternativa, e ela prende um worker por um tempo que nao se controla.
+    """
+
+    codigo = "pedido_em_andamento"

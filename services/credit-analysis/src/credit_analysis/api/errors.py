@@ -16,8 +16,11 @@ from credit_analysis.api.routers.documentos import ArquivoGrandeDemais
 from credit_analysis.api.schemas import ErroResponse
 from credit_analysis.domain.exceptions import (
     AnaliseNaoEncontrada,
+    ChaveDeIdempotenciaAusente,
+    ChaveDeIdempotenciaReusada,
     DadosInsuficientes,
     ErroDominio,
+    PedidoEmAndamento,
     RecursoIndisponivel,
     TransicaoInvalida,
     ValorInvalido,
@@ -33,6 +36,12 @@ _STATUS_POR_ERRO: dict[type[ErroDominio], int] = {
     DadosInsuficientes: status.HTTP_422_UNPROCESSABLE_CONTENT,
     TransicaoInvalida: status.HTTP_409_CONFLICT,
     RecursoIndisponivel: status.HTTP_503_SERVICE_UNAVAILABLE,
+    # Idempotencia (Camada 11). Os tres codigos sao diferentes de proposito: 400 para chave ausente
+    # (o cliente nao mandou o que a rota exige), 422 para chave reusada com pedido diferente (o que
+    # ele mandou e incoerente), 409 para pedido em andamento (estado, e temporario).
+    ChaveDeIdempotenciaAusente: status.HTTP_400_BAD_REQUEST,
+    ChaveDeIdempotenciaReusada: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    PedidoEmAndamento: status.HTTP_409_CONFLICT,
     # Precede ValorInvalido na busca pela MRO por ser subclasse dela.
     ArquivoGrandeDemais: status.HTTP_413_CONTENT_TOO_LARGE,
 }

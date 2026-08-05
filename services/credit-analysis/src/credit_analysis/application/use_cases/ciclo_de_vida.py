@@ -25,7 +25,7 @@ from uuid import UUID
 
 import structlog
 
-from credit_analysis.application.ports import CicloDeVidaDoDado
+from credit_analysis.application.ports import CicloDeVidaDoDado, RegistroDeChaves
 from credit_analysis.domain.retencao import (
     PRAZOS,
     RETENCAO_TEXTO_OCR,
@@ -134,6 +134,11 @@ class ResultadoDaPurga:
     textos_purgados: int
     limite_aplicado: datetime
     executada_em: datetime
+    # Chaves de idempotencia fora da janela de 24h (Camada 11).
+    #
+    # Numero separado e nao somado aos textos: as duas purgas tem prazo, base e volume diferentes —
+    # 90 dias contra 24 horas —, e um total unico esconderia uma delas parando de funcionar.
+    chaves_purgadas: int = 0
 
 
 class PurgarDadoVencido:
@@ -152,14 +157,18 @@ class PurgarDadoVencido:
     Dizer isso e melhor que uma varredura de 5 anos sem teste: a segunda pareceria pronta.
     """
 
-    def __init__(self, ciclo: CicloDeVidaDoDado) -> None:
+    def __init__(self, ciclo: CicloDeVidaDoDado, chaves: RegistroDeChaves | None = None) -> None:
         self._ciclo = ciclo
+        # Opcional porque a purga de texto e independente da de chaves: um ambiente sem registro de
+        # idempotencia — teste que exercita so a retencao — nao deveria ser obrigado a montar um.
+        self._chaves = chaves
 
     async def executar(self, *, agora: datetime | None = None) -> ResultadoDaPurga:
         momento = agora if agora is not None else datetime.now(UTC)
         limite = momento - RETENCAO_TEXTO_OCR
 
         textos = await self._ciclo.purgar_texto_de_ocr(limite)
+        chaves = await self._chaves.purgar_vencidas(momento) if self._chaves is not None else 0
 
         prazo = PRAZOS[ClasseDeDado.TEXTO_DOCUMENTO]
         logger.info(
@@ -175,4 +184,5 @@ class PurgarDadoVencido:
             textos_purgados=textos,
             limite_aplicado=limite,
             executada_em=momento,
+            chaves_purgadas=chaves,
         )

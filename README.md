@@ -941,6 +941,85 @@ estática — percorre a AST e falha se alguma chamada de `logger` receber `cpf`
 ou `texto` —, não depende de nível nem de thread, e pega a regressão que importa: alguém
 acrescentar o CPF ao log para facilitar depuração.
 
+## Idempotência de submissão
+
+`POST /v1/analises` sem chave criava uma análise por chamada. Clique duplo, retry de cliente
+HTTP, reenvio depois de timeout — cada um virava uma análise nova para a mesma pessoa, com
+uma consulta a bureau nova. Em crédito isso não é desperdício: consulta duplicada aparece no
+histórico do próprio cliente. E o modo de falha ficou **mais provável** com a Camada 8, porque
+quem recebe 202 e não vê resultado imediato tende a reenviar.
+
+`Idempotency-Key` é **obrigatório** nessa rota. Segunda mudança de contrato do projeto, pela
+mesma razão da primeira (201 → 202): a alternativa correta era incompatível com a antiga.
+Exigir e não apenas aceitar porque quem gera a chave é o cliente, e um cliente que não a envia
+não está protegido.
+
+### O que este desenho não guarda: a resposta
+
+O desenho comum guarda o corpo para devolvê-lo idêntico, e ele **quebraria a Camada 10 em
+silêncio**. A resposta carrega nome, CPF, renda e parecer: guardada, viraria uma segunda cópia
+de dado pessoal com prazo próprio e fora do alcance de `apagar_identificacao` — um pedido de
+exclusão atendido deixaria o titular inteiro numa tabela de cache por mais 24 horas, e o recibo
+do art. 19 estaria mentindo.
+
+Guardando só o id, a repetição lê o recurso. Se ele foi apagado, a repetição responde 404 em
+vez de ressuscitar dado excluído — o comportamento certo cai fora do desenho, sem precisar de
+uma regra. Tem teste: `test_repeticao_de_analise_apagada_nao_a_ressuscita`.
+
+O preço é que a repetição não é byte-idêntica: ela reflete o estado atual do recurso. A garantia
+é "um recurso por chave", não "resposta congelada".
+
+### A corrida, que é o único caso que importa
+
+O desenho ingênuo — `SELECT`, se não existe então `INSERT` — tem uma janela entre as duas
+consultas. Duas requisições simultâneas leem "não existe", as duas inserem, as duas processam.
+E o clique duplo chega **junto**, então é exatamente esse caso que a camada precisa cobrir.
+
+`INSERT ... ON CONFLICT DO NOTHING RETURNING` decide no banco, numa operação. O teste dispara
+8 reivindicações concorrentes e afirma que **uma** ganhou; trocando a implementação pelo desenho
+ingênuo, ele falha. Um teste sequencial passaria com os dois.
+
+### Três desfechos, três códigos
+
+| Situação | Resposta |
+|---|---|
+| chave nova | 201, processa |
+| chave repetida, pedido igual | 200 — nada foi criado agora |
+| chave repetida, pedido diferente | 422 |
+| mesma chave em processamento | 409 |
+| sem chave | 400 |
+
+O 422 é o que faz a impressão do pedido valer: sem comparar o corpo, um cliente que fixa a
+chave por sessão receberia a resposta do primeiro pedido e concluiria que submeteu uma análise
+de R$ 80.000 quando submeteu a de R$ 45.000. A impressão é SHA-256 do JSON canonicalizado —
+`sort_keys` porque ordem de chave diferente é o mesmo pedido, e um cliente com dicionário não
+ordenado veria o próprio retry virar conflito.
+
+### A chave é escopada por locatário, e isso é segurança
+
+Com a chave global, um cliente que adivinhasse a chave de outro receberia **o recurso do outro**
+na repetição: a idempotência viraria um canal de leitura entre locatários. Chave de idempotência
+costuma ser UUID, mas costume não é controle de acesso. A chave primária é `(locatario, chave)`.
+
+### Duas armadilhas que têm teste próprio
+
+**Chave envenenada.** Se o processamento falha, a chave é liberada antes de o erro propagar. Sem
+isso, um bureau em timeout bloquearia o retry do cliente por dois minutos — a idempotência
+transformaria erro recuperável em bloqueio.
+
+**Chave abandonada.** Se o processo morre entre reivindicar e concluir, a chave seria inútil pelas
+24h da janela. Passados 120s ela é retomada — e a retomada vale só para `em_andamento`: se
+alcançasse chave concluída, criaria a segunda análise dois minutos depois.
+
+### O gancho no cliente de teste, e o que ele esconde
+
+Exigir a chave quebraria 39 chamadas em 7 arquivos de teste. Em vez de editar as 39, o
+`montar_cliente` injeta uma chave nova por requisição — que é o que um cliente correto faz — e
+respeita a que já vier. Zero churn, contrato real.
+
+O custo é que nenhuma chamada da suíte chega sem chave, inclusive as que deveriam. Por isso
+existe um cliente **sem** o gancho, usado só pelo teste que verifica o 400.
+
 ## Segredos
 
 Nenhuma chave é necessária para rodar o projeto — veja a tabela de degradação

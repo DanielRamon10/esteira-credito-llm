@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import datetime
-from typing import IO, Protocol, runtime_checkable
+from typing import IO, Any, Protocol, runtime_checkable
 from uuid import UUID
 
 from credit_analysis.domain.agente import TrilhaAgente
@@ -134,6 +134,38 @@ class CicloDeVidaDoDado(Protocol):
         Devolve a contagem e nao None porque o job precisa dizer o que fez: "purga concluida" sem
         numero nao distingue trabalho de configuracao errada apontando para banco vazio.
         """
+        ...
+
+
+@runtime_checkable
+class RegistroDeChaves(Protocol):
+    """Reivindicacao de chave de idempotencia (Camada 11).
+
+    Duas implementacoes com garantias diferentes, e a diferenca **nao** e durabilidade:
+
+    - Postgres: a reivindicacao e atomica entre processos, entao a garantia vale com N replicas;
+    - memoria: atomica dentro de um processo, entao ela vale com **uma** replica e nao vale com
+      duas. Nao e "menos garantia", e ausencia dela — ver o cabecalho de
+      `infrastructure/repositories/idempotencia_memoria.py`.
+
+    Port e nao classe base porque as duas nao compartilham implementacao: uma resolve a corrida no
+    banco, a outra na ausencia de `await`.
+    """
+
+    async def reivindicar(self, locatario: str, chave: str, impressao: str, agora: datetime) -> Any:
+        """Tenta tomar a chave. Devolve `Reivindicacao`, com o desfecho e o registro existente."""
+        ...
+
+    async def concluir(self, locatario: str, chave: str, recurso_id: UUID) -> None:
+        """Amarra a chave ao recurso criado."""
+        ...
+
+    async def liberar(self, locatario: str, chave: str) -> None:
+        """Devolve a chave quando o processamento falhou, para o retry nao esbarrar nela."""
+        ...
+
+    async def purgar_vencidas(self, agora: datetime) -> int:
+        """Remove chaves fora da janela. Devolve quantas."""
         ...
 
 

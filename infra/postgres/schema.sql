@@ -277,3 +277,49 @@ CREATE TABLE IF NOT EXISTS decisao_retida (
 -- Nao ha indice por `motivo`: o dominio tem dois valores, e um indice sobre coluna de baixa
 -- cardinalidade nao ajuda o planejador — ele faz varredura de qualquer forma.
 CREATE INDEX IF NOT EXISTS idx_decisao_retida_data ON decisao_retida (decidida_em DESC);
+
+-- ========================================================= Camada 11: idempotencia
+--
+-- Uma chave reivindicada por um chamador, com o recurso que ela produziu.
+--
+-- ## A chave e composta por (locatario, chave), e isso e seguranca e nao organizacao
+--
+-- Com `chave` sozinha como PK, um cliente que adivinhasse a chave de outro receberia **o recurso do
+-- outro** na repeticao — a idempotencia viraria um canal de leitura entre locatarios. Chave de
+-- idempotencia costuma ser UUID, mas costume nao e controle de acesso.
+--
+-- O escopo tambem evita colisao honesta: dois clientes que usem `"pedido-1"` nao se atrapalham.
+--
+-- ## O que NAO esta aqui: o corpo da resposta
+--
+-- O desenho comum guarda a resposta para devolve-la identica. Aqui isso criaria uma segunda copia
+-- de nome, CPF e parecer, com prazo proprio e fora do alcance de `apagar_identificacao` — um pedido
+-- de exclusao atendido deixaria o titular nesta tabela por mais 24h, e o recibo do art. 19 estaria
+-- mentindo. Ver o cabecalho de `domain/idempotencia.py`.
+CREATE TABLE IF NOT EXISTS idempotencia (
+    locatario   TEXT        NOT NULL,
+    chave       TEXT        NOT NULL,
+
+    -- SHA-256 do corpo canonicalizado. Detecta chave reusada com pedido diferente.
+    impressao   TEXT        NOT NULL,
+
+    estado      TEXT        NOT NULL CHECK (estado IN ('em_andamento', 'concluida')),
+
+    -- O id do recurso criado, e nao o recurso. NULL enquanto `em_andamento`.
+    --
+    -- Sem FK para `analise`: um `ON DELETE CASCADE` faria o apagamento do art. 18 levar a linha de
+    -- idempotencia junto, e a repeticao voltaria a **criar** a analise que acabou de ser apagada.
+    -- Sem FK, a repeticao encontra a chave, nao acha o recurso e responde 404 — que e a verdade.
+    recurso_id  UUID,
+
+    criada_em   TIMESTAMPTZ NOT NULL,
+
+    PRIMARY KEY (locatario, chave)
+);
+
+-- Varredura por idade, para a purga da janela de 24h.
+--
+-- Esta tabela **e** coberta pela purga, diferente do que aconteceu com `texto_extraido` na Camada
+-- 10: guardar chave de idempotencia para sempre acumularia sem limite e manteria a ligacao
+-- `chamador -> analise` muito alem da finalidade.
+CREATE INDEX IF NOT EXISTS idx_idempotencia_idade ON idempotencia (criada_em);
