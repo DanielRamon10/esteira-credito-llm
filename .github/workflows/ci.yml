@@ -567,13 +567,41 @@ jobs:
           TOKEN=$(python -m plataforma.emissor_local token \
             --audiencia credit-analysis --escopos "analises:escrever analises:ler")
 
+          # `/v1/analises` sem `Idempotency-Key`: 400.
+          #
+          # Este passo **pegou a mudanca de contrato da Camada 11** — ele postava sem a chave e
+          # passou a receber 400. Ficou como verificacao em vez de ser apenas corrigido: e o unico
+          # ponto do CI que exercita a exigencia contra a imagem real, e na suite o cliente de
+          # teste injeta a chave sozinho.
+          codigo=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/v1/analises \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $TOKEN" \
+            -d '{"solicitante":{"nome":"Ana Souza","cpf":"529.982.247-25","data_nascimento":"1990-05-14T00:00:00Z","renda_mensal_declarada":"8500.00"},"proposta":{"valor_solicitado":"45000.00","prazo_meses":36,"taxa_juros_mensal":"1.99"}}')
+          [ "$codigo" = "400" ] \
+            || { echo "::error::sem Idempotency-Key o servico devolveu $codigo, esperado 400"; docker logs api; exit 1; }
+
           # Uma analise de verdade: se o dominio quebrou, o health check nao
           # perceberia.
+          CHAVE=$(python -c 'import uuid; print(uuid.uuid4())')
           curl -fsS -X POST http://localhost:8000/v1/analises \
             -H 'Content-Type: application/json' \
             -H "Authorization: Bearer $TOKEN" \
+            -H "Idempotency-Key: $CHAVE" \
             -d '{"solicitante":{"nome":"Ana Souza","cpf":"529.982.247-25","data_nascimento":"1990-05-14T00:00:00Z","renda_mensal_declarada":"8500.00"},"proposta":{"valor_solicitado":"45000.00","prazo_meses":36,"taxa_juros_mensal":"1.99"}}' \
             | grep -q '"score"' \
             || { echo "::error::a esteira nao produziu parecer"; docker logs api; exit 1; }
+
+          # A repeticao com a **mesma** chave: 200 em vez de 201.
+          #
+          # Aqui o registro e o de memoria (o container sobe sem `CREDIT_POSTGRES_DSN`), entao o que
+          # se mede e a rota e nao a durabilidade. A garantia entre replicas depende do Postgres, e
+          # ela esta em `tests/integration/test_idempotencia.py`.
+          codigo=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/v1/analises \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Idempotency-Key: $CHAVE" \
+            -d '{"solicitante":{"nome":"Ana Souza","cpf":"529.982.247-25","data_nascimento":"1990-05-14T00:00:00Z","renda_mensal_declarada":"8500.00"},"proposta":{"valor_solicitado":"45000.00","prazo_meses":36,"taxa_juros_mensal":"1.99"}}')
+          [ "$codigo" = "200" ] \
+            || { echo "::error::repeticao devolveu $codigo, esperado 200"; docker logs api; exit 1; }
 
           docker rm -f api

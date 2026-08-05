@@ -1020,6 +1020,22 @@ respeita a que já vier. Zero churn, contrato real.
 O custo é que nenhuma chamada da suíte chega sem chave, inclusive as que deveriam. Por isso
 existe um cliente **sem** o gancho, usado só pelo teste que verifica o 400.
 
+### Medido entre duas réplicas, e não só na suíte
+
+A suíte roda um processo. A garantia que importa é entre processos — é ela que o registro em
+memória não dá. Duas APIs no compose apontando para o mesmo Postgres, mesma chave:
+
+```
+réplica 1 (porta 8080)  → HTTP 201
+réplica 2 (porta 8081)  → HTTP 200      ← mesma chave, outro processo
+análises criadas: 1
+```
+
+O smoke test do CI também virou verificação: **ele pegou a mudança de contrato**. Postava sem a
+chave e passou a receber 400, com a mensagem certa. Em vez de só corrigir, ficaram três
+asserções ali — 400 sem chave, 201 com, 200 na repetição —, porque é o único ponto que exercita
+a exigência contra a imagem real.
+
 ## Segredos
 
 Nenhuma chave é necessária para rodar o projeto — veja a tabela de degradação
