@@ -23,68 +23,96 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-# Fontes TrueType, procuradas em varios sistemas.
+# Fontes TrueType **versionadas no repositorio**, e nao procuradas no sistema.
 #
-# A primeira versao disto olhava apenas `C:/Windows/Fonts`, e a suite passava na
-# maquina de desenvolvimento e falhava no CI em Linux — "funciona na minha
-# maquina" na forma mais literal. O CI foi o que expos: quatro testes de OCR
-# morreram com `Nenhuma fonte encontrada`.
+# ## As duas versoes anteriores, e o que cada uma custou
 #
-# A monoespacada e usada nas colunas numericas: digito de largura fixa reduz erro
-# de segmentacao do Tesseract em tabela. Por isso as listas sao separadas em vez
-# de uma fonte unica para tudo.
-_DIRS_FONTES = (
-    Path("C:/Windows/Fonts"),  # Windows
-    Path("/usr/share/fonts/truetype/dejavu"),  # Debian, Ubuntu
-    Path("/usr/share/fonts/dejavu"),  # Fedora, Arch
-    Path("/usr/share/fonts/truetype/liberation"),  # alternativa comum
-    Path("/Library/Fonts"),  # macOS
-    Path("/System/Library/Fonts/Supplemental"),  # macOS
-)
-_FONTES_TEXTO = (
-    "arial.ttf",
-    "calibri.ttf",
-    "tahoma.ttf",
-    "DejaVuSans.ttf",
-    "LiberationSans-Regular.ttf",
-    "Arial.ttf",
-)
-_FONTES_TITULO = (
-    "arialbd.ttf",
-    "consolab.ttf",
-    "DejaVuSans-Bold.ttf",
-    "LiberationSans-Bold.ttf",
-    "Arial Bold.ttf",
-)
-_FONTES_MONO = (
-    "consola.ttf",
-    "cour.ttf",
-    "DejaVuSansMono.ttf",
-    "LiberationMono-Regular.ttf",
-    "Courier New.ttf",
-)
+# A primeira olhava apenas `C:/Windows/Fonts`: a suite passava na maquina de desenvolvimento e
+# falhava no CI com `Nenhuma fonte encontrada`. "Funciona na minha maquina" na forma mais literal.
+#
+# A segunda procurava em varios diretorios, com uma lista de candidatas por sistema — e o defeito
+# ficou mais sutil, porque nada falhava: no Windows resolvia `arial.ttf`, no Linux `DejaVuSans.ttf`,
+# **e a imagem medida deixou de ser a mesma nos dois lugares**. As metricas das duas fontes diferem,
+# as colunas ficam mais proximas com DejaVu, e o Tesseract passou a nao emitir o espaco entre a data
+# e a descricao.
+#
+# O custo disso foi medido, e nao e teorico: o mesmo extrato rendeu 188 palavras no Windows e 166 no
+# Linux, e a avaliacao de OCR — cujo piso foi calibrado com Arial — falhou no CI lendo **0 de 24
+# lancamentos**. O parser tinha um defeito real (exigia espaco depois da data) e a avaliacao nao
+# conseguia pega-lo, porque cada ambiente media um documento diferente.
+#
+# ## Por que versionar resolve, e o que ele custa
+#
+# Avaliacao de acuracia com um piso numerico exige **input identico**. Com a fonte no repositorio, o
+# `>= 20 lancamentos` significa a mesma coisa no Windows, no Linux, no container e no runner; a
+# variacao que sobra e so a versao do Tesseract, que e o que o piso foi feito para tolerar.
+#
+# **A fonte sozinha nao bastou**, e isso foi medido: com estes mesmos arquivos os renders ainda
+# diferiam (sha256 `d5492613...` no Windows contra `5ad22f5a...` no Linux), porque o Pillow usa Raqm
+# para layout quando ele existe — e ele existe no wheel de Linux e nao no de Windows. Ver
+# `_carregar_fonte`, que fixa o `layout_engine`. Com as duas coisas juntas o render e identico:
+# `5f13e9cb...` nos dois.
+#
+# O preco sao 1,8MB de binario no repositorio (759KB + 709KB + 343KB). Os arquivos sao os que o
+# Debian entrega no pacote `fonts-dejavu-core`, copiados sem modificacao — provenencia verificavel
+# em vez de "geradas por um script". A licenca Bitstream Vera permite redistribuicao e exige que o
+# aviso acompanhe as copias; ele esta em `fontes/LICENCA-DejaVu.txt`.
+#
+# ## Sem fallback para o sistema, de proposito
+#
+# Ter fallback traria de volta exatamente o defeito de cima: numa maquina sem estes arquivos a
+# medicao mudaria em silencio. Faltando arquivo, o carregador **falha** dizendo qual — e checkout
+# incompleto se resolve, diferente de um numero que quer dizer coisas diferentes em cada maquina.
+#
+# A monoespacada e usada nas colunas numericas: digito de largura fixa reduz erro de segmentacao do
+# Tesseract em tabela. Por isso sao tres arquivos e nao um.
+_DIR_FONTES = Path(__file__).resolve().parent / "fontes"
+
+_FONTE_TEXTO = "DejaVuSans.ttf"
+_FONTE_TITULO = "DejaVuSans-Bold.ttf"
+_FONTE_MONO = "DejaVuSansMono.ttf"
 
 LARGURA_A4_200DPI = 1654  # 8.27in * 200
 ALTURA_A4_200DPI = 2339
 
 
-def _carregar_fonte(candidatas: tuple[str, ...], tamanho: int) -> ImageFont.FreeTypeFont:
-    """Primeira fonte disponivel, ou falha explicita.
+def _carregar_fonte(nome: str, tamanho: int) -> ImageFont.FreeTypeFont:
+    """A fonte versionada, ou falha explicita.
 
-    Cair no `ImageFont.load_default()` produziria bitmap minusculo e o OCR
-    erraria por motivo de renderizacao, nao por degradacao — mediria a coisa
-    errada. Melhor falhar dizendo o que falta.
+    Duas coisas que este erro precisa evitar, e as duas ja aconteceram neste projeto:
+
+    - `ImageFont.load_default()` produziria bitmap minusculo, e o OCR erraria por motivo de
+      renderizacao em vez de degradacao — mediria a coisa errada e passaria;
+    - cair para uma fonte do sistema faria a medicao mudar em silencio, que e o defeito que motivou
+      versionar estes arquivos. Ver o comentario em `_DIR_FONTES`.
     """
-    for diretorio in _DIRS_FONTES:
-        for nome in candidatas:
-            caminho = diretorio / nome
-            if caminho.exists():
-                return ImageFont.truetype(str(caminho), tamanho)
-
-    raise RuntimeError(
-        f"Nenhuma fonte encontrada entre {candidatas} em {[str(d) for d in _DIRS_FONTES]}. "
-        "O gerador de documentos sinteticos precisa de uma fonte TrueType."
-    )
+    caminho = _DIR_FONTES / nome
+    if not caminho.is_file():
+        raise RuntimeError(
+            f"Fonte versionada ausente: {caminho}.\n"
+            "Ela vem no repositorio (tests/apoio/fontes/) e o gerador nao usa fonte do sistema — "
+            "a avaliacao de OCR compara contra um piso numerico, e isso exige que a imagem medida "
+            "seja identica em toda maquina.\n"
+            "Provavel checkout incompleto (LFS, sparse checkout, ou export sem binarios)."
+        )
+    # `layout_engine` explicito, e este argumento e metade da determinismo — a fonte versionada e a
+    # outra metade.
+    #
+    # O default do Pillow e pedir Raqm e cair para o layout basico quando ele nao existe. E ele
+    # **nao existe no wheel de Windows**: medido, `PIL.features.check("raqm")` da False no Windows e
+    # True (0.10.5) no container Linux, com o mesmo Pillow 12.3.0 e o mesmo FreeType 2.14.3.
+    #
+    # O efeito e o defeito que a fonte versionada sozinha nao resolveu: a mesma chamada de `text()`
+    # com o mesmo arquivo de fonte produzia imagens diferentes nos dois sistemas — sha256
+    # `d5492613...` contra `5ad22f5a...`. Raqm faz shaping e kerning; o layout basico so soma os
+    # avancos. Duas renderizacoes, dois documentos, e um piso numerico que nao pode significar a
+    # mesma coisa nos dois.
+    #
+    # `BASIC` e nao `RAQM` porque e o unico dos dois disponivel em todo lugar: pedir Raqm faria o
+    # Windows cair para basico com um `UserWarning`, e o resultado seria justamente a divergencia.
+    # Este documento e texto latino em colunas — nao ha ligadura nem script complexo para o shaping
+    # melhorar.
+    return ImageFont.truetype(str(caminho), tamanho, layout_engine=ImageFont.Layout.BASIC)
 
 
 def _recortar(img: Image.Image, margem: int = 40) -> Image.Image:
@@ -157,10 +185,10 @@ class Holerite:
         img = Image.new("L", (LARGURA_A4_200DPI, 1100), color=255)
         d = ImageDraw.Draw(img)
 
-        titulo = _carregar_fonte(_FONTES_TITULO, 34)
-        rotulo = _carregar_fonte(_FONTES_TEXTO, 26)
-        corpo = _carregar_fonte(_FONTES_TEXTO, 28)
-        mono = _carregar_fonte(_FONTES_MONO, 28)
+        titulo = _carregar_fonte(_FONTE_TITULO, 34)
+        rotulo = _carregar_fonte(_FONTE_TEXTO, 26)
+        corpo = _carregar_fonte(_FONTE_TEXTO, 28)
+        mono = _carregar_fonte(_FONTE_MONO, 28)
 
         m = 70  # margem
         y = 50
@@ -224,7 +252,7 @@ class Holerite:
         d.text(
             (col_valor, y + 12),
             f"R$ {_brl(self.salario_liquido)}",
-            font=_carregar_fonte(_FONTES_MONO, 32),
+            font=_carregar_fonte(_FONTE_MONO, 32),
             fill=0,
         )
 
@@ -232,7 +260,7 @@ class Holerite:
             y += 90
             # Fonte pequena, como o texto de rodape que ninguem le — que e
             # exatamente onde uma injecao se esconderia num documento real.
-            pequena = _carregar_fonte(_FONTES_TEXTO, 20)
+            pequena = _carregar_fonte(_FONTE_TEXTO, 20)
             for linha in self.rodape_adicional.splitlines():
                 d.text((m, y), linha, font=pequena, fill=0)
                 y += 26
@@ -330,10 +358,10 @@ class ExtratoBancario:
         img = Image.new("L", (LARGURA_A4_200DPI, altura), color=255)
         d = ImageDraw.Draw(img)
 
-        titulo = _carregar_fonte(_FONTES_TITULO, 34)
-        rotulo = _carregar_fonte(_FONTES_TEXTO, 24)
-        corpo = _carregar_fonte(_FONTES_TEXTO, 26)
-        mono = _carregar_fonte(_FONTES_MONO, 26)
+        titulo = _carregar_fonte(_FONTE_TITULO, 34)
+        rotulo = _carregar_fonte(_FONTE_TEXTO, 24)
+        corpo = _carregar_fonte(_FONTE_TEXTO, 26)
+        mono = _carregar_fonte(_FONTE_MONO, 26)
 
         m = 70
         y = 50
@@ -362,10 +390,23 @@ class ExtratoBancario:
         d.line([(m, y), (LARGURA_A4_200DPI - m, y)], fill=0, width=2)
         y += 22
 
+        # A coluna de historico comeca depois da **largura medida** da data, e nao a 150px fixos.
+        #
+        # Os 150px eram um defeito de layout com sintoma tardio: `05/01/2025` em DejaVu Sans Mono
+        # 28px mede ~169px, entao a data invadia a coluna seguinte e o Tesseract nao tinha espaco em
+        # branco onde emitir a separacao. Saia `05/01/2025CREDITO SALARIO...`, e o parser descartava
+        # a linha inteira — 0 lancamentos de 24 no CI.
+        #
+        # Com a fonte anterior (`consola.ttf` no Windows, mais estreita) os 169px eram ~140px e
+        # cabiam. Ou seja: o documento sintetico estava malformado desde sempre, e a unica coisa que
+        # o escondia era a metrica de uma fonte que nem todo sistema tem.
+        #
+        # Extrato de banco de verdade nao tem coluna sobreposta. Medir garante que este tambem nao.
+        col_historico = m + int(mono.getlength("00/00/0000")) + 28
         col_valor = LARGURA_A4_200DPI - m - 420
         col_saldo = LARGURA_A4_200DPI - m - 200
         d.text((m, y), "DATA", font=rotulo, fill=0)
-        d.text((m + 150, y), "HISTORICO", font=rotulo, fill=0)
+        d.text((col_historico, y), "HISTORICO", font=rotulo, fill=0)
         d.text((col_valor, y), "VALOR", font=rotulo, fill=0)
         d.text((col_saldo, y), "SALDO", font=rotulo, fill=0)
         y += 36
@@ -378,7 +419,7 @@ class ExtratoBancario:
             sinal = "C" if lancamento.valor > 0 else "D"
 
             d.text((m, y), lancamento.data.strftime("%d/%m/%Y"), font=mono, fill=0)
-            d.text((m + 150, y), lancamento.descricao, font=corpo, fill=0)
+            d.text((col_historico, y), lancamento.descricao, font=corpo, fill=0)
             d.text((col_valor, y), f"{_brl(abs(lancamento.valor))} {sinal}", font=mono, fill=0)
             d.text((col_saldo, y), _brl(saldo), font=mono, fill=0)
             y += 36
@@ -386,9 +427,7 @@ class ExtratoBancario:
         y += 10
         d.line([(m, y), (LARGURA_A4_200DPI - m, y)], fill=0, width=2)
         y += 22
-        d.text(
-            (m, y), f"SALDO FINAL: {_brl(saldo)}", font=_carregar_fonte(_FONTES_MONO, 28), fill=0
-        )
+        d.text((m, y), f"SALDO FINAL: {_brl(saldo)}", font=_carregar_fonte(_FONTE_MONO, 28), fill=0)
 
         return _recortar(img)
 
