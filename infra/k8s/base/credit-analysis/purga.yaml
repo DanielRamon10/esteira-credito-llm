@@ -1,0 +1,146 @@
+# CronJob de purga por prazo de retencao (Camada 10).
+#
+# Aplica os prazos de `domain/retencao.py`: hoje, o texto de OCR passados 90 dias. O prazo e regra
+# de negocio com base legal (LGPD art. 15) e mora no dominio; este objeto so decide **quando**
+# perguntar se algo venceu.
+#
+# ## Estado honesto
+#
+# Passa em `kustomize build` e em `kubectl apply --dry-run`. O que roda de verdade e o mesmo comando
+# contra o Postgres do compose, e ele foi medido: com quatro documentos envelhecidos para 200 dias,
+# a execucao removeu os quatro textos e deixou intactas as quatro confiancas de OCR — o que sustenta
+# o parecer sobrevive a purga. Segunda execucao: zero linhas.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: credit-analysis-purga
+  labels:
+    app.kubernetes.io/name: credit-analysis-purga
+    app.kubernetes.io/component: job
+    app.kubernetes.io/part-of: credit-analysis
+spec:
+  # 03:17 UTC, diario.
+  #
+  # **Nao e `0 3 * * *`**, e o minuto quebrado e deliberado: horario redondo e onde todo mundo
+  # agenda, e a soma de backups, relatorios e purgas na mesma marca produz um pico de I/O que nao
+  # tem relacao com carga real. Um minuto arbitrario custa nada e sai da fila.
+  #
+  # Diario e nao horario: o prazo e de 90 dias, entao rodar de hora em hora processaria 24 vezes o
+  # mesmo dia de vencimento para encontrar o que um unico dia acumula.
+  schedule: "17 3 * * *"
+  timeZone: "Etc/UTC"
+
+  # `Forbid`: se uma execucao passar de 24h, a proxima **nao** comeca.
+  #
+  # Duas purgas simultaneas fariam `UPDATE` nas mesmas linhas e uma esperaria o lock da outra,
+  # dobrando o tempo sem dobrar o trabalho. E uma execucao que passa de 24h e sinal de problema, nao
+  # motivo para paralelizar.
+  concurrencyPolicy: Forbid
+
+  # Historico curto dos dois lados, e os dois numeros tem motivo.
+  #
+  # 3 sucessos: o suficiente para ver "rodou ontem e anteontem" sem acumular pods terminados.
+  # 1 falha: uma falha basta para investigar, e falhas repetidas seriam o mesmo erro tres vezes.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+  # Se o controlador perder a janela por mais de 1h, desiste em vez de disparar tarde.
+  #
+  # Sem isto, um cluster que ficou fora do ar por seis horas dispararia a purga assim que voltar —
+  # junto com todo o resto que estava atrasado. A purga pode esperar o proximo dia: o dado vencido
+  # ontem continua vencido amanha.
+  startingDeadlineSeconds: 3600
+
+  jobTemplate:
+    spec:
+      # Duas tentativas alem da primeira. Falha de purga costuma ser conexao, que retentar resolve;
+      # falha de logica nao melhora na quarta tentativa.
+      backoffLimit: 2
+      # Teto de 30 minutos. Sem ele, um job travado num lock ficaria ate alguem notar — e
+      # `concurrencyPolicy: Forbid` faria as execucoes seguintes serem puladas em silencio.
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: credit-analysis-purga
+            app.kubernetes.io/component: job
+            app.kubernetes.io/part-of: credit-analysis
+        spec:
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: purga
+              image: credit-analysis:dev
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "credit_analysis.purga_main"]
+              # Sem `ports`: nao ha o que servir. E sem sonda, pelo mesmo motivo — um job que
+              # executa e sai nao tem estado de prontidao.
+              envFrom:
+                - configMapRef:
+                    name: credit-analysis-config
+                - secretRef:
+                    name: credit-analysis-secrets
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              resources:
+                requests:
+                  # Bem menor que API e trabalhador: este processo abre um pool de duas conexoes,
+                  # roda um `UPDATE` e sai. Nao carrega modelo, nao rasteriza imagem.
+                  memory: 128Mi
+                  cpu: 100m
+                limits:
+                  memory: 512Mi
+                  # Sem limite de CPU, como nos demais — aqui o efeito e menor, mas manter a regra
+                  # uniforme evita que alguem conclua que a ausencia nos outros foi descuido.
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi
+---
+# NetworkPolicy do job: nenhum ingress, egress so para o banco.
+#
+# Superficie menor que a do trabalhador, porque a necessidade e menor: a purga nao le objeto, nao
+# consome fila e nao chama LLM. Ela conversa com uma coisa so.
+#
+# **Sem egress 443**, e a ausencia e a parte interessante: quando o objeto no armazenamento entrar no
+# escopo da purga (ver `RETENCAO_OBJETO` em `domain/retencao.py`), esta regra precisa mudar junto com
+# a role que ganhar `DeleteObject`. Uma coisa nao funciona sem a outra, e e bom que falhe visivel.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: credit-analysis-purga
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: credit-analysis-purga
+  policyTypes: ["Ingress", "Egress"]
+  # Sem `ingress:` — nega tudo que entra. Ninguem fala com um job.
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dados
+      ports:
+        - port: 5432

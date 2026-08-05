@@ -13,6 +13,7 @@ aplicacao, o que seria a propria dependencia que estamos tentando inverter.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 from typing import IO, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from credit_analysis.domain.entities import AnaliseCredito
 from credit_analysis.domain.extracao_assincrona import Entrega, PedidoDeExtracao
 from credit_analysis.domain.kyc import ResultadoKYC
 from credit_analysis.domain.politica import TrechoPolitica, TrechoRecuperado
+from credit_analysis.domain.value_objects import CPF
 
 
 @runtime_checkable
@@ -74,6 +76,64 @@ class BuscaPorDocumento(Protocol):
 
     async def buscar_por_documento(self, documento_id: UUID) -> AnaliseCredito | None:
         """Devolve a analise que contem o documento, ou None."""
+        ...
+
+
+@runtime_checkable
+class CicloDeVidaDoDado(Protocol):
+    """Operacoes de retencao e apagamento. Capacidade **opcional**, como `BuscaPorDocumento`.
+
+    ## Por que opcional
+
+    Purga e apagamento sao operacoes de armazenamento duravel. O adapter em memoria nao tem prazo de
+    retencao — o processo morre e o dado vai com ele —, e obriga-lo a implementar isto produziria
+    codigo que existe apenas para satisfazer um Protocol.
+
+    A rota de apagamento confere a capacidade e responde 501 quando o repositorio nao a oferece. E
+    mais honesto que uma implementacao em memoria que "apaga" um dicionario e devolve 200: o cliente
+    receberia confirmacao de exclusao de um sistema que nao conserva nada.
+
+    ## Por que nao esta em `RepositorioAnalises`
+
+    O port do agregado responde "como leio e gravo uma analise". Estas operacoes atravessam
+    agregados: `apagar_identificacao` remove uma analise **e** insere um registro noutra tabela, e
+    `purgar_texto_de_ocr` mexe em muitas linhas de uma vez sem carregar nenhum agregado.
+
+    Poe-las no port do agregado misturaria as duas responsabilidades, e obrigaria todo fake de
+    teste a conhecer a tabela de retencao.
+    """
+
+    async def buscar_por_cpf(self, cpf: CPF) -> list[AnaliseCredito]:
+        """Analises de um titular, para atender pedido de exclusao (LGPD art. 18).
+
+        ## Isto faz varredura, e e deliberado
+
+        Nao ha indice em `solicitante_cpf`, e `test_cpf_nao_tem_indice` existe para que ele nao seja
+        criado: busca barata por CPF e o caminho por onde um vazamento deixa de ser um registro e
+        vira uma lista.
+
+        O art. 18 exige encontrar os dados de uma pessoa, o que parece pedir o indice — e nao pede.
+        Pedido de exclusao e raro e assincrono; pagar uma varredura nele e aceitavel. Criar o indice
+        compraria uma capacidade **permanente** de enumerar por pessoa para servir uma operacao
+        ocasional, e essa troca e ruim.
+        """
+        ...
+
+    async def apagar_identificacao(self, analise_id: UUID, motivo: str, agora: datetime) -> bool:
+        """Remove a analise e conserva o registro da decisao. Devolve se havia o que apagar.
+
+        As duas metades sao uma transacao so: uma analise apagada sem o registro conservado
+        perderia a trilha que a obrigacao legal exige, e um registro inserido sem a analise apagada
+        duplicaria o dado em vez de reduzi-lo.
+        """
+        ...
+
+    async def purgar_texto_de_ocr(self, limite: datetime) -> int:
+        """Zera `texto_extraido` de analises paradas antes do limite. Devolve quantas linhas.
+
+        Devolve a contagem e nao None porque o job precisa dizer o que fez: "purga concluida" sem
+        numero nao distingue trabalho de configuracao errada apontando para banco vazio.
+        """
         ...
 
 

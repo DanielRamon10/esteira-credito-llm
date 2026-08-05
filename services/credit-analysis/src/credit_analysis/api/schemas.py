@@ -17,6 +17,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from credit_analysis.application.use_cases.ciclo_de_vida import ReciboDeApagamento
 from credit_analysis.application.use_cases.processar_documento import ResultadoProcessamento
 from credit_analysis.domain.agente import PassoAgente, TrilhaAgente
 from credit_analysis.domain.armazenamento import EstadoDocumento
@@ -665,4 +666,74 @@ class DocumentoEstadoResponse(BaseModel):
                 if d.documento_id == documento.id
             ],
             erro=documento.erro,
+        )
+
+
+# --- Privacidade (Camada 10) -------------------------------------------------
+
+
+class PedidoDeApagamento(BaseModel):
+    """Pedido de exclusao do titular (LGPD art. 18 secao VI).
+
+    ## Por que o CPF e um campo de corpo, e nao de caminho
+
+    Ver o cabecalho de `api/routers/privacidade.py`: CPF em URL vaza para log de ingress, historico,
+    `Referer` e span de trace. O corpo de um POST nao aparece em nenhum desses.
+    """
+
+    cpf: str = Field(
+        min_length=11,
+        max_length=14,
+        description="CPF do titular, com ou sem pontuacao.",
+        # **Sem `examples`**, e a omissao e proposital: o schema do OpenAPI vira pagina publica, e
+        # um CPF de exemplo ali e um CPF valido num documento indexavel. O `min_length` ja comunica
+        # o formato.
+    )
+
+    @property
+    def cpf_valido(self) -> CPF:
+        """Converte para o value object, que confere os digitos verificadores.
+
+        A validacao acontece **aqui** e nao num `field_validator` para o erro sair como 422 do
+        dominio com a mensagem do `CPF`, e nao como um `ValueError` generico do Pydantic. Ver
+        `api/errors.py`.
+        """
+        return CPF(self.cpf)
+
+
+class ReciboResponse(BaseModel):
+    """Comprovante do atendimento, que o art. 19 obriga o controlador a fornecer.
+
+    Nao inclui o CPF de volta. Devolve-lo seria conveniente para conferencia e poria o dado no corpo
+    de uma resposta que pode ser registrada por proxy, cache ou cliente — no atendimento de um
+    pedido para remover exatamente aquele dado.
+    """
+
+    analises_afetadas: list[UUID] = Field(
+        description=(
+            "Identificadores das analises cuja identificacao foi removida. Vazio quando nao havia "
+            "nenhuma, o que nao e erro."
+        )
+    )
+    decisoes_conservadas: int = Field(
+        description=(
+            "Quantos registros de decisao permanecem, sem identificacao, sob a LGPD art. 16 "
+            "secao I: um parecer de credito e registro que a regulacao bancaria exige conservar."
+        )
+    )
+    executado_em: datetime
+    base_legal: str = Field(
+        description="A base que sustenta o que foi feito e o que foi conservado."
+    )
+
+    @classmethod
+    def de_dominio(cls, recibo: ReciboDeApagamento) -> ReciboResponse:
+        return cls(
+            analises_afetadas=list(recibo.analises_afetadas),
+            decisoes_conservadas=recibo.decisoes_conservadas,
+            executado_em=recibo.executado_em,
+            base_legal=(
+                "Exclusao sob LGPD art. 18 secao VI. Registro da decisao conservado sem "
+                "identificacao sob art. 16 secao I (obrigacao legal) e POL-006 secao 5."
+            ),
         )

@@ -35,7 +35,11 @@ from uuid import uuid4
 import pytest
 from psycopg_pool import AsyncConnectionPool
 
-from credit_analysis.application.ports import BuscaPorDocumento, RepositorioAnalises
+from credit_analysis.application.ports import (
+    BuscaPorDocumento,
+    CicloDeVidaDoDado,
+    RepositorioAnalises,
+)
 from credit_analysis.config import get_settings
 from credit_analysis.domain.armazenamento import EstadoDocumento, Referencia
 from credit_analysis.domain.documento import OrigemDaRenda
@@ -628,6 +632,246 @@ class TestOrigemDaRenda:
                     "UPDATE documento SET renda_origem = %s WHERE id = %s",
                     ("bruto", analise.documentos[0].id),
                 )
+
+
+class TestApagamentoDeIdentificacao:
+    """LGPD art. 18 contra POL-006 secao 5, a tensao central da Camada 10.
+
+    Apagar tudo atende o titular e destroi a trilha que a obrigacao legal exige. Conservar tudo
+    protege a trilha e ignora o direito. Estes testes medem a saida escolhida: identificacao sai,
+    registro da decisao fica.
+    """
+
+    async def test_identificacao_sai_e_decisao_fica(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        analise = fazer_analise(com_documento=True)
+        await repositorio.salvar(analise)
+        agora = datetime(2026, 8, 4, tzinfo=UTC)
+
+        apagou = await repositorio.apagar_identificacao(analise.id, "pedido_do_titular", agora)
+
+        assert apagou
+        assert await repositorio.buscar_por_id(analise.id) is None
+
+        async with pool.connection() as conexao:
+            cursor = await conexao.execute(
+                """
+                SELECT decisao, score, justificativas, faixa_valor, prazo_meses, motivo
+                FROM decisao_retida WHERE analise_id = %s
+                """,
+                (analise.id,),
+            )
+            linha = await cursor.fetchone()
+
+        assert linha is not None
+        assert linha[0] == Decisao.APROVADO.value
+        assert linha[1] == 712
+        # A fundamentacao sobrevive: e o que responde ao titular sob o art. 20.
+        assert "renda comprovada acima do minimo" in linha[2]
+        # 45.000 cai na faixa 10k-50k. O valor exato **nao** e conservado.
+        assert linha[3] == "10k_50k"
+        assert linha[4] == 36
+        assert linha[5] == "pedido_do_titular"
+
+    async def test_nada_identificavel_sobra_na_tabela_conservada(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """A assercao que da sentido a tabela, e ela precisa ser sobre o **schema**.
+
+        Conferir que uma linha especifica nao tem CPF passaria com uma coluna `cpf` vazia por acaso.
+        O que importa e a tabela nao **ter onde** guardar identificador: se alguem acrescentar uma
+        coluna `solicitante_cpf` amanha, este teste falha antes de a primeira linha ser gravada.
+        """
+        analise = fazer_analise(com_documento=True)
+        await repositorio.salvar(analise)
+        await repositorio.apagar_identificacao(
+            analise.id, "prazo_vencido", datetime(2026, 8, 4, tzinfo=UTC)
+        )
+
+        async with pool.connection() as conexao:
+            cursor = await conexao.execute(
+                """
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'decisao_retida'
+                """
+            )
+            colunas = {linha[0] for linha in await cursor.fetchall()}
+
+        proibidas = {
+            "solicitante_cpf",
+            "solicitante_nome",
+            "solicitante_nascimento",
+            "renda_declarada",
+            "texto_extraido",
+            "conteudo_hash",
+            "proposta_valor",
+        }
+        vazadas = colunas & proibidas
+        assert not vazadas, f"coluna identificavel em decisao_retida: {vazadas}"
+
+    async def test_analise_sem_parecer_nao_deixa_registro(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Caso nunca decidido nao tem decisao a conservar.
+
+        Inserir uma linha com score zero criaria registro de uma decisao que nao houve — pior que
+        nao ter registro, porque um relatorio de politica contaria como negativa uma analise que
+        ninguem avaliou.
+        """
+        analise = fazer_analise(com_parecer=False)
+        await repositorio.salvar(analise)
+
+        apagou = await repositorio.apagar_identificacao(
+            analise.id, "pedido_do_titular", datetime(2026, 8, 4, tzinfo=UTC)
+        )
+
+        assert apagou
+        async with pool.connection() as conexao:
+            cursor = await conexao.execute(
+                "SELECT count(*) FROM decisao_retida WHERE analise_id = %s", (analise.id,)
+            )
+            linha = await cursor.fetchone()
+        assert linha is not None and linha[0] == 0
+
+    async def test_apagar_o_que_nao_existe_devolve_falso(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Distingue "apaguei" de "nao havia", e a rota precisa disso para responder 404.
+
+        Devolver True para id inexistente faria o cliente receber confirmacao de exclusao de algo
+        que nunca existiu — num pedido de titular, uma resposta falsa sobre dado pessoal.
+        """
+        assert not await repositorio.apagar_identificacao(
+            uuid4(), "pedido_do_titular", datetime(2026, 8, 4, tzinfo=UTC)
+        )
+
+    async def test_apagamento_e_idempotente(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Pedido reenviado nao duplica registro nem estoura.
+
+        `ON CONFLICT DO NOTHING` na chave primaria cobre o caso, e ele importa: pedido de titular
+        chega por canal humano, e ser reenviado e normal.
+        """
+        analise = fazer_analise(com_documento=True)
+        await repositorio.salvar(analise)
+        agora = datetime(2026, 8, 4, tzinfo=UTC)
+
+        assert await repositorio.apagar_identificacao(analise.id, "pedido_do_titular", agora)
+        assert not await repositorio.apagar_identificacao(analise.id, "pedido_do_titular", agora)
+
+        async with pool.connection() as conexao:
+            cursor = await conexao.execute(
+                "SELECT count(*) FROM decisao_retida WHERE analise_id = %s", (analise.id,)
+            )
+            linha = await cursor.fetchone()
+        assert linha is not None and linha[0] == 1
+
+
+class TestPurgaDeTextoDeOCR:
+    async def test_purga_texto_de_analise_parada(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        analise = fazer_analise(com_documento=True)
+        documento = analise.documentos[0]
+        # Confianca, motor e renda entram juntos com o texto em `concluir_extracao`. O teste precisa
+        # deles preenchidos porque a assercao central e que a purga leva o texto **e deixa** tudo o
+        # que sustenta o parecer.
+        documento.texto_extraido = "HOLERITE\nCPF: 529.982.247-25\nLIQUIDO 7.262,14"
+        documento.confianca_ocr = Percentual.de("94.12")
+        documento.motor_ocr = "tesseract:por"
+        documento.renda_comprovada = Dinheiro.de("7262.14")
+        await repositorio.salvar(analise)
+
+        # A analise foi mexida por ultimo em abril; o limite da purga e maio.
+        async with pool.connection() as conexao:
+            await conexao.execute(
+                "UPDATE analise SET atualizada_em = %s WHERE id = %s",
+                (datetime(2026, 4, 1, tzinfo=UTC), analise.id),
+            )
+
+        purgadas = await repositorio.purgar_texto_de_ocr(datetime(2026, 5, 1, tzinfo=UTC))
+
+        assert purgadas == 1
+        lida = await repositorio.buscar_por_id(analise.id)
+        assert lida is not None
+        assert lida.documentos[0].texto_extraido is None
+        # O que sustenta o parecer sobrevive: sem isto a purga destruiria a auditoria.
+        assert lida.documentos[0].confianca_ocr == Percentual.de("94.12")
+        assert lida.documentos[0].motor_ocr == "tesseract:por"
+        assert lida.documentos[0].renda_comprovada == Dinheiro.de("7262.14")
+        assert lida.parecer is not None
+        assert lida.parecer.score == 712
+
+    async def test_nao_purga_analise_recente(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """O par negativo. Uma purga que leva tudo passaria no teste de cima.
+
+        `atualizada_em` fica em `now()` ao salvar, entao um limite no passado nao deve alcancar.
+        """
+        analise = fazer_analise(com_documento=True)
+        analise.documentos[0].texto_extraido = "HOLERITE ..."
+        await repositorio.salvar(analise)
+
+        purgadas = await repositorio.purgar_texto_de_ocr(datetime(2020, 1, 1, tzinfo=UTC))
+
+        assert purgadas == 0
+        lida = await repositorio.buscar_por_id(analise.id)
+        assert lida is not None
+        assert lida.documentos[0].texto_extraido is not None
+
+    async def test_purga_e_idempotente(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Rodar duas vezes nao conta a mesma linha duas vezes.
+
+        O `WHERE texto_extraido IS NOT NULL` e o que garante isso. Sem ele a metrica do job diria
+        que purgou milhares de linhas toda noite — numero que nao serviria para detectar nada.
+        """
+        analise = fazer_analise(com_documento=True)
+        analise.documentos[0].texto_extraido = "HOLERITE ..."
+        await repositorio.salvar(analise)
+        async with pool.connection() as conexao:
+            await conexao.execute(
+                "UPDATE analise SET atualizada_em = %s WHERE id = %s",
+                (datetime(2026, 4, 1, tzinfo=UTC), analise.id),
+            )
+
+        limite = datetime(2026, 5, 1, tzinfo=UTC)
+        assert await repositorio.purgar_texto_de_ocr(limite) == 1
+        assert await repositorio.purgar_texto_de_ocr(limite) == 0
+
+
+class TestBuscaPorCPF:
+    async def test_acha_todas_as_analises_do_titular(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Um pedido de exclusao precisa alcancar **todas**, e nao a mais recente."""
+        primeira = fazer_analise(com_documento=True)
+        segunda = fazer_analise()
+        await repositorio.salvar(primeira)
+        await repositorio.salvar(segunda)
+
+        de_outra_pessoa = fazer_analise()
+        de_outra_pessoa.solicitante.cpf = CPF("11144477735")
+        await repositorio.salvar(de_outra_pessoa)
+
+        achadas = await repositorio.buscar_por_cpf(CPF("52998224725"))
+
+        assert {a.id for a in achadas} == {primeira.id, segunda.id}
+
+    async def test_cpf_sem_analise_devolve_lista_vazia(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        assert await repositorio.buscar_por_cpf(CPF("11144477735")) == []
+
+    def test_satisfaz_o_port_em_tempo_de_execucao(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """Mesmo raciocinio do `BuscaPorDocumento`: o `isinstance` da rota precisa ser True."""
+        assert isinstance(repositorio, CicloDeVidaDoDado)
 
 
 class TestLGPD:

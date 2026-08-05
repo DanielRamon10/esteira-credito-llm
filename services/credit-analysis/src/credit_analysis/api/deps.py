@@ -18,6 +18,7 @@ from fastapi import Depends, Request
 from credit_analysis.application.ports import (
     AgenteCredito,
     ArmazenamentoDocumentos,
+    CicloDeVidaDoDado,
     ConsultaBureau,
     ConsultaKYC,
     FilaDeTrabalho,
@@ -190,7 +191,40 @@ def obter_caso_fundamentar(
 
 # Aliases para deixar as assinaturas das rotas curtas e legiveis.
 SettingsDep = Annotated[Settings, Depends(obter_settings)]
+
+
+def obter_ciclo_de_vida(request: Request) -> CicloDeVidaDoDado:
+    """Repositorio, quando ele sabe cuidar de retencao e apagamento.
+
+    ## 503 e nao 501, e a escolha e sobre taxonomia
+
+    `501 Not Implemented` seria tentador — o adapter em memoria nunca vai suportar isto. Mas o que
+    decide se a capacidade existe e **configuracao**: com `CREDIT_POSTGRES_DSN`, o repositorio
+    montado a oferece. Isso e a mesma classe do OCR ausente, que este projeto ja responde com 503 e
+    uma instrucao de como habilitar.
+
+    Inventar um codigo novo para uma distincao que nao se sustenta faria o cliente tratar dois casos
+    identicos de formas diferentes.
+
+    ## Por que a checagem e por capacidade e nao por configuracao
+
+    Conferir `settings.usar_pgvector` diria qual repositorio **deveria** estar montado. O
+    `isinstance` diz qual esta. A diferenca aparece em teste, onde o repositorio e injetado e a
+    configuracao nao descreve o que roda — e um 503 mentiroso ali levaria meia hora para ser
+    entendido.
+    """
+    repositorio = obter_repositorio(request)
+    if not isinstance(repositorio, CicloDeVidaDoDado):
+        raise RecursoIndisponivel(
+            "Este ambiente nao conserva dado de forma duravel, portanto nao ha o que apagar a "
+            "pedido: o repositorio em memoria perde tudo no restart. Configure "
+            "CREDIT_POSTGRES_DSN para habilitar o atendimento de pedidos do titular."
+        )
+    return repositorio
+
+
 RepositorioDep = Annotated[RepositorioAnalises, Depends(obter_repositorio)]
+CicloDeVidaDep = Annotated[CicloDeVidaDoDado, Depends(obter_ciclo_de_vida)]
 RetrieverDep = Annotated[RetrieverHibrido, Depends(obter_retriever)]
 FundamentarDep = Annotated[FundamentarParecer, Depends(obter_caso_fundamentar)]
 MotorOCRDep = Annotated[MotorOCR, Depends(obter_motor_ocr)]

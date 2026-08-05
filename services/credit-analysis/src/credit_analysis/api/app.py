@@ -32,7 +32,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from credit_analysis.api.errors import registrar_handlers
 from credit_analysis.api.routers import agente as rota_agente
-from credit_analysis.api.routers import analises, documentos, health, politicas
+from credit_analysis.api.routers import analises, documentos, health, politicas, privacidade
 from credit_analysis.api.routers import metricas as rota_metricas
 from credit_analysis.api.seguranca import montar_chaveiro
 from credit_analysis.application.ports import (
@@ -279,6 +279,9 @@ def criar_app(
     # Router separado: a consulta vive em `/documentos/{id}`, fora do prefixo `/analises`.
     app.include_router(documentos.consulta, prefix=settings.prefixo_api)
     app.include_router(rota_agente.router, prefix=settings.prefixo_api)
+    # Direitos do titular (Camada 10). Sob o prefixo versionado como as demais: a resposta e um
+    # recibo com contrato, e contrato de recibo muda como qualquer outro.
+    app.include_router(privacidade.router, prefix=settings.prefixo_api)
 
     # Depois dos routers: o instrumentador percorre as rotas registradas para
     # nomear os spans com o template, e nao com o caminho cru.

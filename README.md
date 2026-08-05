@@ -836,6 +836,111 @@ um teste de rota passaria com a otimização morta. Ele conta chamadas —
 rápido desativado, `runtime_checkable` removido do Protocol, e limite da varredura divergente
 do teto do aviso.
 
+## Ciclo de vida do dado pessoal
+
+Esta camada nasceu de uma medição, e ela foi curta: o README dizia que o bucket expira o
+documento em **365 dias (LGPD art. 15)**, que a aplicação não tem `s3:DeleteObject` e que
+"quem expira é a regra de ciclo de vida, auditável". Tudo verdade — e o **texto** daquele
+documento, com nome, empregador, CPF e salário, estava no Postgres sem prazo nenhum. O
+controle era derrotado por uma cópia que ele não cobria.
+
+### A tensão que define o desenho
+
+Duas obrigações em direções opostas, e as duas são lei:
+
+- **art. 18 §VI** dá ao titular o direito de exclusão;
+- **art. 16 §I** permite — e a regulação bancária exige — conservar o necessário para cumprir
+  obrigação legal. Um parecer de crédito é registro de decisão: apagar score e justificativa
+  deixaria o banco sem como responder a um questionamento do próprio titular (art. 20) ou do
+  regulador.
+
+Atender só a primeira destrói a trilha; atender só a segunda ignora o direito. A saída é
+separar **identificação** de **decisão**: uma tabela `decisao_retida` guarda score, decisão,
+justificativas, faixa de valor e prazo — e não tem coluna onde caiba um identificador. O teste
+que sustenta isso afirma sobre o `information_schema`, não sobre uma linha: se alguém
+acrescentar `solicitante_cpf` amanhã, ele falha antes de a primeira linha existir.
+
+### A palavra que o projeto não usa
+
+Seria cômodo chamar isso de anonimização — dado anonimizado sai do escopo da LGPD (art. 12), o
+que é conveniente demais para aceitar sem conferir. Não é, por duas razões:
+
+1. **hash de CPF não anonimiza.** O espaço é 10¹¹, e o dígito verificador reduz para ~10⁹
+   válidos: uma GPU percorre isso em segundos. Pseudônimo derivado de identificador com domínio
+   pequeno é reversível por construção;
+2. o `analise_id` permanece, porque a trilha precisa dele. Quem tiver um mapeamento antigo
+   re-identifica.
+
+O que existe é **retenção sob base legal com identificadores removidos**, e isso continua sendo
+dado pessoal sob a LGPD. Chamar de anonimização seria uma alegação que o desenho não sustenta.
+
+### Prazos por classe, e não um número
+
+| Classe | Prazo | Base |
+|---|---|---|
+| Texto de OCR | 90 dias | art. 15 §I — é cópia de trabalho, não registro |
+| Identificação | 5 anos | POL-006 §5 / CMN 4.658 |
+| Objeto no S3 | 365 dias | regra de ciclo de vida do bucket, fora da aplicação |
+
+O texto sai muito antes porque **não é** o que sustenta o parecer: justificativas, políticas
+aplicadas, dados extraídos campo a campo, renda comprovada com origem e a referência versionada
+do objeto sobrevivem à purga. Medido contra Postgres real: quatro documentos envelhecidos para
+200 dias, quatro textos removidos, **quatro confianças de OCR intactas**. Segunda execução: zero
+linhas.
+
+### Duas decisões de rota que valem mais que a rota
+
+**O CPF vai no corpo, não na URL.** `POST /v1/privacidade/apagamentos/{cpf}` poria o CPF em log
+de ingress, histórico, `Referer`, span de trace e — no pior caso — label de métrica. Cinco
+lugares sem controle de acesso a dado pessoal, num pedido cujo objeto é remover aquele dado.
+
+**CPF sem análise responde 200, não 404.** Um 404 aqui distinguiria quem tem cadastro de quem
+não tem, para qualquer um com o escopo e uma lista de CPFs — um oráculo de existência construído
+pela rota que existe para proteger a pessoa.
+
+### O art. 18 contra o índice que não existe
+
+`test_cpf_nao_tem_indice` existe desde a camada 9 para manter busca por pessoa cara: "busca
+barata por CPF é o caminho por onde um vazamento deixa de ser um registro e vira uma lista". E o
+art. 18 exige encontrar os dados de uma pessoa — o que parece pedir exatamente esse índice.
+
+Não pede. Pedido de exclusão é raro; pagar uma varredura nele é aceitável. Criar o índice
+compraria uma capacidade **permanente** de enumerar por pessoa para servir uma operação
+ocasional.
+
+### O que esta camada não consegue fazer
+
+Um pedido de exclusão **não remove o objeto no S3 na hora**. A aplicação não tem
+`s3:DeleteObject`, de propósito, e o objeto sai quando a regra de ciclo de vida alcança — até 365
+dias. Para atendimento de direito, esperar 365 dias não é atendimento. O recibo não afirma que o
+objeto foi removido, e essa omissão é deliberada: recibo que promete mais do que houve é pior que
+recibo incompleto.
+
+### Um bug de concorrência que a camada revelou
+
+O primeiro teste de apagamento falhou com `KeyError: 0`. Causa: o repositório da camada 9 fazia
+`conexao.row_factory = dict_row` numa conexão **do pool** e nunca desfazia. A conexão voltava
+contaminada, e quem a pegasse depois receberia dicionários onde esperava tuplas — `contar()` faz
+`linha[0]`. Defeito dependente de ordem: aparece ou não conforme qual conexão o pool entrega.
+
+Corrigido pondo o row factory no **cursor**, cujo escopo é o da consulta. Restaurar em `finally`
+funcionaria e deixaria a janela aberta entre a alteração e a restauração.
+
+### O teste que não media nada, quatro vezes
+
+A asserção "o log do atendimento não carrega o CPF" falhou em quatro versões, todas afirmando
+sobre lista vazia — ou seja, todas passariam **com** o CPF no log:
+
+1. `capture_logs` em volta da chamada HTTP: o `TestClient` roda noutra thread;
+2. o mesmo, chamando o caso de uso direto: `cache_logger_on_first_use=True`;
+3. `caplog`: `settings_teste` usa `nivel_log="WARNING"` e o INFO nunca chega à stdlib;
+4. `caplog` com INFO configurado antes: o logger do módulo já tinha sido cacheado com WARNING.
+
+O que denunciou foi o `assert len(...) == 1` antes das asserções de conteúdo. A versão final é
+estática — percorre a AST e falha se alguma chamada de `logger` receber `cpf`, `nome`, `titular`
+ou `texto` —, não depende de nível nem de thread, e pega a regressão que importa: alguém
+acrescentar o CPF ao log para facilitar depuração.
+
 ## Segredos
 
 Nenhuma chave é necessária para rodar o projeto — veja a tabela de degradação

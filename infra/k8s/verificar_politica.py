@@ -71,7 +71,13 @@ def conferir_servico(nome: str, erros: list[str]) -> None:
             erros.append(f"{nome}: falta {exigido}")
 
     for deployment in (obj for obj in objetos if obj["kind"] == "Deployment"):
-        conferir_deployment(nome, deployment, erros)
+        conferir_pod(nome, deployment["spec"]["template"], erros, exige_sonda=True)
+
+    # CronJob tambem, e a ausencia disto era uma lacuna: o `purga.yaml` da Camada 10 entrou com
+    # `securityContext`, recursos e rootfs somente leitura corretos, e **nada** conferia que
+    # continuassem assim. Um `kind` fora da varredura e um manifest sem politica.
+    for cronjob in (obj for obj in objetos if obj["kind"] == "CronJob"):
+        conferir_cronjob(nome, cronjob, erros)
 
     for policy in (obj for obj in objetos if obj["kind"] == "NetworkPolicy"):
         conferir_policy(nome, policy, erros)
@@ -148,14 +154,54 @@ def conferir_porta_das_sondas(
             )
 
 
-def conferir_deployment(nome: str, deployment: dict[str, Any], erros: list[str]) -> None:
-    spec = deployment["spec"]["template"]["spec"]
+def conferir_cronjob(nome: str, cronjob: dict[str, Any], erros: list[str]) -> None:
+    """Politica do pod de um CronJob, mais o que so CronJob tem.
+
+    ## Sonda nao se aplica, e por um motivo diferente do trabalhador
+
+    O trabalhador e isento porque nao serve trafego. Um job e isento porque **termina**: nao existe
+    "pronto para receber" num processo que executa e sai, e `livenessProbe` num container de job
+    reiniciaria trabalho concluido.
+
+    A isencao aqui e por `kind`, e nao por rotulo — nao ha como um CronJob ser um servidor HTTP por
+    engano.
+    """
+    modelo = cronjob["spec"]["jobTemplate"]["spec"]["template"]
+    conferir_pod(nome, modelo, erros, exige_sonda=False)
+
+    spec_job = cronjob["spec"]["jobTemplate"]["spec"]
+
+    # Job sem teto de tempo fica preso ate alguem notar. Com `concurrencyPolicy: Forbid`, as
+    # execucoes seguintes sao **puladas em silencio** enquanto isso — o pior par possivel.
+    if "activeDeadlineSeconds" not in spec_job:
+        erros.append(f"{nome}/cronjob: sem activeDeadlineSeconds; um job travado nunca termina")
+
+    # `Allow` (o default) deixa duas purgas concorrerem pelas mesmas linhas.
+    if cronjob["spec"].get("concurrencyPolicy") != "Forbid":
+        erros.append(f"{nome}/cronjob: concurrencyPolicy deveria ser Forbid")
+
+    # `restartPolicy` do pod de job so aceita Never ou OnFailure; `Never` com `backoffLimit` deixa a
+    # decisao de retentar com o controlador, que a registra em vez de reiniciar o mesmo container.
+    if modelo["spec"].get("restartPolicy") != "Never":
+        erros.append(f"{nome}/cronjob: restartPolicy deveria ser Never")
+
+
+def conferir_pod(
+    nome: str, modelo: dict[str, Any], erros: list[str], *, exige_sonda: bool
+) -> None:
+    """Politica comum a qualquer pod, venha ele de Deployment ou de CronJob.
+
+    Era `conferir_deployment` e passou a receber o **modelo de pod**: as regras de securityContext,
+    recursos e limite de CPU nao tem nada de especifico a Deployment, e mante-las la deixaria o
+    CronJob de fora — que foi exatamente o que aconteceu ate a Camada 10.
+    """
+    spec = modelo["spec"]
     contexto_pod = spec.get("securityContext", {})
 
     if not contexto_pod.get("runAsNonRoot"):
         erros.append(f"{nome}: pod nao declara runAsNonRoot")
 
-    rotulos_do_pod = deployment["spec"]["template"]["metadata"].get("labels", {})
+    rotulos_do_pod = modelo["metadata"].get("labels", {})
 
     for container in spec["containers"]:
         rotulo = f"{nome}/{container['name']}"
@@ -171,11 +217,12 @@ def conferir_deployment(nome: str, deployment: dict[str, Any], erros: list[str])
         # para medir. Um `livenessProbe` respondendo 200 num trabalhador travado seria pior que
         # nenhum — significaria "saudavel" enquanto a fila cresce. O sinal certo e profundidade de
         # fila (`DocumentosPresosNaExtracao`), e ele vive nos alertas, nao no manifest.
-        if e_consumidor_de_fila(container, rotulos_do_pod):
+        if not exige_sonda or e_consumidor_de_fila(container, rotulos_do_pod):
             # Impresso e nao silencioso: uma isencao que nao aparece no log do CI e uma isencao
             # que ninguem revisa. Se um dia isto imprimir o nome de um servico que **deveria**
             # ter sonda, a linha e a pista.
-            print(f"::notice::{rotulo}: isento de sondas HTTP (consumidor de fila)")
+            motivo = "consumidor de fila" if exige_sonda else "processo que termina"
+            print(f"::notice::{rotulo}: isento de sondas HTTP ({motivo})")
             for sonda in ("readinessProbe", "livenessProbe", "startupProbe"):
                 # E o inverso tambem e violacao: declarar sonda HTTP sem porta e configuracao que
                 # nunca pode passar, e o pod entraria em CrashLoop por falha de sonda.

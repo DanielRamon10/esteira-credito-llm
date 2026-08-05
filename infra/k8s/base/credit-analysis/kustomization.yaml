@@ -18,3 +18,6 @@ resources:
   # ConfigMap e o Secret da API porque a configuracao **e** a mesma (mesmo banco, mesmo bucket,
   # mesma fila); o que difere e o comando e o que o pod monta.
   - trabalhador.yaml
+  # Purga por prazo de retencao (Camada 10). CronJob e nao Deployment: executa, informa e sai —
+  # quem repete e o agendador do Kubernetes, e nao um `while True` com sleep.
+  - purga.yaml

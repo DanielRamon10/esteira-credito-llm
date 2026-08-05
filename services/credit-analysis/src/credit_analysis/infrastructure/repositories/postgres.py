@@ -72,6 +72,36 @@ class ConflitoDeVersao(RuntimeError):
     """
 
 
+async def _consultar(
+    conexao: AsyncConnection[Any], sql: str, parametros: tuple[Any, ...] = ()
+) -> list[dict[str, Any]]:
+    """Consulta devolvendo dicionarios, com o row factory no **cursor** e nao na conexao.
+
+    ## O defeito que isto corrige
+
+    A versao anterior fazia `conexao.row_factory = dict_row` dentro de cada leitura. A conexao vem
+    do pool e volta para ele **com o atributo alterado**: quem a pegasse depois receberia
+    dicionarios onde esperava tuplas.
+
+    `contar()` faz `linha[0]`. Com a conexao contaminada por uma leitura anterior, aquilo levanta
+    `KeyError: 0` — e o defeito e dependente de ordem, porque so aparece quando o pool devolve
+    aquela conexao especifica. Foi assim que ele apareceu: um teste da Camada 10 que roda
+    `buscar_por_id` antes de uma consulta por posicao.
+
+    Um pool com uma conexao esconderia isso por sorte; com varias, o mesmo teste passa ou falha
+    conforme qual conexao foi entregue.
+
+    ## Por que cursor e nao restaurar o atributo depois
+
+    Restaurar em `finally` funcionaria e deixaria a janela aberta: entre a alteracao e a
+    restauracao, outra corrotina do mesmo processo pode pegar a conexao. O cursor nao tem essa
+    janela: o escopo dele **e** o da consulta.
+    """
+    async with conexao.cursor(row_factory=dict_row) as cursor:
+        await cursor.execute(sql, parametros)
+        return [dict(linha) for linha in await cursor.fetchall()]
+
+
 class RepositorioAnalisesPostgres:
     """Adapter do port `RepositorioAnalises` sobre Postgres."""
 
@@ -229,25 +259,22 @@ class RepositorioAnalisesPostgres:
 
     async def buscar_por_id(self, analise_id: UUID) -> AnaliseCredito | None:
         async with self._pool.connection() as conexao:
-            conexao.row_factory = dict_row  # type: ignore[assignment]
-            cursor = await conexao.execute("SELECT * FROM analise WHERE id = %s", (analise_id,))
-            linha = await cursor.fetchone()
-            if linha is None:
+            linhas = await _consultar(conexao, "SELECT * FROM analise WHERE id = %s", (analise_id,))
+            if not linhas:
                 return None
-            return await self._montar(conexao, dict(linha))
+            return await self._montar(conexao, linhas[0])
 
     async def listar(self, limite: int = 50, offset: int = 0) -> list[AnaliseCredito]:
         async with self._pool.connection() as conexao:
-            conexao.row_factory = dict_row  # type: ignore[assignment]
-            cursor = await conexao.execute(
+            linhas = await _consultar(
+                conexao,
                 # `id DESC` no desempate: o relogio do Windows tem resolucao de ~15ms, e duas
                 # analises criadas em sequencia recebem o mesmo timestamp. Sem ele a paginacao
                 # poderia repetir ou pular registro.
                 "SELECT * FROM analise ORDER BY criada_em DESC, id DESC LIMIT %s OFFSET %s",
                 (limite, offset),
             )
-            linhas = await cursor.fetchall()
-            return [await self._montar(conexao, dict(linha)) for linha in linhas]
+            return [await self._montar(conexao, linha) for linha in linhas]
 
     async def contar(self) -> int:
         async with self._pool.connection() as conexao:
@@ -266,8 +293,8 @@ class RepositorioAnalisesPostgres:
         adapter em memoria faz hoje, e e aceitavel no volume dele.
         """
         async with self._pool.connection() as conexao:
-            conexao.row_factory = dict_row  # type: ignore[assignment]
-            cursor = await conexao.execute(
+            linhas = await _consultar(
+                conexao,
                 """
                 SELECT a.* FROM analise a
                 JOIN documento d ON d.analise_id = a.id
@@ -275,25 +302,124 @@ class RepositorioAnalisesPostgres:
                 """,
                 (documento_id,),
             )
-            linha = await cursor.fetchone()
-            if linha is None:
+            if not linhas:
                 return None
-            return await self._montar(conexao, dict(linha))
+            return await self._montar(conexao, linhas[0])
+
+    # ------------------------------------------- Ciclo de vida do dado (Camada 10)
+
+    async def buscar_por_cpf(self, cpf: CPF) -> list[AnaliseCredito]:
+        """Varredura por CPF, sem indice e de proposito. Ver o port `CicloDeVidaDoDado`."""
+        async with self._pool.connection() as conexao:
+            linhas = await _consultar(
+                conexao,
+                "SELECT * FROM analise WHERE solicitante_cpf = %s ORDER BY criada_em",
+                (cpf.numero,),
+            )
+            return [await self._montar(conexao, linha) for linha in linhas]
+
+    async def apagar_identificacao(self, analise_id: UUID, motivo: str, agora: datetime) -> bool:
+        """Conserva a decisao e apaga a analise, numa transacao.
+
+        ## A ordem importa, e o `INSERT ... SELECT` e o motivo
+
+        O registro conservado e montado **a partir da propria linha**, dentro da transacao e antes
+        do `DELETE`. Ler em Python, fechar a conexao e gravar depois abriria uma janela em que a
+        analise ja foi apagada e o registro ainda nao existe — e um erro ali perderia a trilha que a
+        obrigacao legal exige.
+
+        ## Analise sem parecer nao gera registro
+
+        Um caso que nunca foi decidido nao tem decisao a conservar: nao ha score, nao ha
+        justificativa, e inserir uma linha com zeros criaria registro de uma decisao que nao houve.
+        Ele apenas desaparece, que e o atendimento integral do art. 18 quando nao ha base legal para
+        conservar nada.
+
+        ## A faixa de valor, e nao o valor
+
+        `faixa_valor` e derivada em SQL e nao em Python. Se fosse calculada aqui e gravada, este
+        metodo poderia inserir o valor exato por descuido — e valor exato mais data mais prazo e um
+        quasi-identificador. Em SQL, o valor exato nunca sai da linha que esta sendo apagada.
+        """
+        async with self._pool.connection() as conexao, conexao.transaction():
+            cursor = await conexao.execute(
+                """
+                INSERT INTO decisao_retida (
+                    analise_id, decisao, nivel_risco, score, comprometimento,
+                    limite_recomendado, justificativas, politicas_aplicadas,
+                    faixa_valor, prazo_meses, decidida_em, identificacao_removida_em, motivo
+                )
+                SELECT
+                    a.id, a.parecer_decisao, a.parecer_nivel_risco, a.parecer_score,
+                    a.parecer_comprometimento, a.parecer_limite,
+                    a.parecer_justificativas, a.parecer_politicas,
+                    CASE
+                        WHEN a.proposta_valor <  10000 THEN 'ate_10k'
+                        WHEN a.proposta_valor <  50000 THEN '10k_50k'
+                        WHEN a.proposta_valor < 200000 THEN '50k_200k'
+                        ELSE 'acima_200k'
+                    END,
+                    a.proposta_prazo, a.criada_em, %s, %s
+                FROM analise a
+                WHERE a.id = %s AND a.parecer_decisao IS NOT NULL
+                ON CONFLICT (analise_id) DO NOTHING
+                """,
+                (agora, motivo, analise_id),
+            )
+            cursor = await conexao.execute("DELETE FROM analise WHERE id = %s", (analise_id,))
+            apagou = cursor.rowcount > 0
+
+        # Fora da transacao: o cache de versao e do processo, e limpa-lo dentro dela deixaria uma
+        # entrada orfa caso a transacao fosse revertida.
+        _VERSOES.pop(analise_id, None)
+        return apagou
+
+    async def purgar_texto_de_ocr(self, limite: datetime) -> int:
+        """Zera o texto de OCR de analises paradas antes do limite.
+
+        `texto_extraido = NULL` e nao `''`: a coluna e opcional no dominio, e string vazia seria um
+        terceiro estado — "purgado" indistinguivel de "extraiu e nao veio texto". `NULL` ja diz
+        ausencia, e `documento.erro` continua contando o que aconteceu.
+
+        Nao mexe em `confianca_ocr`, `motor_ocr`, `renda_comprovada` nem `renda_origem`: nenhum
+        deles e dado pessoal, e todos sustentam a auditoria do parecer depois de o texto sair.
+        """
+        async with self._pool.connection() as conexao:
+            cursor = await conexao.execute(
+                """
+                UPDATE documento d
+                SET texto_extraido = NULL
+                FROM analise a
+                WHERE d.analise_id = a.id
+                  AND d.texto_extraido IS NOT NULL
+                  AND a.atualizada_em < %s
+                """,
+                (limite,),
+            )
+            return int(cursor.rowcount)
 
     async def _montar(self, conexao: AsyncConnection[Any], linha: dict[str, Any]) -> AnaliseCredito:
         analise_id: UUID = linha["id"]
         # Guarda a versao lida, para o `salvar` seguinte compara-la.
         _VERSOES[analise_id] = int(linha["versao"])
 
-        cursor = await conexao.execute(
-            "SELECT * FROM documento WHERE analise_id = %s ORDER BY ordem", (analise_id,)
-        )
-        documentos = [_montar_documento(dict(d)) for d in await cursor.fetchall()]
+        documentos = [
+            _montar_documento(d)
+            for d in await _consultar(
+                conexao,
+                "SELECT * FROM documento WHERE analise_id = %s ORDER BY ordem",
+                (analise_id,),
+            )
+        ]
 
-        cursor = await conexao.execute(
-            "SELECT * FROM dado_extraido WHERE analise_id = %s ORDER BY ordem", (analise_id,)
-        )
-        dados = [_montar_dado(dict(d)) for d in await cursor.fetchall()]
+        dados = [
+            _montar_dado(d)
+            for d in await _consultar(
+                conexao,
+                "SELECT * FROM dado_extraido WHERE analise_id = %s ORDER BY ordem",
+                (analise_id,),
+            )
+        ]
 
         return AnaliseCredito(
             id=analise_id,

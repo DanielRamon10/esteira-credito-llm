@@ -210,3 +210,70 @@ CREATE TABLE IF NOT EXISTS dado_extraido (
 );
 
 CREATE INDEX IF NOT EXISTS idx_dado_analise ON dado_extraido (analise_id, ordem);
+
+-- ============================================================ Camada 10: retencao
+--
+-- Registro da decisao que sobrevive ao apagamento dos identificadores.
+--
+-- ## Por que uma tabela separada e nao colunas nulas em `analise`
+--
+-- Anular `solicitante_cpf` e `solicitante_nome` em `analise` deixaria o agregado carregavel como
+-- uma analise viva sem solicitante, e cada leitor — score, caso de uso, schema da API, ferramenta
+-- do agente: 21 pontos no codigo — precisaria de uma checagem defensiva para um estado que so
+-- existe depois de a decisao ser final. Checagem defensiva em 21 lugares e onde um deles fica
+-- faltando.
+--
+-- Aqui a distincao e estrutural: `analise` guarda caso em andamento ou concluido, com titular;
+-- `decisao_retida` guarda o registro que a obrigacao legal exige, sem titular. Sao coisas
+-- diferentes, e o schema diz isso.
+--
+-- ## O que NAO esta aqui, e essa e a parte que importa
+--
+-- Sem nome, sem CPF, sem data de nascimento, sem renda declarada, sem texto de documento, sem hash
+-- de conteudo. Nada que identifique, e nada de que se derive identificacao.
+--
+-- **Nao chamamos isso de anonimizacao.** `analise_id` permanece, porque a trilha precisa dele, e
+-- quem tiver um mapeamento antigo `analise_id -> CPF` re-identifica. O que existe aqui e retencao
+-- sob base legal (LGPD art. 16 §I) com identificadores removidos, e isso continua sendo dado
+-- pessoal sob a LGPD. Ver o cabecalho de `domain/retencao.py`.
+CREATE TABLE IF NOT EXISTS decisao_retida (
+    analise_id          UUID PRIMARY KEY,
+
+    -- A decisao e o que a justifica. Sem isto a tabela nao serviria a nada: o proposito e responder
+    -- "em que o banco se baseou?" anos depois, ao titular (art. 20) ou ao regulador.
+    decisao             TEXT        NOT NULL,
+    nivel_risco         TEXT        NOT NULL,
+    score               INTEGER     NOT NULL,
+    comprometimento     NUMERIC(6,2),
+    limite_recomendado  NUMERIC(15,2),
+    justificativas      TEXT[]      NOT NULL DEFAULT '{}',
+    politicas_aplicadas TEXT[]      NOT NULL DEFAULT '{}',
+
+    -- Faixa de valor e prazo, e nao os valores exatos.
+    --
+    -- Valor solicitado exato e quasi-identificador: "R$ 45.327,18 em 36 meses em marco de 2026"
+    -- provavelmente identifica uma pessoa so na carteira. A faixa preserva o que serve a analise
+    -- estatistica e a auditoria de politica sem reconstruir o caso individual.
+    faixa_valor         TEXT        NOT NULL,
+    prazo_meses         INTEGER     NOT NULL,
+
+    -- Quando a decisao foi tomada, e quando os identificadores sairam.
+    --
+    -- As duas datas existem porque as perguntas sao diferentes: a primeira e "quando decidimos" e a
+    -- segunda e "quando cumprimos o pedido de exclusao". Provar a segunda e obrigacao do
+    -- controlador, e sem a coluna a prova seria um log.
+    decidida_em         TIMESTAMPTZ NOT NULL,
+    identificacao_removida_em TIMESTAMPTZ NOT NULL,
+
+    -- Por que os identificadores sairam: pedido do titular (art. 18) ou fim do prazo (art. 15).
+    --
+    -- A distincao e material numa fiscalizacao: pedido atendido tem prazo de resposta e o
+    -- controlador precisa demonstrar que atendeu; expiracao por prazo e rotina.
+    motivo              TEXT        NOT NULL CHECK (motivo IN ('pedido_do_titular', 'prazo_vencido'))
+);
+
+-- Consulta por data de decisao, para relatorio de politica e para a propria purga.
+--
+-- Nao ha indice por `motivo`: o dominio tem dois valores, e um indice sobre coluna de baixa
+-- cardinalidade nao ajuda o planejador — ele faz varredura de qualquer forma.
+CREATE INDEX IF NOT EXISTS idx_decisao_retida_data ON decisao_retida (decidida_em DESC);
