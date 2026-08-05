@@ -1036,6 +1036,69 @@ chave e passou a receber 400, com a mensagem certa. Em vez de só corrigir, fica
 asserções ali — 400 sem chave, 201 com, 200 na repetição —, porque é o único ponto que exercita
 a exigência contra a imagem real.
 
+## Carga medida
+
+Três alegações estavam escritas no repositório sem número: "o motor de score é puro CPU e responde
+em milissegundos" (Camada 1), "escala independente" (manifesto do trabalhador, Camada 9) e "o
+dicionário cresce sem limite, mas para o volume deste projeto é irrelevante" (`_VERSOES`).
+
+    camada                                    vazão          latência
+    scoring.avaliar (CPU puro, sem I/O)       15.674/s       p50 0,064ms
+    caso de uso, repositório em memória        1.765/s (c=1)  p50 0,46ms
+                                               2.010/s (c=10) p50 2,72ms
+    caso de uso, repositório Postgres              81/s (c=1)  p50 11,9ms
+                                                  174/s (c=50) p50 265ms
+    POST /analises (uvicorn no container)           14/s (c=1)  p50 68ms
+                                                   54/s (c=10) p50 177ms
+                                                   46/s (c=50) p50 929ms
+    pool, uma ida ao banco                        360/s serial  p50 2,78ms
+    pool, INSERT concorrente                    1.183/s (c=8)
+
+**Todos os números são teto, não previsão.** O Postgres do compose roda com `fsync=off` —
+deliberado e documentado lá —, então escrita com durabilidade ligada é mais lenta.
+
+### O que a medição respondeu
+
+**"Milissegundos" era conservador:** 0,064ms, teto teórico de ~15.700/s. Não há nada a otimizar no
+motor de score.
+
+**O teto da API é número de idas ao banco, e não CPU.** O mesmo caso de uso faz 1.765/s com
+repositório em memória e 174/s com Postgres — 10x, com domínio idêntico. Somando autenticação e as
+duas idas da idempotência, a rota fica em ~50/s.
+
+**Concorrência acima de ~10 só acrescenta fila.** A vazão trava e a latência cresce linear: 50
+requisições em voo divididas por 265ms dão 189/s, que é o teto medido. Aumentar concorrência do
+cliente não aumenta vazão — aumenta o p95 dele.
+
+**`_VERSOES`: uma entrada por análise, ~47 B/entrada.** Projetando 1 milhão de análises vistas por
+um processo: ~47MB no dicionário mais os objetos referenciados, na casa de 150MB. O comentário
+chamava isso de irrelevante para este volume, e a estimativa se confirma.
+
+**Compartilhar o Postgres custa ~18% de latência** sob a contenção testada (p50 156ms → 184ms). É a
+metade de "escala independente" que o manifesto não discutia: separar processos não separa o banco.
+
+### Duas hipóteses que a medição refutou
+
+A primeira leitura foi que o teto vinha de CPU dentro do event loop — score síncrono num handler
+async serializaria tudo. O score custa 0,064ms; o teto teórico dele é 300x o observado. Errada.
+
+A segunda foi fsync do WAL. Também errada, e valia conferir antes de escrever: o compose **já** roda
+com `fsync=off`, e escrita faz 1.183/s ali.
+
+O que sobrou foi o mais simples: cada `POST` custa ~12 idas ao banco, e 12 × ~0,85ms sob
+concorrência dá a ordem de grandeza medida. Sem defeito e sem mistério — mas agora com um número
+que diz onde mexer se precisar.
+
+### Por que os pisos são propriedades, e não números
+
+Mesma lição do eval de OCR: piso numérico sobre medição dependente de ambiente passa a medir o
+ambiente, e a reação a um vermelho legítimo é afrouxar o número até ele não significar nada. As
+asserções da suíte de carga são coisas que não mudam com a velocidade da máquina — nenhuma
+requisição falha, nenhuma análise duplicada sob rajada com a mesma chave, crescimento de `_VERSOES`
+linear. Os números ficam na tabela, datados.
+
+E ela não roda no CI: `pytest -m carga`, com Postgres de pé.
+
 ## Segredos
 
 Nenhuma chave é necessária para rodar o projeto — veja a tabela de degradação

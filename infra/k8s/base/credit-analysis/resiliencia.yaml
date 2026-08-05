@@ -14,9 +14,13 @@ metadata:
   name: credit-analysis
   annotations:
     limitacao-conhecida: >-
-      Escala por CPU, mas o tempo dominante e espera por inferencia (80s
-      medidos), que nao aparece como CPU. Proximo passo: metrica customizada
-      credito_http_em_andamento via Prometheus Adapter.
+      Escala por CPU, e a Camada 12 mediu que a API nao e limitada por CPU de
+      forma nenhuma: o motor de score custa 0,064ms e o teto de vazao vem do
+      numero de idas ao Postgres (1.765/s em memoria contra 174/s no banco, com
+      o mesmo dominio). Somando a espera por inferencia no caminho do agente
+      (80s medidos), CPU e um proxy ruim nos dois casos. Proximo passo: metrica
+      customizada credito_http_em_andamento via Prometheus Adapter. Tabela em
+      tests/carga/test_carga.py.
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

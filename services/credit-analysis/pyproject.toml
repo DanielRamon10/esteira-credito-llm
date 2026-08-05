@@ -81,12 +81,14 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 # Evals ficam fora da execucao padrao: baixam 2,24GB de modelo. Rode com
 # `pytest -m eval` (a CI roda num job separado, com cache do modelo).
-addopts = "-q --strict-markers -m 'not eval and not ocr'"
+addopts = "-q --strict-markers -m 'not eval and not ocr and not carga'"
 asyncio_mode = "auto"
 markers = [
     "integration: testes que exercitam a API completa",
     "eval: avaliacao de qualidade do retrieval; exige o modelo de embedding real",
     "ocr: avaliacao de acuracia de OCR; exige o Tesseract instalado",
+    # Medicao de carga; exige Postgres e mede a maquina onde roda, por isso fora do CI normal.
+    "carga: medicao de vazao e latencia sob concorrencia; exige Postgres",
 ]
 
 [tool.ruff]

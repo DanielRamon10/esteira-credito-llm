@@ -105,6 +105,16 @@ async def criar_analise(
     - **chave repetida, pedido diferente** — 422. Devolver a resposta do primeiro faria o cliente
       concluir que submeteu uma analise que nao existe.
 
+    ## O custo desta rota, medido
+
+    O motor de score custa **0,064ms** — a Camada 1 dizia "responde em milissegundos" e era
+    conservadora. O que limita a vazao aqui e o **numero de idas ao banco**: o mesmo caso de uso faz
+    1.765 analises/s com repositorio em memoria e 174/s com Postgres, e a rota completa (com
+    autenticacao e as duas idas da idempotencia) fica em ~50/s.
+
+    Consequencia pratica: concorrencia acima de ~10 nao aumenta vazao, so a latencia de quem espera.
+    A tabela esta em `tests/carga/test_carga.py`.
+
     ## A repeticao le o recurso, e nao um retrato dele
 
     `RegistroDeIdempotencia` guarda o **id**, nao o corpo — o motivo esta no cabecalho de
