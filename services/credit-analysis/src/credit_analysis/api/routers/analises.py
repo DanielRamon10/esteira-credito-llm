@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Path, Query, Response, status
 
 from credit_analysis.api.deps import (
@@ -21,6 +22,7 @@ from credit_analysis.api.schemas import (
     AnaliseResponse,
     ErroResponse,
     PaginaAnalises,
+    RevisaoResponse,
 )
 from credit_analysis.api.seguranca import (
     ANALISES_ESCREVER,
@@ -43,6 +45,8 @@ from credit_analysis.domain.idempotencia import (
     impressao_do_pedido,
 )
 from credit_analysis.domain.value_objects import Dinheiro
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/analises", tags=["Analises de credito"])
 
@@ -244,3 +248,64 @@ async def listar_analises(
         limite=limite,
         offset=offset,
     )
+
+
+@router.post(
+    "/{analise_id}/revisao",
+    response_model=RevisaoResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Pedir revisao humana de decisao automatizada (LGPD art. 20)",
+    dependencies=[Depends(Escopo(ANALISES_ESCREVER))],
+    responses={
+        404: {"model": ErroResponse, "description": "Analise nao encontrada"},
+        409: {"model": ErroResponse, "description": "Nao ha decisao a revisar"},
+    },
+)
+async def solicitar_revisao(
+    analise_id: Annotated[UUID, Path(description="Identificador da analise")],
+    repositorio: RepositorioDep,
+    identidade: IdentidadeDep,
+) -> RevisaoResponse:
+    """Registra que o titular contesta a decisao e pede olhar humano.
+
+    ## 202 e nao 200
+
+    O pedido foi **aceito**, e o trabalho que ele gera — um analista olhar o caso — nao aconteceu
+    nesta requisicao. Mesma semantica do 202 da recepcao de documento (Camada 8), e pelo mesmo
+    motivo: 200 sugeriria que a revisao esta feita.
+
+    ## O que este endpoint nao faz, e o que isso protege
+
+    Nao muda a decisao. Um pedido que aprovasse automaticamente seria absurdo; que negasse, pior. O
+    parecer atual segue valido e visivel, com a justificativa que o sustenta, ate um analista
+    revisar.
+
+    Tambem nao reabre a analise: `reabrir_para_reavaliacao` existe para evidencia nova e consome uma
+    das cinco reavaliacoes — teto criado para impedir que alguem reenvie documento ate obter o
+    parecer que quer. Gastar aquele teto num **direito** seria limitar o direito a cinco usos. A
+    discussao esta em `AnaliseCredito.solicitar_revisao_humana`.
+
+    ## 409 quando nao houve decisao
+
+    Analise em `pendente` ou `processando` nao decidiu nada. Aceitar o pedido ali abriria
+    contestacao de nada — e faria o prazo de resposta comecar a contar antes de haver o que
+    responder.
+    """
+    analise = await repositorio.buscar_por_id(analise_id)
+    if analise is None:
+        raise AnaliseNaoEncontrada(f"Analise {analise_id} nao encontrada")
+
+    # O canal registrado e o `sub` do token: quem pede e sempre o titular, e guardar isso de novo
+    # seria dado pessoal a mais para nao dizer nada. O que a trilha precisa e por onde entrou.
+    primeiro = analise.solicitar_revisao_humana(identidade.sujeito)
+    await repositorio.salvar(analise)
+
+    log = logger.bind(analise_id=str(analise.id))
+    log.info(
+        "lgpd.revisao_solicitada",
+        primeiro_pedido=primeiro,
+        canal=identidade.sujeito,
+        base_legal="LGPD art. 20",
+    )
+
+    return RevisaoResponse.de_dominio(analise, primeiro_pedido=primeiro)

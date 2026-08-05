@@ -49,6 +49,36 @@ class FatorScore:
     justificativa: str
 
 
+# De qual politica cada fator do score vem.
+#
+# ## O defeito que isto corrige
+#
+# `Parecer.politicas_aplicadas` existia desde a Camada 1, era persistido e aparecia na resposta da
+# API — **sempre vazio**. Nada o preenchia. Um campo que promete "quais politicas sustentaram esta
+# decisao" e nunca responde e pior que campo ausente: quem consome conclui que nenhuma politica foi
+# aplicada.
+#
+# Apareceu ao implementar o art. 20 (Camada 13): a rota de pedido de revisao entrega os criterios da
+# decisao, e um `politicas_aplicadas: []` ali seria dizer ao titular que a decisao nao se baseou em
+# regra nenhuma.
+#
+# ## Por que um mapa aqui e nao um campo em `FatorScore`
+#
+# Um campo `politica` no dataclass seria mais direto e obrigaria os cinco construtores a preenche-lo
+# — e um sexto fator futuro poderia passar `""` e voltar ao problema calado.
+#
+# O mapa e conferido por teste contra os nomes que `calcular_fatores` produz: fator sem politica
+# quebra o teste em vez de sumir da lista. E os arquivos citados existem em `politicas/`,
+# versionados — o mesmo corpus que o RAG indexa.
+POLITICA_POR_FATOR: dict[str, str] = {
+    "comprometimento_renda": "POL-001",
+    "divergencia_renda": "POL-005",
+    "historico_bancario": "POL-001",
+    "restricao_cadastral": "POL-003",
+    "perfil_demografico": "POL-001",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class EntradaScore:
     """Tudo que o motor precisa. Sem isso ele nao consulta nada externo.
@@ -256,6 +286,11 @@ def avaliar(entrada: EntradaScore) -> Parecer:
         score=score,
         comprometimento_renda=comprometimento,
         justificativas=[f.justificativa for f in fatores],
+        # Sem repeticao: tres fatores vem da POL-001, e listar a mesma politica tres vezes nao
+        # acrescenta informacao a quem le o parecer. Ordenado para a resposta da API ser estavel
+        # entre chamadas — sem isso o mesmo parecer teria corpos diferentes, e um diff de contrato
+        # apontaria mudanca onde nao houve.
+        politicas_aplicadas=sorted({POLITICA_POR_FATOR[f.nome] for f in fatores}),
         limite_recomendado=calcular_limite_recomendado(entrada, score),
     )
 

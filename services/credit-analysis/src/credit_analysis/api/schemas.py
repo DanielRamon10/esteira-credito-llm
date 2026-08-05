@@ -737,3 +737,63 @@ class ReciboResponse(BaseModel):
                 "identificacao sob art. 16 secao I (obrigacao legal) e POL-006 secao 5."
             ),
         )
+
+
+class RevisaoResponse(BaseModel):
+    """Comprovante do pedido de revisao, com os criterios da decisao.
+
+    ## Por que a mesma resposta entrega as duas metades do art. 20
+
+    O caput da o direito de **pedir revisao**; o §1 obriga o controlador a fornecer, sempre que
+    solicitado, informacao clara sobre os **criterios e procedimentos** da decisao automatizada.
+
+    Sao duas obrigacoes, e o momento em que o titular pede revisao e exatamente quando ele quer
+    saber em que a decisao se baseou. Devolver so "pedido registrado" cumpriria uma e ignoraria a
+    outra, e obrigaria uma segunda chamada para a informacao a que ele ja tinha direito.
+
+    ## O que nao esta aqui: o peso de cada fator
+
+    As justificativas dizem quais fatores pesaram e em que direcao ("renda comprovada acima do
+    minimo"), e nao os pontos que cada um somou. A diferenca e deliberada e esta no README:
+    entregar a tabela de pontos e entregar o mapa para burlar o score, e o art. 20 §1 pede criterio
+    compreensivel, nao o modelo.
+    """
+
+    analise_id: UUID
+    pedido_registrado_em: datetime
+    primeiro_pedido: bool = Field(
+        description=(
+            "False quando ja havia pedido anterior sobre esta decisao. O prazo de resposta conta "
+            "do primeiro, e reenviar nao o reinicia."
+        )
+    )
+
+    decisao: Decisao
+    score: int
+    criterios: list[str] = Field(
+        description="Os fatores que sustentaram a decisao, na linguagem da politica (art. 20 §1)."
+    )
+    politicas_aplicadas: list[str]
+    base_legal: str
+
+    @classmethod
+    def de_dominio(cls, analise: AnaliseCredito, *, primeiro_pedido: bool) -> RevisaoResponse:
+        parecer = analise.parecer
+        if parecer is None:  # pragma: no cover - a rota garante que houve decisao
+            raise ValueError("revisao exige parecer")
+        if analise.revisao_solicitada_em is None:  # pragma: no cover - idem
+            raise ValueError("revisao exige data de solicitacao")
+
+        return cls(
+            analise_id=analise.id,
+            pedido_registrado_em=analise.revisao_solicitada_em,
+            primeiro_pedido=primeiro_pedido,
+            decisao=parecer.decisao,
+            score=parecer.score,
+            criterios=list(parecer.justificativas),
+            politicas_aplicadas=list(parecer.politicas_aplicadas),
+            base_legal=(
+                "Revisao de decisao automatizada sob LGPD art. 20; criterios informados sob o "
+                "art. 20 §1. A decisao permanece valida enquanto um analista nao a revisar."
+            ),
+        )

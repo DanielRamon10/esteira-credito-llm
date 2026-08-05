@@ -1099,6 +1099,52 @@ linear. Os números ficam na tabela, datados.
 
 E ela não roda no CI: `pytest -m carga`, com Postgres de pé.
 
+## Revisão de decisão automatizada (art. 20)
+
+O projeto citava o art. 20 em três lugares como justificativa do score explicável — "a Resolução
+CMN 4.658 e o art. 20 da LGPD dão ao cliente o direito de pedir revisão de decisão automatizada, e
+'o modelo disse não' não é justificativa" — e não oferecia o pedido. Esta camada fecha a última
+alegação legal citada sem implementação.
+
+`POST /v1/analises/{id}/revisao` responde 202 e devolve **os critérios da decisão**, porque o
+artigo tem duas metades: o caput dá o direito de pedir revisão, o §1 obriga a informar critérios e
+procedimentos. Um endpoint que só registrasse o pedido cumpriria metade e obrigaria uma segunda
+chamada para a informação a que o titular já tinha direito.
+
+### Três coisas que o pedido não faz
+
+**Não muda a decisão.** Aprovar automaticamente por contestação seria absurdo; negar, pior. O
+parecer segue válido e visível com a justificativa que o sustenta, até um analista revisar.
+
+**Não consome reavaliação.** `reabrir_para_reavaliacao` existe para evidência nova e tem teto de
+cinco — criado para impedir que alguém reenvie documento até obter o parecer que quer. Gastar aquele
+teto num **direito** o limitaria a cinco usos, e um titular que contestasse cinco vezes perderia a
+capacidade de anexar documento. Por isso o pedido é ortogonal ao ciclo de vida: campos próprios, sem
+transição de status.
+
+**Não reinicia o prazo.** Reenviar não sobrescreve a data do primeiro pedido — atualizá-la daria ao
+controlador um jeito de empurrar o prazo de resposta usando o pedido do próprio titular.
+
+### O campo que estava vazio desde a Camada 1
+
+Ao montar a resposta do §1, `politicas_aplicadas` voltou `[]`. O campo existia desde a primeira
+camada, era persistido e aparecia na resposta da API — e **nada o preenchia**. Um campo que promete
+"quais políticas sustentaram esta decisão" e nunca responde é pior que campo ausente: quem consome
+conclui que nenhuma política foi aplicada.
+
+Só apareceu porque o art. 20 §1 obriga a informar os critérios, e um `politicas_aplicadas: []` ali
+seria dizer ao titular que a decisão não se baseou em regra nenhuma. Agora cada fator do score
+aponta a política que o implementa (POL-001, POL-003, POL-005), com os arquivos versionados em
+`politicas/` — o mesmo corpus que o RAG indexa.
+
+### O cruzamento com a Camada 10
+
+`decisao_retida` ganhou `revisao_solicitada BOOLEAN`. Um pedido de exclusão leva a análise; se a
+contestação fosse embora com ela, uma auditoria de "quantas decisões foram contestadas?" perderia o
+caso — e essa pergunta é de política, não de titular. Booleano ali e data na tabela `analise`: o
+prazo de resposta só importa enquanto o caso existe, e a data seria um quasi-identificador a mais
+numa tabela feita para não ter nenhum.
+
 ## Segredos
 
 Nenhuma chave é necessária para rodar o projeto — veja a tabela de degradação

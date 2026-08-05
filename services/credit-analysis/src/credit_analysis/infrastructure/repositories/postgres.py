@@ -145,6 +145,8 @@ class RepositorioAnalisesPostgres:
             (parecer.limite_recomendado.valor if parecer and parecer.limite_recomendado else None),
             parecer.justificativas if parecer else [],
             parecer.politicas_aplicadas if parecer else [],
+            analise.revisao_solicitada_em,
+            analise.revisao_solicitada_por,
             analise.criada_em,
             analise.atualizada_em,
         )
@@ -163,9 +165,10 @@ class RepositorioAnalisesPostgres:
                     parecer_decisao, parecer_nivel_risco, parecer_score,
                     parecer_comprometimento, parecer_limite,
                     parecer_justificativas, parecer_politicas,
+                    revisao_solicitada_em, revisao_solicitada_por,
                     criada_em, atualizada_em
                 ) VALUES (%s, 1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                          %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                          %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (analise.id, *campos),
             )
@@ -183,6 +186,7 @@ class RepositorioAnalisesPostgres:
                 parecer_decisao = %s, parecer_nivel_risco = %s, parecer_score = %s,
                 parecer_comprometimento = %s, parecer_limite = %s,
                 parecer_justificativas = %s, parecer_politicas = %s,
+                revisao_solicitada_em = %s, revisao_solicitada_por = %s,
                 criada_em = %s, atualizada_em = %s
             WHERE id = %s AND versao = %s
             """,
@@ -347,7 +351,8 @@ class RepositorioAnalisesPostgres:
                 INSERT INTO decisao_retida (
                     analise_id, decisao, nivel_risco, score, comprometimento,
                     limite_recomendado, justificativas, politicas_aplicadas,
-                    faixa_valor, prazo_meses, decidida_em, identificacao_removida_em, motivo
+                    faixa_valor, prazo_meses, decidida_em, identificacao_removida_em,
+                    motivo, revisao_solicitada
                 )
                 SELECT
                     a.id, a.parecer_decisao, a.parecer_nivel_risco, a.parecer_score,
@@ -359,7 +364,8 @@ class RepositorioAnalisesPostgres:
                         WHEN a.proposta_valor < 200000 THEN '50k_200k'
                         ELSE 'acima_200k'
                     END,
-                    a.proposta_prazo, a.criada_em, %s, %s
+                    a.proposta_prazo, a.criada_em, %s, %s,
+                    a.revisao_solicitada_em IS NOT NULL
                 FROM analise a
                 WHERE a.id = %s AND a.parecer_decisao IS NOT NULL
                 ON CONFLICT (analise_id) DO NOTHING
@@ -441,6 +447,12 @@ class RepositorioAnalisesPostgres:
             erro=linha["erro"],
             reavaliacoes=int(linha["reavaliacoes"]),
             motivo_reavaliacao=linha["motivo_reavaliacao"],
+            revisao_solicitada_em=(
+                _como_datetime(linha["revisao_solicitada_em"])
+                if linha["revisao_solicitada_em"] is not None
+                else None
+            ),
+            revisao_solicitada_por=linha["revisao_solicitada_por"],
             criada_em=_como_datetime(linha["criada_em"]),
             atualizada_em=_como_datetime(linha["atualizada_em"]),
         )

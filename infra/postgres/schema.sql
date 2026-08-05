@@ -126,6 +126,14 @@ CREATE TABLE IF NOT EXISTS analise (
     parecer_justificativas  TEXT[] NOT NULL DEFAULT '{}',
     parecer_politicas       TEXT[] NOT NULL DEFAULT '{}',
 
+    -- Pedido de revisao da decisao automatizada (LGPD art. 20).
+    --
+    -- Data e nao booleano: o prazo de resposta conta da solicitacao, e "houve pedido" sem data nao
+    -- diz desde quando. `revisao_por` guarda o canal que registrou — o sujeito do token —, e nao o
+    -- titular: quem pede e sempre ele, e repetir isso seria guardar dado pessoal para nada.
+    revisao_solicitada_em  TIMESTAMPTZ,
+    revisao_solicitada_por TEXT,
+
     criada_em           TIMESTAMPTZ NOT NULL,
     atualizada_em       TIMESTAMPTZ NOT NULL
 );
@@ -269,7 +277,15 @@ CREATE TABLE IF NOT EXISTS decisao_retida (
     --
     -- A distincao e material numa fiscalizacao: pedido atendido tem prazo de resposta e o
     -- controlador precisa demonstrar que atendeu; expiracao por prazo e rotina.
-    motivo              TEXT        NOT NULL CHECK (motivo IN ('pedido_do_titular', 'prazo_vencido'))
+    motivo              TEXT        NOT NULL CHECK (motivo IN ('pedido_do_titular', 'prazo_vencido')),
+
+    -- Se houve pedido de revisao (art. 20) sobre esta decisao.
+    --
+    -- Booleano aqui e data na tabela `analise`, e a diferenca e proposital: o prazo de resposta so
+    -- importa enquanto o caso existe. No registro conservado o que interessa e "esta decisao foi
+    -- contestada?", que e material para auditoria de politica — e a data seria um quasi-identificador
+    -- a mais numa tabela que existe para nao ter nenhum.
+    revisao_solicitada  BOOLEAN     NOT NULL DEFAULT FALSE
 );
 
 -- Consulta por data de decisao, para relatorio de politica e para a propria purga.

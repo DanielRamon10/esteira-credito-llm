@@ -295,6 +295,31 @@ class AnaliseCredito:
     erro: str | None = None
     reavaliacoes: int = 0
     motivo_reavaliacao: str | None = None
+
+    # Pedido de revisao humana da decisao automatizada (LGPD art. 20).
+    #
+    # ## Por que campos proprios, e nao `reabrir_para_reavaliacao`
+    #
+    # A reabertura existe para **evidencia nova** e incrementa `reavaliacoes`, que tem teto de 5 —
+    # criado para impedir que alguem reenvie documento indefinidamente ate obter o parecer que quer.
+    #
+    # Reusar aquilo para o art. 20 erraria em tres pontos: limitaria um **direito** a cinco usos,
+    # poria a analise em `PROCESSANDO` quando nada esta sendo processado, e confundiria "chegou
+    # documento novo" com "o titular contestou".
+    #
+    # Por isso o pedido e ortogonal ao `status`: ele nao muda o ciclo de vida da analise, nao apaga
+    # o parecer e nao altera a decisao. Ele registra que um humano precisa olhar.
+    #
+    # ## Por que a data e o solicitante, e nao um booleano
+    #
+    # A data e o que faz o prazo de resposta existir; um booleano diria "houve pedido" sem dizer
+    # desde quando, e o prazo da LGPD conta da solicitacao.
+    #
+    # `revisao_solicitada_por` guarda o **sujeito do token** — o canal de atendimento que registrou
+    # o pedido —, e nao o titular: quem pede e sempre o titular, e repetir isso seria guardar dado
+    # pessoal para nao dizer nada. O que a trilha precisa saber e por qual canal entrou.
+    revisao_solicitada_em: datetime | None = None
+    revisao_solicitada_por: str | None = None
     id: UUID = field(default_factory=uuid4)
     criada_em: datetime = field(default_factory=_agora)
     atualizada_em: datetime = field(default_factory=_agora)
@@ -345,6 +370,55 @@ class AnaliseCredito:
         self.reavaliacoes += 1
         self.erro = None
         self.motivo_reavaliacao = motivo
+
+    def solicitar_revisao_humana(self, canal: str, agora: datetime | None = None) -> bool:
+        """Registra pedido de revisao da decisao automatizada. Devolve se este pedido e o primeiro.
+
+        LGPD art. 20: o titular tem direito a pedir revisao de decisao tomada unicamente por
+        tratamento automatizado que afete seus interesses — e credito e o exemplo que o proprio
+        artigo cita.
+
+        ## Exige parecer, e o erro e de transicao
+
+        Nao se contesta decisao que nao existe. Uma analise em `PENDENTE` ou `PROCESSANDO` ainda nao
+        decidiu nada, e aceitar o pedido ali criaria uma trilha de contestacao de nada — pior, o
+        prazo de resposta comecaria a contar antes de haver o que responder.
+
+        ## Idempotente, e a primeira data e a que vale
+
+        Pedido repetido nao sobrescreve `revisao_solicitada_em`. O prazo de resposta conta da
+        **primeira** solicitacao, e atualizar a data a cada reenvio daria ao controlador um jeito de
+        empurrar o prazo para frente reenviando o pedido do proprio titular.
+
+        Devolve `False` no repetido para a rota poder dizer "ja estava em revisao" em vez de sugerir
+        que abriu outra.
+
+        ## O que este metodo nao faz
+
+        Nao muda a decisao. Um pedido de revisao que aprovasse automaticamente seria absurdo, e um
+        que negasse seria pior; o que ele faz e tirar o caso do caminho automatico. Quem revisa e
+        uma pessoa, e o parecer atual continua visivel com a justificativa que o sustenta — que e a
+        outra metade do art. 20 (§1: informacao sobre os criterios).
+        """
+        if self.parecer is None:
+            raise TransicaoInvalida(
+                "Nao ha decisao a revisar: a analise esta em "
+                f"{self.status.value} e nenhum parecer foi emitido. O art. 20 trata de revisao de "
+                "decisao tomada, e nao de solicitacao em andamento."
+            )
+
+        if self.revisao_solicitada_em is not None:
+            return False
+
+        self.revisao_solicitada_em = agora if agora is not None else _agora()
+        self.revisao_solicitada_por = canal
+        self.atualizada_em = _agora()
+        return True
+
+    @property
+    def em_revisao_humana(self) -> bool:
+        """Se ha pedido de revisao pendente sobre esta analise."""
+        return self.revisao_solicitada_em is not None
 
     def anexar_documento(self, documento: DocumentoSubmetido) -> None:
         """Anexa um documento. Permitido antes ou durante o processamento.
