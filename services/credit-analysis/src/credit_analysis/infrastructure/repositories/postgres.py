@@ -40,6 +40,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from credit_analysis.domain.armazenamento import EstadoDocumento, Referencia
+from credit_analysis.domain.documento import OrigemDaRenda
 from credit_analysis.domain.entities import (
     AnaliseCredito,
     DadoExtraido,
@@ -179,8 +180,9 @@ class RepositorioAnalisesPostgres:
                     texto_extraido, confianca_ocr, motor_ocr, erro,
                     referencia_chave, referencia_versao,
                     injecao_suspeita, categorias_injecao, exige_revisao, renda_comprovada,
-                    submetido_em, ordem
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    renda_origem, submetido_em, ordem
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                          %s)
                 """,
                 (
                     doc.id,
@@ -199,6 +201,7 @@ class RepositorioAnalisesPostgres:
                     list(doc.categorias_injecao),
                     doc.exige_revisao_humana,
                     doc.renda_comprovada.valor if doc.renda_comprovada else None,
+                    doc.renda_origem.value if doc.renda_origem else None,
                     doc.submetido_em,
                     ordem,
                 ),
@@ -356,6 +359,9 @@ def _montar_documento(linha: dict[str, Any]) -> DocumentoSubmetido:
         injecao_suspeita=bool(linha["injecao_suspeita"]),
         categorias_injecao=tuple(linha["categorias_injecao"] or ()),
         exige_revisao_humana=bool(linha["exige_revisao"]),
+        renda_origem=(
+            OrigemDaRenda(linha["renda_origem"]) if linha["renda_origem"] is not None else None
+        ),
         renda_comprovada=(
             Dinheiro(linha["renda_comprovada"]) if linha["renda_comprovada"] is not None else None
         ),

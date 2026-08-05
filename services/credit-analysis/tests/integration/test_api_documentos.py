@@ -394,6 +394,65 @@ class TestQualidadeDeExtracao:
 
         assert corpo["renda_comprovada"] is None
         assert corpo["exige_revisao_humana"] is True
+        assert corpo["renda_origem"] is None
+
+    async def test_renda_apurada_pelo_bruto_exige_revisao_e_diz_a_origem(
+        self,
+        settings_teste: Settings,
+        repositorio: RepositorioAnalisesMemoria,
+        payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
+    ) -> None:
+        """A cadeia inteira do quarto gatilho, da entrada HTTP a resposta de polling.
+
+        O texto e o que o Tesseract produz sob `pouca_luz`: `L1QUID0` no lugar de `LIQUIDO`, com o
+        valor `7.262,14` intacto ao lado. Foi medido em `tests/eval/test_ocr_qualidade.py`.
+
+        O que este teste prende, e que os testes de unidade nao pegam:
+
+        - a confianca e **alta** (90%, acima do limiar de 85% da POL-002), entao o primeiro gatilho
+          de revisao nao dispara. Sem o quarto, este caso seguiria automatico;
+        - `renda_origem` chega ao cliente. Sem isso, quem recebe a resposta ve
+          `renda_comprovada: 8500.00` com `exige_revisao_humana: true` e nao tem como saber se a
+          revisao e por causa da renda ou por um dos outros tres motivos.
+        """
+        texto = (
+            "RECIBO DE PAGAMENTO DE SALARIO\n"
+            "INDUSTRIA BRASILEIRA DE COMPONENTES LTDA\n"
+            "CNPJ: 12.345.678/0001-90\n"
+            "Nome: MARIA OLIVEIRA SANTOS  Competencia: 06/2025\n"
+            "CPF: 529.982.247-25  Admissao: 15/03/2019\n"
+            "SALARIO BASE 8.500,00\n"
+            "INSS 876,02\n"
+            "VALOR L1QUID0 A RECEBER R$ 7.262,14\n"
+        )
+        with montar_client(settings_teste, repositorio, chaves_de_teste, texto_ocr=texto) as client:
+            aid = client.post("/v1/analises", json=payload_analise).json()["id"]
+            corpo = await enviar_e_processar(client, aid)
+
+        assert corpo["renda_origem"] == "base"
+        assert corpo["exige_revisao_humana"] is True
+        # O bruto, 17% acima do liquido de 7.262,14 que esta legivel no documento.
+        assert Decimal(corpo["renda_comprovada"]) == Decimal("8500.00")
+
+    async def test_renda_pelo_liquido_segue_automatico(
+        self,
+        settings_teste: Settings,
+        repositorio: RepositorioAnalisesMemoria,
+        payload_analise: dict[str, Any],
+        chaves_de_teste: Path,
+    ) -> None:
+        """O par negativo do teste acima, e ele importa tanto quanto.
+
+        Um gatilho de revisao que dispara sempre nao e um gatilho: e uma esteira manual. Este teste
+        e o que garante que o caso normal continua passando sem analista.
+        """
+        with montar_client(settings_teste, repositorio, chaves_de_teste) as client:
+            aid = client.post("/v1/analises", json=payload_analise).json()["id"]
+            corpo = await enviar_e_processar(client, aid)
+
+        assert corpo["renda_origem"] == "liquido"
+        assert corpo["exige_revisao_humana"] is False
 
 
 class TestInjecaoDePrompt:

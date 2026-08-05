@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from credit_analysis.application.use_cases.processar_documento import ResultadoProcessamento
 from credit_analysis.domain.agente import PassoAgente, TrilhaAgente
 from credit_analysis.domain.armazenamento import EstadoDocumento
-from credit_analysis.domain.documento import CampoExtraido, QualidadeExtracao
+from credit_analysis.domain.documento import CampoExtraido, OrigemDaRenda, QualidadeExtracao
 from credit_analysis.domain.entities import (
     AnaliseCredito,
     DadoExtraido,
@@ -579,6 +579,24 @@ class DocumentoEstadoResponse(BaseModel):
     # `renda_mediana_extrato`), regra que mora no dominio.
     renda_comprovada: Decimal | None = None
 
+    # De que campo aquele numero saiu.
+    #
+    # Sem isto, `renda_comprovada` diz "quanto" e nao diz "de que" — e os dois nao valem o mesmo: o
+    # liquido paga parcela, o bruto e ~20% maior. Um cliente que recebe `renda_origem: "base"` sabe
+    # que o valor e o salario bruto, e nao precisa deduzir isso do fato de `exige_revisao_humana`
+    # estar ligado (que pode estar ligado por outros tres motivos).
+    #
+    # `null` em extrato bancario nao e informacao faltando: la a renda e a mediana dos creditos, e a
+    # distincao bruto/liquido nao existe.
+    renda_origem: OrigemDaRenda | None = Field(
+        default=None,
+        description=(
+            "De qual campo do holerite a renda apurada saiu: `liquido` (o que entra na conta) ou "
+            "`base` (o bruto, ~20% maior). Quando `base`, o caso vai para revisao humana — o valor "
+            "e verdadeiro, mas nao e o que a POL-005 manda usar. `null` para extrato bancario."
+        ),
+    )
+
     # ## Os campos de auditoria voltaram para ca
     #
     # No fluxo sincrono eles vinham em `DocumentoProcessadoResponse`, na mesma requisicao. Com
@@ -637,6 +655,7 @@ class DocumentoEstadoResponse(BaseModel):
             renda_comprovada=(
                 documento.renda_comprovada.valor if documento.renda_comprovada is not None else None
             ),
+            renda_origem=documento.renda_origem,
             exige_revisao_humana=documento.exige_revisao_humana,
             injecao_suspeita=documento.injecao_suspeita,
             categorias_injecao=list(documento.categorias_injecao),

@@ -40,6 +40,7 @@ from credit_analysis.application.ports import ConsultaBureau, RepositorioAnalise
 from credit_analysis.domain import scoring
 from credit_analysis.domain.documento import (
     ExtracaoHolerite,
+    OrigemDaRenda,
     QualidadeExtracao,
     ResultadoOCR,
 )
@@ -111,15 +112,53 @@ class ResultadoProcessamento:
     def exige_revisao_humana(self) -> bool:
         """Se o caso nao pode seguir sem um analista olhar.
 
-        Tres gatilhos: qualidade de extracao na faixa de revisao (POL-002 secao
-        3.2), tentativa de injecao detectada no documento, e ausencia de renda
-        apurada num documento que deveria conte-la.
+        Quatro gatilhos: qualidade de extracao na faixa de revisao (POL-002 secao 3.2), injecao
+        detectada no documento, ausencia de renda apurada num documento que deveria conte-la, e
+        **renda apurada pelo salario bruto**.
+
+        ## O quarto gatilho, e a medicao que o produziu
+
+        Os tres primeiros cobrem "o documento nao foi lido bem" e "o documento e hostil". O quarto
+        cobre um caso que passava por confiavel: sob degradacao leve (`pouca_luz`) o Tesseract saia
+        com 88,97% — acima do limiar de 85% — e a renda apurada ficava 17% acima da real
+        (R$ 8.500,00 contra R$ 7.262,14), porque o liquido nao casava e a renda caia para o bruto.
+
+        Nenhum dos tres primeiros pegava isso: a qualidade era confiavel, nao havia injecao, e havia
+        renda apurada — a errada.
+
+        Aquele caso foi corrigido na origem (o OCR escrevia `7.262 , 14` e o padrao de valor nao
+        tolerava espaco em volta da virgula), mas o gatilho nao existe por causa dele: ele existe
+        para quando o liquido e ilegivel de verdade, e ai a queda para o bruto e a leitura correta
+        de um documento incompleto.
+
+        A direcao do erro e o que torna o gatilho obrigatorio: renda superestimada aprova credito
+        que deveria ser negado. O caminho oposto (renda subestimada) nega credito bom, o que e ruim
+        de outra forma e nao coloca inadimplencia na carteira.
+
+        ## Por que revisao e nao rejeicao
+
+        Rejeitar o documento por um rotulo ilegivel custaria disponibilidade num documento cujo
+        conteudo esta la. O bruto e um numero **verdadeiro**, so nao e o que a POL-005 manda usar —
+        um analista resolve isso olhando a imagem em segundos.
         """
         if self.ocr.qualidade is not QualidadeExtracao.CONFIAVEL:
             return True
         if self.conteudo is not None and self.conteudo.suspeito:
             return True
+        if self.renda_veio_do_salario_base:
+            return True
         return self.renda_comprovada is None
+
+    @property
+    def renda_veio_do_salario_base(self) -> bool:
+        """Se a renda apurada e o salario bruto em vez do liquido.
+
+        Somente para holerite: no extrato a renda e a mediana dos creditos, e nao ha equivalente de
+        "bruto" para confundir com ela.
+        """
+        if self.extracao_holerite is None:
+            return False
+        return self.extracao_holerite.origem_da_renda is OrigemDaRenda.BASE
 
 
 class AplicarExtracao:
@@ -234,6 +273,7 @@ class AplicarExtracao:
             motor_ocr=comando.ocr.motor,
             exige_revisao_humana=resultado.exige_revisao_humana,
             renda_comprovada=resultado.renda_comprovada,
+            renda_origem=extracao.origem_da_renda if extracao is not None else None,
         )
 
         # Reavalia com a renda comprovada. E o ponto do documento existir: sem isto a extracao

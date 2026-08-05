@@ -38,6 +38,7 @@ from psycopg_pool import AsyncConnectionPool
 from credit_analysis.application.ports import BuscaPorDocumento, RepositorioAnalises
 from credit_analysis.config import get_settings
 from credit_analysis.domain.armazenamento import EstadoDocumento, Referencia
+from credit_analysis.domain.documento import OrigemDaRenda
 from credit_analysis.domain.entities import (
     AnaliseCredito,
     DadoExtraido,
@@ -559,6 +560,74 @@ class TestBuscaPorDocumento:
         """
         assert isinstance(repositorio, BuscaPorDocumento)
         assert isinstance(repositorio, RepositorioAnalises)
+
+
+class TestOrigemDaRenda:
+    """A distincao liquido/bruto tem que sobreviver ao restart.
+
+    E o que faz a diferenca entre "a renda deste parecer era liquida?" ser respondivel por consulta
+    ou exigir reprocessar uma imagem que pode nao existir mais.
+    """
+
+    async def test_origem_sobrevive_a_ida_e_volta(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        analise = fazer_analise(com_documento=True)
+        analise.documentos[0].renda_comprovada = Dinheiro.de("8500.00")
+        analise.documentos[0].renda_origem = OrigemDaRenda.BASE
+        analise.documentos[0].exige_revisao_humana = True
+        await repositorio.salvar(analise)
+
+        lida = await repositorio.buscar_por_id(analise.id)
+
+        assert lida is not None
+        assert lida.documentos[0].renda_origem is OrigemDaRenda.BASE
+        assert lida.documentos[0].exige_revisao_humana is True
+
+    async def test_extrato_grava_origem_nula(
+        self, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """`NULL` e valido e significa "a distincao nao se aplica", nao "faltou gravar".
+
+        Extrato bancario apura renda pela mediana dos creditos, e nao existe um bruto para
+        confundir com ela. Sem este teste, um `NOT NULL DEFAULT 'liquido'` posto por descuido faria
+        todo extrato afirmar que a renda dele e liquida — afirmacao sem sentido, e falsa por vir de
+        um default.
+        """
+        analise = fazer_analise(com_documento=True)
+        analise.documentos[0].tipo = TipoDocumento.EXTRATO_BANCARIO
+        analise.documentos[0].renda_comprovada = Dinheiro.de("8032.14")
+        analise.documentos[0].renda_origem = None
+        await repositorio.salvar(analise)
+
+        lida = await repositorio.buscar_por_id(analise.id)
+
+        assert lida is not None
+        assert lida.documentos[0].renda_origem is None
+        assert lida.documentos[0].renda_comprovada is not None
+
+    async def test_o_banco_recusa_origem_fora_do_dominio(
+        self, pool: AsyncConnectionPool, repositorio: RepositorioAnalisesPostgres
+    ) -> None:
+        """O `CHECK` da coluna, e por que ele nao e redundante com o StrEnum.
+
+        O enum protege o caminho da aplicacao. O banco tem outros: uma migracao, um script de
+        correcao, um `UPDATE` manual num incidente. `renda_origem = 'bruto'` — sinonimo plausivel de
+        `base` — passaria em qualquer um deles e o `OrigemDaRenda(...)` da leitura levantaria
+        `ValueError` depois, na hora de montar o agregado, com um erro longe da causa.
+        """
+        analise = fazer_analise(com_documento=True)
+        await repositorio.salvar(analise)
+
+        # `pytest.raises` dentro do `async with`, e nao ao lado: ele nao e um gerenciador de
+        # contexto assincrono, e combinar os dois num unico `async with` estoura com um TypeError
+        # sobre protocolo — erro que nao tem relacao com o que o teste mede.
+        async with pool.connection() as conexao:
+            with pytest.raises(Exception, match="renda_origem"):
+                await conexao.execute(
+                    "UPDATE documento SET renda_origem = %s WHERE id = %s",
+                    ("bruto", analise.documentos[0].id),
+                )
 
 
 class TestLGPD:

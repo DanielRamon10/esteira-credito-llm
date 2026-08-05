@@ -72,7 +72,6 @@ esteira de crédito não pode errar.
 
 | Caso | Confiança | Realidade |
 |---|---|---|
-| Holerite com pouca luz | 88,97% (acima do limiar) | perdeu o salário líquido — falso positivo |
 | Extrato limpo | 81,93% (abaixo do limiar) | 24 de 24 lançamentos — falso negativo |
 
 Tabela densa de números monoespacados recebe score por palavra mais baixo que
@@ -82,15 +81,31 @@ confiança como sinal secundário.
 Estes números foram remedidos em 2026-08 contra uma imagem **determinística** — a
 fonte é versionada no repositório e o `layout_engine` do Pillow é fixo, então o
 documento é byte-a-byte igual em qualquer máquina. Antes disso a medição dependia
-de qual fonte o sistema tinha, e as duas entradas da tabela eram outras.
+de qual fonte o sistema tinha.
 
-**O falso positivo virou um defeito com nome.** Sob pouca luz o valor `7.262,14`
-continua legível no texto; o que o OCR corrompe é o rótulo "LÍQUIDO", e o extrator
-exige o rótulo. `renda_comprovada` então cai para o salário base — R$ 8.500,00 em
-vez de R$ 7.262,14, 17% acima, na direção que aprova crédito que não deveria — e
-como `completa` fica `True`, nada escala. Está registrado como `xfail(strict=True)`
-em `test_pouca_luz_infla_a_renda_pela_queda_para_o_salario_base`, aguardando decisão
-de domínio.
+A tabela tinha um segundo caso, um falso positivo, e ele **deixou de existir** —
+porque a medição determinística expôs dois defeitos que o escondiam:
+
+1. a coluna de data invadia a de histórico no gerador (`m + 150` fixos contra uma
+   data de ~169px), e isso penalizava a leitura em toda degradação;
+2. o padrão de valor não tolerava o espaço que o OCR insere em volta da vírgula.
+   Sob pouca luz o Tesseract escreve `R$ 7.262 , 14` — o rótulo sai perfeito, o
+   número não —, o campo não casava, e `renda_comprovada` caía para o salário
+   base: R$ 8.500,00 em vez de R$ 7.262,14, **17% acima**, na direção que aprova
+   crédito que não deveria. E como `completa` ficava `True`, nada escalava.
+
+O segundo custou um erro de diagnóstico que vale registrar: a primeira leitura
+concluiu que o rótulo estava corrompido e o valor intacto, e a correção foi
+construída sobre isso. Só ao afirmar `"7.262,14" in ocr.texto` num teste ficou
+claro que era o contrário.
+
+**A rede de segurança ficou, porque a classe do problema não era o espaço.** O
+líquido pode ser ilegível de verdade — rótulo apagado, coluna cortada, holerite que
+só imprime o bruto. Nesses casos a renda ainda cai para o bruto, e agora isso é
+dito: `documento.renda_origem` registra de qual campo o número saiu, é persistido e
+exposto no polling, e um caso apurado pelo bruto vai para revisão humana (quarto
+gatilho de `exige_revisao_humana`). `holerite_suficiente` passou a exigir o líquido,
+então a cadeia tenta um motor melhor quando existe um.
 
 ## Agente com ferramentas (Camada 4)
 

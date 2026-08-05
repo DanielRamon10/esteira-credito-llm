@@ -13,6 +13,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from credit_analysis.domain.armazenamento import EstadoDocumento, Referencia
+from credit_analysis.domain.documento import OrigemDaRenda
 from credit_analysis.domain.enums import (
     Decisao,
     NivelRisco,
@@ -148,6 +149,20 @@ class DocumentoSubmetido:
     # E este e o numero que alimentou o score: guarda-lo aqui e o que permite responder "de onde
     # veio a renda deste parecer?" sem reexecutar a interpretacao.
     renda_comprovada: Dinheiro | None = None
+
+    # **Qual** campo do holerite produziu a renda acima — o liquido ou o bruto.
+    #
+    # Sem isto, `renda_comprovada` responde "quanto" e nao responde "de que". Os dois nao valem o
+    # mesmo: o liquido e o que entra na conta e paga parcela, o bruto e ~20% maior e superestima a
+    # capacidade de pagamento.
+    #
+    # Gravado, e nao apenas usado na decisao de revisao, porque a pergunta e de auditoria: um caso
+    # aprovado meses atras precisa poder dizer se a renda que o sustentou era liquida. Deduzir
+    # depois exigiria reprocessar a imagem, que pode nao existir mais.
+    #
+    # `None` para extrato bancario: la a renda e a mediana dos creditos, e nao existe um "bruto"
+    # para confundir com ela. Nao e ausencia de informacao — e ausencia da distincao.
+    renda_origem: OrigemDaRenda | None = None
     id: UUID = field(default_factory=uuid4)
     submetido_em: datetime = field(default_factory=_agora)
 
@@ -180,6 +195,7 @@ class DocumentoSubmetido:
         motor_ocr: str | None = None,
         exige_revisao_humana: bool = False,
         renda_comprovada: Dinheiro | None = None,
+        renda_origem: OrigemDaRenda | None = None,
     ) -> None:
         self.texto_extraido = texto
         self.confianca_ocr = confianca
@@ -190,6 +206,7 @@ class DocumentoSubmetido:
         self.motor_ocr = motor_ocr
         self.exige_revisao_humana = exige_revisao_humana
         self.renda_comprovada = renda_comprovada
+        self.renda_origem = renda_origem
 
     def rejeitar_por_qualidade(self, motivo: str, confianca: Percentual) -> None:
         """Reprovado no piso da POL-002. O texto extraido **e preservado**.

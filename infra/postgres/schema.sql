@@ -165,6 +165,20 @@ CREATE TABLE IF NOT EXISTS documento (
     exige_revisao       BOOLEAN     NOT NULL DEFAULT FALSE,
     renda_comprovada    NUMERIC(15,2),
 
+    -- De qual campo do holerite a renda saiu: 'liquido' ou 'base'.
+    --
+    -- `renda_comprovada` responde "quanto" e nao responde "de que", e os dois nao valem o mesmo: o
+    -- liquido e o que entra na conta e paga parcela, o bruto e ~20% maior. Um caso aprovado meses
+    -- atras precisa poder dizer qual sustentou o parecer, e deduzir depois exigiria reprocessar uma
+    -- imagem que pode nao existir mais.
+    --
+    -- TEXT com CHECK e nao ENUM do Postgres: adicionar valor a um ENUM exige `ALTER TYPE`, que em
+    -- versoes anteriores a 12 nao roda dentro de transacao — e o dominio desta coluna pode crescer
+    -- (um extrato com renda por mediana, um informe de rendimentos).
+    --
+    -- NULL e valido e significativo: extrato bancario nao tem a distincao bruto/liquido.
+    renda_origem        TEXT        CHECK (renda_origem IN ('liquido', 'base')),
+
     submetido_em        TIMESTAMPTZ NOT NULL,
     -- Ordem estavel dentro do agregado. Sem ela, `SELECT` sem `ORDER BY` devolve
     -- em ordem arbitraria, e `analise.documentos[0]` num teste passaria ou falharia

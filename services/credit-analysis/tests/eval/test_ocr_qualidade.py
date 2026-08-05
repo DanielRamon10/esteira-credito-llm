@@ -26,7 +26,7 @@ Holerite, 5 campos de ground truth (contagem por `contar_campos`):
     foto_tremida       89,06 confiavel 5/5   94,41 confiavel 5/5
     documento_torto    90,49 confiavel 5/5   94,91 confiavel 5/5
     baixa_resolucao    90,04 confiavel 5/5   94,53 confiavel 5/5
-    pouca_luz          88,97 confiavel 4/5   92,75 confiavel 4/5   <- falso positivo
+    pouca_luz          88,97 confiavel 5/5   92,75 confiavel 5/5
     scanner_ruidoso    73,99 revisao    3/5  75,55 revisao    2/5
     foto_ruim          67,65 revisao    1/5  69,31 revisao    2/5
 
@@ -43,10 +43,9 @@ metrica que premiava leitura pior, com teto real de 4/5. Ver `campos_esperados`.
 **A confianca do Tesseract e um bom preditor, mas nao suficiente.** Continua valendo,
 e os casos mudaram de lugar:
 
-- *Falso positivo* — agora e `pouca_luz`, com 88,97% (acima do limiar de 85% da
-  POL-002) e perdendo o **salario liquido**. O `baixa_resolucao`, que ocupava este
-  papel, passou a ler 5/5: a imagem antiga estava malformada, com a coluna de data
-  invadindo a de historico, e isso penalizava a leitura em toda degradacao.
+- *Falso positivo* — **nao ha mais nenhum**. O `baixa_resolucao` ocupava esse papel e
+  passou a ler 5/5, e o `pouca_luz` o ocupou por um tempo e tambem le 5/5 agora. As duas
+  correcoes que produziram isso estao descritas abaixo.
 - *Falso negativo* — o extrato limpo sai com 81,93% no engine local apesar de ler
   **24 de 24**. Tabela densa de numeros monoespacados recebe score por palavra mais
   baixo que prosa, e uma extracao perfeita iria para revisao humana. No 5.5.0 o mesmo
@@ -60,21 +59,48 @@ afirmam **sinalizacao** (`revisao_humana`) em vez de contagem.
 E por isso que `MotorOCRComEscalonamento` decide por **suficiencia de campos** e
 usa a confianca como sinal secundario.
 
-## O defeito que esta medicao encontrou
+## Os dois defeitos que esta medicao encontrou
 
-`pouca_luz` nao perde o **valor** do salario liquido — `7.262,14` esta no texto. O
-que o OCR corrompe e o **rotulo** "LIQUIDO", e `_PADROES_HOLERITE` exige o rotulo
-para casar o campo.
+**1. A coluna de data invadia a de historico.** `m + 150` fixos contra uma data que mede
+~169px na fonte versionada. Sem espaco em branco entre as colunas, o Tesseract nao emitia
+separacao e o parser de extrato descartava a linha inteira: 0 lancamentos de 24, com 0
+rejeitados. Corrigido medindo a largura da coluna; e o que fez `baixa_resolucao` deixar de
+perder campo.
 
-O que acontece depois e o problema: `ExtracaoHolerite.renda_comprovada` cai para o
-salario base, e a renda apurada vira R$ 8.500,00 em vez de R$ 7.262,14 — **17% acima**,
-na direcao que aprova credito que nao deveria. E como `completa` fica True,
-`holerite_suficiente` diz que o documento serve e **nada escala**.
+**2. O padrao de valor nao tolerava espaco em volta da virgula.** Sob `pouca_luz` o
+Tesseract escreve
 
-Ver `test_pouca_luz_infla_a_renda_pela_queda_para_o_salario_base`, marcado como
-`xfail(strict=True)`: ele afirma o comportamento correto e falha enquanto o defeito
-existir — e passa a acusar XPASS no dia em que for corrigido, o que impede a correcao
-de sair sem que o teste seja revisto.
+    VALOR LIQUIDO A RECEBER R$ 7.262 , 14
+
+O rotulo sai **perfeito** — o que ele quebra e o numero. O campo nao casava,
+`renda_comprovada` caia para o salario base, e a renda apurada ficava em R$ 8.500,00 contra
+R$ 7.262,14: **17% acima**, na direcao que aprova credito que nao deveria. Pior, `completa`
+ficava True e `holerite_suficiente` dizia que o documento servia, entao **nada escalava**.
+
+Aqui houve um erro de diagnostico que vale registrar: a primeira leitura desta medicao
+concluiu que o **rotulo** estava corrompido e o valor intacto, e a correcao foi construida
+em cima disso — sinalizar a origem da renda e mandar para revisao humana. So ao afirmar
+`"7.262,14" in ocr.texto` num teste ficou claro que era o contrario. Ler o numero certo e
+melhor que sinalizar o errado, e `_VALOR` passou a tolerar o espaco.
+
+## A rede de seguranca ficou, e por que
+
+A queda para o bruto e alcancavel sempre que o liquido for ilegivel **de verdade** — rotulo
+apagado, coluna cortada na digitalizacao, holerite que so imprime o bruto. O que a correcao
+de `_VALOR` removeu foi um gatilho por espaco, nao a classe:
+
+- `ExtracaoHolerite.origem_da_renda` diz de qual campo o numero saiu, e e propriedade
+  derivada da mesma condicao que escolhe o valor — as duas nao tem como divergir;
+- `holerite_suficiente` passou a exigir o liquido: a cadeia tenta um motor melhor quando ha
+  um, porque existe numero melhor na imagem;
+- `ResultadoProcessamento.exige_revisao_humana` ganhou um quarto gatilho, e um caso apurado
+  pelo bruto vai para o analista;
+- `documento.renda_origem` e persistido e exposto na resposta de polling, para a pergunta de
+  auditoria "a renda deste parecer era liquida?" nao exigir reprocessar a imagem.
+
+Estes quatro sao exercitados com **texto fixo** em `tests/unit/test_extracao_ocr.py` e
+`tests/integration/test_api_documentos.py`, e nao por degradacao de imagem: a decisao nao
+depende de OCR, e nao deveria depender do engine instalado para ser testada.
 """
 
 from __future__ import annotations
@@ -88,7 +114,10 @@ import pytest
 from credit_analysis.domain.documento import QualidadeExtracao
 from credit_analysis.domain.exceptions import DadosInsuficientes
 from credit_analysis.domain.extrato import analisar_extrato
-from credit_analysis.infrastructure.ocr.extracao import extrair_holerite, extrair_transacoes
+from credit_analysis.infrastructure.ocr.extracao import (
+    extrair_holerite,
+    extrair_transacoes,
+)
 from credit_analysis.infrastructure.ocr.tesseract import OCRTesseract, localizar_binario
 from tests.apoio.documentos_sinteticos import PERFIS, Degradacao, ExtratoBancario, Holerite
 
@@ -213,63 +242,24 @@ class TestHoleriteLimpo:
 
 
 class TestDegradacoes:
-    @pytest.mark.parametrize("nome_perfil", ["foto_tremida", "documento_torto", "baixa_resolucao"])
+    @pytest.mark.parametrize(
+        "nome_perfil", ["foto_tremida", "documento_torto", "baixa_resolucao", "pouca_luz"]
+    )
     async def test_degradacao_leve_mantem_a_renda(
         self, motor: OCRTesseract, holerite: Holerite, nome_perfil: str
     ) -> None:
         """Perfis que o pre-processamento consegue compensar.
 
-        `pouca_luz` **saiu desta lista** com a imagem deterministica: ele mantem um valor de renda,
-        e o valor esta errado. Ver
-        `test_pouca_luz_infla_a_renda_pela_queda_para_o_salario_base`.
+        `pouca_luz` saiu desta lista e **voltou**, e a ida e a volta valem mais que o teste: ele
+        passou a apurar pelo salario bruto quando a imagem virou deterministica, e a causa nao era
+        degradacao demais — era o padrao de valor nao tolerar o espaco que o OCR insere em volta da
+        virgula (`7.262 , 14`). Ver `_VALOR` em `infrastructure/ocr/extracao.py`.
         """
         perfil = PERFIS_POR_NOME[nome_perfil]
         ocr = await motor.extrair(np.asarray(perfil.aplicar(holerite.renderizar())))
         extracao = extrair_holerite(ocr)
 
         assert extracao.renda_comprovada is not None, f"perdeu a renda em {nome_perfil}"
-        assert extracao.renda_comprovada.valor == holerite.salario_liquido
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Defeito conhecido: com o rotulo LIQUIDO corrompido, renda_comprovada cai para o "
-            "salario base e infla a renda 17% sem escalar. Decisao de dominio pendente — ver o "
-            "cabecalho deste modulo."
-        ),
-    )
-    async def test_pouca_luz_infla_a_renda_pela_queda_para_o_salario_base(
-        self, motor: OCRTesseract, holerite: Holerite
-    ) -> None:
-        """O pior desfecho possivel para esta esteira, e ele esta alcancavel hoje.
-
-        A cadeia medida, com a imagem deterministica:
-
-        1. `pouca_luz` sai com 88,97% — acima do limiar de 85% da POL-002, classificado
-           `CONFIAVEL`;
-        2. o **valor** `7.262,14` esta no texto; o que o OCR corrompe e o rotulo "LIQUIDO";
-        3. `_PADROES_HOLERITE["salario_liquido"]` exige o rotulo, entao o campo nao casa;
-        4. `renda_comprovada` cai para o salario base: **R$ 8.500,00 em vez de R$ 7.262,14**, 17%
-           acima, na direcao que aprova credito que nao deveria;
-        5. `completa` fica True, `holerite_suficiente` diz que o documento serve, e **nada escala**
-           para o modelo de visao nem para revisao humana.
-
-        Nenhum passo isolado e absurdo. A queda para o salario base e deliberada — o docstring de
-        `renda_comprovada` explica a precedencia — e ele mesmo nomeia o dano: "usar o bruto infla a
-        capacidade de pagamento em ~20%". O que nao existia era a medicao de que a queda
-        acontece **em silencio**, com confianca alta, num perfil de degradacao leve.
-
-        `xfail(strict=True)` e nao um teste que afirma o comportamento atual: este teste descreve o
-        que **deveria** valer. Enquanto o defeito existir ele falha de forma esperada; no dia em que
-        for corrigido, ele acusa XPASS e obriga quem corrigiu a passar por aqui.
-        """
-        ocr = await motor.extrair(
-            np.asarray(PERFIS_POR_NOME["pouca_luz"].aplicar(holerite.renderizar()))
-        )
-        extracao = extrair_holerite(ocr)
-
-        # A renda ou e a liquida, ou nao existe — nunca a bruta fantasiada de liquida.
-        assert extracao.renda_comprovada is not None
         assert extracao.renda_comprovada.valor == holerite.salario_liquido
 
     @pytest.mark.parametrize("nome_perfil", ["scanner_ruidoso", "foto_ruim"])

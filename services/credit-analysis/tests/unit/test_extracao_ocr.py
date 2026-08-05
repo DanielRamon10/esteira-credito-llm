@@ -14,7 +14,7 @@ from decimal import Decimal
 import numpy as np
 import pytest
 
-from credit_analysis.domain.documento import ResultadoOCR
+from credit_analysis.domain.documento import OrigemDaRenda, ResultadoOCR
 from credit_analysis.domain.value_objects import Percentual
 from credit_analysis.infrastructure.ocr.escalonamento import MotorOCRComEscalonamento
 from credit_analysis.infrastructure.ocr.extracao import (
@@ -306,12 +306,157 @@ DATA HISTORICO VALOR SALDO
         assert rejeitadas == []
 
 
+# O texto real que o Tesseract produz sob o perfil `pouca_luz`: o rotulo sai **perfeito** e o que
+# ele quebra e o numero, inserindo espaco em volta da virgula.
+HOLERITE_VALOR_ESPACADO = """\
+RECIBO DE PAGAMENTO DE SALARIO
+INDUSTRIA BRASILEIRA DE COMPONENTES LTDA
+CNPJ: 12.345.678/0001-90
+Nome: MARIA OLIVEIRA SANTOS  Competencia: 06/2025
+CPF: 529.982.247-25  Admissao: 15/03/2019
+SALARIO BASE 8.500,00
+INSS 876,02
+VALOR LIQUIDO A RECEBER R$ 7.262 , 14
+"""
+
+# Aqui sim o rotulo esta ilegivel — o caso que sobra para a rede de seguranca cobrir.
+HOLERITE_SEM_ROTULO_LIQUIDO = """\
+RECIBO DE PAGAMENTO DE SALARIO
+INDUSTRIA BRASILEIRA DE COMPONENTES LTDA
+CNPJ: 12.345.678/0001-90
+Nome: MARIA OLIVEIRA SANTOS  Competencia: 06/2025
+CPF: 529.982.247-25  Admissao: 15/03/2019
+SALARIO BASE 8.500,00
+INSS 876,02
+VALOR L1QUID0 A RECEBER R$ 7.262,14
+"""
+
+
+class TestValorComEspaco:
+    """O defeito que a avaliacao de OCR encontrou, com o texto exato que ela produziu.
+
+    Fica aqui e nao no eval porque o eval mede **acuracia de OCR** e depende do engine instalado;
+    o que este teste mede e a interpretacao de um texto fixo, que nao depende de nada.
+    """
+
+    def test_espaco_em_volta_da_virgula_nao_perde_o_valor(self) -> None:
+        """`R$ 7.262 , 14` e o que o Tesseract escreve em imagem escura.
+
+        Binarizacao adaptativa engrossa os tracos, a virgula vira um blob, e o segmentador a separa
+        dos digitos vizinhos. O padrao antigo (`\\d{1,3}(?:\\.\\d{3})*,\\d{2}`) nao casava, o campo
+        sumia, e a renda caia para o salario bruto: R$ 8.500,00 contra R$ 7.262,14, **17% acima** e
+        na direcao que aprova credito que nao deveria.
+        """
+        extracao = extrair_holerite(ocr(HOLERITE_VALOR_ESPACADO))
+
+        assert extracao.salario_liquido is not None
+        assert extracao.origem_da_renda is OrigemDaRenda.LIQUIDO
+        assert extracao.renda_comprovada is not None
+        assert extracao.renda_comprovada.valor == Decimal("7262.14")
+
+    def test_valor_espacado_e_suficiente_e_nao_escala(self) -> None:
+        """Ler o numero certo tambem evita escalonamento desnecessario.
+
+        Sem a tolerancia, `holerite_suficiente` era False e a cadeia tentava o modelo de visao — um
+        motor caro acionado por um espaco em branco.
+        """
+        assert holerite_suficiente(HOLERITE_VALOR_ESPACADO)
+
+    def test_espaco_nao_atravessa_fim_de_linha(self) -> None:
+        """O defeito que a tolerancia poderia introduzir, e por que o padrao usa `[^\\S\\n]`.
+
+        Com `\\s*`, o milhar de uma linha casaria com os centavos da seguinte e o parser inventaria
+        um valor a partir de duas linhas diferentes — aqui, `8.500` e `00` viram `8.500,00` num
+        documento que nao tem esse numero.
+        """
+        texto = "SALARIO BASE 8.500\nLIQUIDO , 00 A RECEBER\n"
+        extracao = extrair_holerite(ocr(texto))
+
+        assert extracao.salario_base is None
+        assert extracao.renda_comprovada is None
+
+
+class TestOrigemDaRenda:
+    """De qual campo a renda saiu, e por que a distincao vale um campo proprio."""
+
+    def test_holerite_completo_apura_pelo_liquido(self) -> None:
+        extracao = extrair_holerite(ocr(HOLERITE_OK))
+
+        assert extracao.origem_da_renda is OrigemDaRenda.LIQUIDO
+        assert extracao.renda_comprovada is not None
+        assert extracao.renda_comprovada.valor == Decimal("7262.14")
+
+    def test_rotulo_liquido_ilegivel_cai_para_o_bruto_e_diz_isso(self) -> None:
+        """Liquido ilegivel de verdade: o rotulo saiu `L1QUID0` e nao ha o que casar.
+
+        Este **nao** e o caso que o perfil `pouca_luz` produzia — la o rotulo saia perfeito e o que
+        quebrava era o numero (`7.262 , 14`), corrigido em `_VALOR`. Aqui a corrupcao e no rotulo, e
+        nao ha como recuperar o campo: a renda cai para o bruto.
+
+        A queda continua acontecendo, e e deliberada: recusar um documento legivel por causa de um
+        rotulo custaria disponibilidade. O que mudou e que ela deixou de ser muda.
+        """
+        extracao = extrair_holerite(ocr(HOLERITE_SEM_ROTULO_LIQUIDO))
+
+        assert extracao.salario_liquido is None
+        assert extracao.origem_da_renda is OrigemDaRenda.BASE
+        assert extracao.renda_comprovada is not None
+        # 8.500,00 e o bruto: 17% acima do liquido real de 7.262,14.
+        assert extracao.renda_comprovada.valor == Decimal("8500.00")
+
+    def test_sem_renda_nenhuma_a_origem_e_none(self) -> None:
+        """`None` distingue "nao apurei" de "apurei pelo bruto" — acoes diferentes."""
+        extracao = extrair_holerite(ocr("RECIBO\nNome: JOAO DA SILVA\n"))
+
+        assert extracao.origem_da_renda is None
+        assert extracao.renda_comprovada is None
+
+    def test_a_origem_nao_pode_divergir_da_renda(self) -> None:
+        """As duas propriedades derivam da mesma condicao, e este teste e o que prende isso.
+
+        Um campo `origem` gravado por quem constroi a extracao poderia discordar do valor que
+        `renda_comprovada` devolveu — bastaria a ordem de precedencia mudar num lugar e nao no
+        outro, e o parecer diria "liquido" sobre um numero bruto. Pior que nao ter o campo.
+        """
+        for texto in (HOLERITE_OK, HOLERITE_SEM_ROTULO_LIQUIDO, "RECIBO\nNome: JOAO\n"):
+            extracao = extrair_holerite(ocr(texto))
+            esperado = (
+                {
+                    OrigemDaRenda.LIQUIDO: extracao.salario_liquido,
+                    OrigemDaRenda.BASE: extracao.salario_base,
+                }.get(extracao.origem_da_renda)
+                if extracao.origem_da_renda
+                else None
+            )
+
+            if extracao.renda_comprovada is None:
+                assert extracao.origem_da_renda is None
+            else:
+                assert esperado is not None
+                assert esperado.valor_monetario == extracao.renda_comprovada
+
+
 class TestSuficiencia:
     def test_holerite_completo_e_suficiente(self) -> None:
         assert holerite_suficiente(HOLERITE_OK)
 
     def test_holerite_sem_renda_nao_e_suficiente(self) -> None:
         assert not holerite_suficiente("RECIBO\nNome: JOAO DA SILVA\n")
+
+    def test_renda_apenas_pelo_bruto_nao_e_suficiente(self) -> None:
+        """Aqui a exigencia e mais alta que em `ExtracaoHolerite.completa`, e de proposito.
+
+        `completa` responde "da para emitir parecer?" e aceita o bruto. Esta funcao responde "vale a
+        pena tentar um motor melhor?", e ai o bruto nao serve: existe um numero melhor na imagem que
+        este motor nao leu.
+
+        Antes desta mudanca a cadeia considerava o resultado suficiente e **nao escalava**, mesmo
+        com um modelo de visao disponivel capaz de ler o rotulo.
+        """
+        assert not holerite_suficiente(HOLERITE_SEM_ROTULO_LIQUIDO)
+
+        # E `completa` continua True: as duas perguntas sao diferentes, e a diferenca e o ponto.
+        assert extrair_holerite(ocr(HOLERITE_SEM_ROTULO_LIQUIDO)).completa
 
 
 class TestEscalonamento:

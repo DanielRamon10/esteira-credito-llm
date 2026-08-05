@@ -27,6 +27,7 @@ import structlog
 from credit_analysis.domain.documento import (
     CampoExtraido,
     ExtracaoHolerite,
+    OrigemDaRenda,
     ResultadoOCR,
     parsear_valor_brl,
 )
@@ -42,7 +43,33 @@ logger = structlog.get_logger(__name__)
 CONFIANCA_PADRAO_ESTRUTURAL = Percentual.de(90)
 
 # Um valor monetario em pt-BR: milhares opcionais, decimais obrigatorios.
-_VALOR = r"\d{1,3}(?:\.\d{3})*,\d{2}"
+#
+# ## Espaco em volta dos separadores, e a medicao que o exigiu
+#
+# A versao anterior era `\d{1,3}(?:\.\d{3})*,\d{2}` — sem tolerancia a espaco — e ela perdia o
+# salario liquido no perfil `pouca_luz` da avaliacao de OCR. O texto que o Tesseract produz e:
+#
+#     VALOR LIQUIDO A RECEBER R$ 7.262 , 14
+#
+# O rotulo sai **perfeito**; o que ele quebra e o numero, inserindo espaco em volta da virgula.
+# Binarizacao adaptativa em imagem escura engrossa os tracos e a virgula vira um blob que o
+# segmentador separa dos digitos vizinhos.
+#
+# A consequencia media era grave: o campo nao casava, `renda_comprovada` caia para o salario base, e
+# a renda apurada ficava 17% acima da real (R$ 8.500,00 contra R$ 7.262,14) na direcao que aprova
+# credito que nao deveria.
+#
+# **Ler o numero certo e melhor que sinalizar o numero errado.** A rede de seguranca (`renda_origem`
+# + revisao humana) continua existindo para o caso em que so o bruto e legivel de verdade; este
+# padrao remove o caso em que ela seria acionada por um espaco.
+#
+# ## `[^\S\n]` e nao `\s`
+#
+# Espaco horizontal apenas. Com `\s`, o padrao atravessaria fim de linha e casaria o milhar de uma
+# linha com os centavos da seguinte — inventando um valor a partir de duas linhas diferentes, que e
+# a familia de defeito que o cabecalho de `_INICIO_LANCAMENTO` documenta em detalhe.
+_ESP = r"[^\S\n]*"
+_VALOR = rf"\d{{1,3}}(?:{_ESP}\.{_ESP}\d{{3}})*{_ESP},{_ESP}\d{{2}}"
 
 # O OCR troca digito por letra parecida com frequencia. Corrigimos apenas onde o
 # contexto garante que e digito (dentro de CPF/CNPJ/valor), nunca em texto livre.
@@ -505,13 +532,31 @@ def _parsear_data(dia: str, mes: str, ano: str) -> date | None:
 
 
 def holerite_suficiente(texto: str) -> bool:
-    """Se o texto tem o minimo para compor um parecer: renda e identificacao.
+    """Se o texto tem o minimo para compor um parecer: renda **liquida** e identificacao.
 
     Usado como `Suficiencia` na cadeia de OCR. E isto — e nao a media de
     confianca da pagina — que decide escalar para o modelo de visao.
+
+    ## Por que aqui a exigencia e mais alta que em `ExtracaoHolerite.completa`
+
+    `completa` responde "da para emitir parecer com isto?", e a resposta e sim mesmo com o bruto:
+    recusar um documento legivel por causa de um rotulo custaria disponibilidade. Esta funcao
+    responde outra pergunta — "vale a pena tentar um motor melhor?" — e ai o bruto **nao** serve,
+    porque existe um numero melhor na imagem que este motor nao conseguiu ler.
+
+    A diferenca foi medida: sob `pouca_luz` o liquido nao casava e a renda vinha do bruto. Com a
+    exigencia de `completa` aqui, a cadeia considerava o resultado suficiente e **nao escalava**,
+    apesar de haver um motor de visao capaz de ler o campo que faltava. Aquele caso especifico ja
+    nao ocorre (ver `_VALOR`), e a regra vale para os que restam.
+
+    Escalar nao tem downside quando nao ha para onde escalar: `MotorOCRComEscalonamento` devolve o
+    resultado de maior confianca quando nenhum motor satisfaz. Sem modelo de visao configurado — o
+    default deste projeto — o comportamento e identico ao de antes, e o caso vai para revisao humana
+    por `ResultadoProcessamento.exige_revisao_humana`.
     """
     ocr = ResultadoOCR(texto=texto, confianca=Percentual.de(100), motor="verificacao")
-    return extrair_holerite(ocr).completa
+    extracao = extrair_holerite(ocr)
+    return extracao.completa and extracao.origem_da_renda is OrigemDaRenda.LIQUIDO
 
 
 def extrato_suficiente(minimo_transacoes: int = 3) -> object:

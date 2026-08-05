@@ -34,6 +34,21 @@ class QualidadeExtracao(StrEnum):
     REJEITADA = "rejeitada"  # abaixo de 60%
 
 
+class OrigemDaRenda(StrEnum):
+    """De qual campo do holerite a renda apurada saiu.
+
+    Existe porque os dois nao valem o mesmo: o liquido e o que entra na conta e paga parcela; o
+    bruto e ~20% maior e superestima a capacidade de pagamento. Sem registrar a origem, o parecer
+    apresenta os dois como "renda comprovada" e ninguem depois sabe qual foi.
+
+    `BASE` nao e um erro — e um caso que exige um analista. Ver
+    `ExtracaoHolerite.origem_da_renda`.
+    """
+
+    LIQUIDO = "liquido"
+    BASE = "base"
+
+
 def classificar_qualidade(confianca: Percentual) -> QualidadeExtracao:
     if confianca >= CONFIANCA_MINIMA_AUTOMATICA:
         return QualidadeExtracao.CONFIAVEL
@@ -165,6 +180,11 @@ class ExtracaoHolerite:
         O liquido tem precedencia sobre o base: e o que efetivamente entra na
         conta do cliente e, portanto, o que pode pagar parcela. Usar o bruto
         infla a capacidade de pagamento em ~20%.
+
+        **A queda para o bruto nao e mais silenciosa.** Ela continua acontecendo — recusar o
+        documento inteiro por falta de um rotulo custaria disponibilidade — mas `origem_da_renda`
+        registra qual fonte respondeu, e um caso apurado pelo bruto vai para revisao humana. Ver
+        `origem_da_renda`.
         """
         for campo in (self.salario_liquido, self.salario_base):
             if campo is not None:
@@ -174,6 +194,50 @@ class ExtracaoHolerite:
         return None
 
     @property
+    def origem_da_renda(self) -> OrigemDaRenda | None:
+        """De qual campo a renda apurada veio, ou None quando nao houve renda.
+
+        ## Por que isto existe
+
+        A medicao que motivou este campo esta em `tests/eval/test_ocr_qualidade.py`: sob o perfil
+        `pouca_luz` o Tesseract saia com 88,97% de confianca — acima do limiar de 85% da POL-002 — e
+        a renda apurada virava R$ 8.500,00 em vez de R$ 7.262,14. 17% acima, na direcao que aprova
+        credito que nao deveria, e o parecer nao tinha como dizer que aquele numero era o bruto.
+
+        **Aquele caso especifico foi corrigido na origem** e nao chega mais aqui: o OCR escrevia
+        `7.262 , 14`, com espaco em volta da virgula, e o padrao de valor nao tolerava. Ver `_VALOR`
+        em `infrastructure/ocr/extracao.py`. Ler o numero certo e melhor que sinalizar o errado.
+
+        O campo continua, e nao por inercia: a queda para o bruto e alcancavel sempre que o liquido
+        for ilegivel de verdade — rotulo apagado, coluna cortada na digitalizacao, holerite que so
+        imprime o bruto. O que a correcao removeu foi um gatilho por espaco; o caso legitimo fica.
+
+        ## Propriedade derivada, e nao campo gravado
+
+        Um campo `origem` preenchido por quem constroi a extracao pode divergir do valor que
+        `renda_comprovada` devolveu — bastaria uma ordem de precedencia mudar num lugar e nao no
+        outro. Derivando da mesma condicao, as duas nao tem como discordar.
+        """
+        for campo, origem in (
+            (self.salario_liquido, OrigemDaRenda.LIQUIDO),
+            (self.salario_base, OrigemDaRenda.BASE),
+        ):
+            if campo is not None:
+                valor = campo.valor_monetario
+                if valor is not None and valor.positivo:
+                    return origem
+        return None
+
+    @property
     def completa(self) -> bool:
-        """Se ha o minimo para compor um parecer: identificacao e renda."""
+        """Se ha o minimo para compor um parecer: identificacao e renda.
+
+        **Nao exige que a renda venha do liquido**, e a escolha e deliberada: um holerite em que so
+        o bruto ficou legivel ainda sustenta um parecer, desde que um analista olhe. Exigir o
+        liquido aqui trocaria um numero 17% otimista por uma esteira que recusa documento legivel.
+
+        Quem cuida do "desde que um analista olhe" e
+        `ResultadoProcessamento.exige_revisao_humana`; quem tenta evitar o caso antes disso e
+        `holerite_suficiente`, que **exige** o liquido para nao escalar cedo demais.
+        """
         return self.renda_comprovada is not None and (self.cpf is not None or self.nome is not None)
